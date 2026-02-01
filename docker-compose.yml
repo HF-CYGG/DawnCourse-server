@@ -3,5 +3,5 @@ services:
   app-server:
     build: .
     ports:
-      - "80:80"
+      - "10000:80"
     restart: always

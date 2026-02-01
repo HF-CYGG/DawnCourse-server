@@ -1,0 +1,8 @@
+{
+  "versionCode": 100,
+  "versionName": "v1.0.0.00",
+  "updateContent": "Dawn Course v1.0.0.00 正式版发布！\n\n1. 纯净体验：零广告、离线优先、Material 3 设计\n2. 强大课表：灵活视图、自定义时间、多学期管理\n3. 智能调课：冲突检测、批量调课、一键撤销\n4. 贴心辅助：自动静音、常驻通知、桌面小组件\n5. 个性化：动态背景、动态取色",
+  "downloadUrl": "https://gitee.com/YeMiao_cats/Dawn-Course/releases/download/v1.0.0.00/app-release.apk",
+  "date": "2026-02-02",
+  "forceUpdate": false
+}

@@ -9,6 +9,8 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
   DOCKER_HUB_IMAGE: yemiao351/dawncourse
+  # 可以在这里定义默认的自定义镜像名，或者直接使用 secrets
+  # CUSTOM_IMAGE_NAME: registry.cn-hangzhou.aliyuncs.com/your-namespace/your-repo
 
 jobs:
   build-and-push-image:
@@ -21,6 +23,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # 1. GitHub Container Registry (ghcr.io)
       - name: Log in to the Container registry
         uses: docker/login-action@v3
         with:
@@ -28,11 +31,27 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # 2. Docker Hub (docker.io) - 如果配置了 secrets
       - name: Log in to Docker Hub
+        if: ${{ secrets.DOCKER_USERNAME != '' }}
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
+
+      # 3. 自定义仓库 (Custom Registry, 如阿里云/腾讯云)
+      # 需要在 GitHub Secrets 配置:
+      # CUSTOM_REGISTRY_URL (如 registry.cn-hangzhou.aliyuncs.com)
+      # CUSTOM_REGISTRY_USERNAME
+      # CUSTOM_REGISTRY_PASSWORD
+      # CUSTOM_IMAGE_NAME (完整镜像名，如 registry.cn-hangzhou.aliyuncs.com/namespace/repo)
+      - name: Log in to Custom Registry
+        if: ${{ secrets.CUSTOM_REGISTRY_URL != '' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.CUSTOM_REGISTRY_URL }}
+          username: ${{ secrets.CUSTOM_REGISTRY_USERNAME }}
+          password: ${{ secrets.CUSTOM_REGISTRY_PASSWORD }}
 
       - name: Extract metadata (tags, labels) for Docker
         uses: docker/metadata-action@v5
@@ -40,7 +59,8 @@ jobs:
         with:
           images: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-            ${{ env.DOCKER_HUB_IMAGE }}
+            ${{ secrets.DOCKER_USERNAME != '' && env.DOCKER_HUB_IMAGE || '' }}
+            ${{ secrets.CUSTOM_IMAGE_NAME }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch

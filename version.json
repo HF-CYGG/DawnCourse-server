@@ -1,10 +1,10 @@
 {
-  "versionCode": 101,
-  "versionName": "v1.0.1.00",
-  "title": "调课功能体验升级",
+  "versionCode": 102,
+  "versionName": "v1.0.2.10",
+  "title": "交互优化与智能增强",
   "type": "feature",
-  "updateContent": "Dawn Course v1.0.1.00 更新日志：\n\n1. 调课体验重构：全新“原周次 → 目标周次”流向设计，逻辑更清晰。\n2. 交互防错升级：时间选择网格增加“原时间”屏蔽与震动提示，防止误操作。\n3. 视觉美化：引入“时间选择卡片”与沉浸式弹窗，告别拥挤布局。\n4. 智能冲突提示：优化冲突检测算法，去除重复课程，提示语更精简友好。",
-  "downloadUrl": "https://gitee.com/YeMiao_cats/Dawn-Course/releases/download/v1.0.1.00/Dawn%20Course.apk",
+  "updateContent": "Dawn Course v1.0.2.10 更新日志：\n\n1. 课表交互优化：严格周次边界限制，新增“假期模式”温馨提示，告别空白网格。\n2. 智能导入升级：导入时自动识别学期周数，配置更省心。\n3. 设置安全校验：修改总周数时智能检测冲突，防止课程被意外隐藏。\n4. 底层性能重构：全面优化代码注释与运行效率，体验更流畅。",
+  "downloadUrl": "https://gitee.com/YeMiao_cats/Dawn-Course/releases/download/v1.0.2.10/Dawn%20Course.apk",
   "date": "2026-02-02",
   "forceUpdate": false
 }

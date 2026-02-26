@@ -1,10 +1,10 @@
 {
-  "versionCode": 103,
-  "versionName": "v1.0.2.13",
-  "title": "交互体验升级与假期模式优化",
+  "versionCode": 104,
+  "versionName": "v1.0.3.00",
+  "title": "代码健壮性与周次选择优化",
   "type": "feature",
-  "updateContent": "Dawn Course v1.0.2.13 更新日志：\n\n1. 假期模式升级：支持查看假期期间的历史课程，不再强制锁定全屏。\n2. 调课体验优化：调课时自动提示当前进入的周次，并在周次选择界面高亮标记，定位更便捷。\n3. 更新检查修复：优化更新错误提示，支持复制错误信息以便反馈。\n4. 界面细节调整：修复日期显示逻辑，优化更新弹窗版本号展示。",
-  "downloadUrl": "https://gitee.com/YeMiao_cats/Dawn-Course/releases/download/v1.0.2.13/Dawn%20Course.apk",
-  "date": "2026-02-03",
+  "updateContent": "Dawn Course v1.0.3.00 更新日志：\n\n1. 周次选择优化：修复周次选择菜单中的“当前”标记，使其始终指向真实日期的当前周，不再随查看周次变化。\n2. 代码健壮性升级：全面优化空指针安全与异常处理，修复潜在崩溃点。\n3. 构建系统优化：修复 Gradle 缓存导致的构建问题，提升稳定性。",
+  "downloadUrl": "https://gitee.com/YeMiao_cats/Dawn-Course/releases/download/v1.0.3.00/Dawn%20Course.apk",
+  "date": "2026-02-27",
   "forceUpdate": false
 }

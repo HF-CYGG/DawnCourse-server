@@ -1,10 +1,10 @@
 {
-  "versionCode": 105,
-  "versionName": "v1.0.3.13",
-  "title": "强智系统适配与导入优化",
-  "type": "feature",
-  "updateContent": "Dawn Course v1.0.3.13 更新日志：\n\n1. **强智教务系统支持**：新增对强智教务系统的全面支持（API 直连导入与 HTML 解析脚本），并为 Kingosoft 解析器添加兼容逻辑。\n2. **ICS 导入增强**：改进 ICS 课程导入解析逻辑，修正重复事件生成以符合 RFC 5545 规范，提升容错性。\n3. **UI 视觉优化**：优化非本周课程卡片视觉效果（使用主题色背景），并更新应用图标。\n4. **导入功能重构**：重构作息时间生成逻辑，提取通用解析工具函数到共享库，移除 WakeUp 导入功能。\n5. **开发者文档**：新增解析脚本开发指南，方便社区贡献。",
-  "downloadUrl": "https://gitee.com/YeMiao_cats/Dawn-Course/releases/download/v1.0.3.13/Dawn%20Course.apk",
-  "date": "2026-03-02",
+  "versionCode": 108,
+  "versionName": "v1.0.3.16",
+  "title": "正方网页教师/教室显示修复（紧急）",
+  "type": "bugfix",
+  "updateContent": "Dawn Course v1.0.3.16 更新日志：\n\n1. 修复：新版正方个人课表解析不显示教师与教室信息（适配 span+font 结构，保持原逻辑不删除）。\n2. 同步：强智与 Kingosoft 解析脚本增加对“校区/上课地点”字段的兼容匹配。\n3. 稳定性：通用解析工具增强空内容处理，避免错误早返回导致信息缺失。\n\n建议：更新后重新导入一次课表以应用修复。",
+  "downloadUrl": "https://gitee.com/YeMiao_cats/Dawn-Course/releases/download/v1.0.3.16/Dawn%20Course.apk",
+  "date": "2026-03-03",
   "forceUpdate": false
 }

@@ -1,11 +1,11 @@
 {
-  "versionCode": 108,
-  "versionName": "v1.0.3.16",
-  "title": "正方网页教师/教室显示修复（紧急）",
+  "versionCode": 109,
+  "versionName": "v1.0.3.23",
+  "title": "小组件假期显示修复与课程卡片优化",
   "type": "bugfix",
-  "updateContent": "Dawn Course v1.0.3.16 更新日志：\n\n1. 修复：新版正方个人课表解析不显示教师与教室信息（适配 span+font 结构，保持原逻辑不删除）。\n2. 同步：强智与 Kingosoft 解析脚本增加对“校区/上课地点”字段的兼容匹配。\n3. 稳定性：通用解析工具增强空内容处理，避免错误早返回导致信息缺失。\n\n建议：更新后重新导入一次课表以应用修复。",
-  "downloadUrl": "https://gitee.com/YeMiao_cats/Dawn-Course/releases/download/v1.0.3.16/Dawn%20Course.apk",
-  "date": "2026-03-03",
-  "sha256": "4445544196BDCCDE33AA5801F968CA0A53E02DE2FEE9377BB2198F965C6065C9",
+  "updateContent": "Dawn Course v1.0.3.23 更新日志：\n\n1. 修复：小组件在假期/未开学时仍显示课程的问题，增加开学前判断并显示假期提示。\n2. 优化：课程卡片名称显示上限调整为最多 4 行，且不超过卡片高度的一半，保证教室/教师信息可见。\n3. 优化：课程详情与课程卡片教师字段显示去除多余教学班/考核方式等干扰信息。",
+  "downloadUrl": "https://gitee.com/YeMiao_cats/Dawn-Course/releases/download/v1.0.3.23/Dawn%20Course.apk",
+  "date": "2026-03-07",
+  "sha256": "DD7B9409CABA071DA4D5B9C8D962A8E0CBFAEDCBCD4F0B4E3D40017EF4D574DE",
   "forceUpdate": false
 }

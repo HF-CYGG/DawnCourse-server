@@ -1,11 +1,11 @@
 {
-  "versionCode": 109,
-  "versionName": "v1.0.3.23",
-  "title": "小组件假期显示修复与课程卡片优化",
-  "type": "bugfix",
-  "updateContent": "Dawn Course v1.0.3.23 更新日志：\n\n1. 修复：小组件在假期/未开学时仍显示课程的问题，增加开学前判断并显示假期提示。\n2. 优化：课程卡片名称显示上限调整为最多 4 行，且不超过卡片高度的一半，保证教室/教师信息可见。\n3. 优化：课程详情与课程卡片教师字段显示去除多余教学班/考核方式等干扰信息。",
-  "downloadUrl": "https://gitee.com/YeMiao_cats/Dawn-Course/releases/download/v1.0.3.23/Dawn%20Course.apk",
-  "date": "2026-03-07",
-  "sha256": "DD7B9409CABA071DA4D5B9C8D962A8E0CBFAEDCBCD4F0B4E3D40017EF4D574DE",
+  "versionCode": 110,
+  "versionName": "v1.0.4.2",
+  "title": "自动更新改造与设置/导入体验升级",
+  "type": "feature",
+  "updateContent": "Dawn Course v1.0.4.2 更新日志：\n\n1. 新增：设置页外观增加“高级选项”折叠菜单，背景/卡片细节集中管理。\n2. 优化：正方教务绑定界面样式与交互，移除起迪绑定入口，自动更新体验更一致。\n3. 调整：将“一键更新”统一更名为“自动更新”，同步/绑定提示文案同步更新。\n4. 优化：课程导入确认界面重构，交互与视觉更清晰。\n5. 修复：课程表解析日期映射问题，并增强网页解析器稳定性。\n6. 优化：课表卡片与网格线预览效果；节次设置新增时间选择组件。\n7. 优化：小组件适配手动修改时间场景，刷新显示更可靠。",
+  "downloadUrl": "https://gitee.com/YeMiao_cats/Dawn-Course/releases/download/v1.0.4.2/Dawn%20Course.apk",
+  "date": "2026-03-08",
+  "sha256": "C077F93CE670BF947BDDF164C45711F85BAE1A253148789BFC771F728C619C71",
   "forceUpdate": false
 }

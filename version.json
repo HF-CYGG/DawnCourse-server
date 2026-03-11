@@ -1,11 +1,11 @@
 {
-  "versionCode": 130,
-  "versionName": "v1.0.4.29",
-  "title": "导入与设置体验优化",
-  "type": "standard",
-  "updateContent": "Dawn Course v1.0.4.29 更新日志：\n\n1. 优化：启动阶段延迟自动检查更新，减少首屏竞争与卡顿。\n2. 优化：Widget 相关后台调度与时间变化监听改为后台初始化。\n3. 修复：导入页适配系统导航栏，ICS 导入入口不再被遮挡。\n4. 修复：教务系统页面检测与兼容逻辑增强，覆盖更多学校与更多页面结构。\n5. 修复：正方自动登录脚本与登录状态判断优化，减少停留在登录页的情况。\n6. 优化：设置页弹窗加入渐入渐出动画，并加强正方入口地址校验。\n7. 优化：课程卡片样式与主题对比度/文字颜色策略，提升可读性与一致性。\n8. 修复：提醒/静音调度与周次计算边界问题，降低重复触发概率。\n9. 稳定性：DataStore 异常场景兜底；导入清空数据时同步设置状态。",
-  "downloadUrl": "https://gitee.com/YeMiao_cats/Dawn-Course/releases/download/v1.0.4.29/Dawn%20Course.apk",
-  "date": "2026-03-11",
-  "sha256": "5A9C87B78527337154FF70E81BEADABA2519A5B15C13804ED09CDA6EC92AD985",
+  "versionCode": 137,
+  "versionName": "v1.0.4.36",
+  "title": "紧急修复：深色模式课程文字异常",
+  "type": "bugfix",
+  "updateContent": "Dawn Course v1.0.4.36 紧急更新：\n\n1. 修复：深色模式下课程卡片文字显示异常（对比度不足/发灰难读）。\n2. 优化：主页面周头与时间轴文字可读性策略（无阴影，纯黑/纯白自动切换）。\n3. 优化：非本周课程卡片遮罩对比度（在有壁纸/无壁纸场景下自动切换样式）。\n4. 修复：壁纸亮度分析可能导致的闪退（Bitmap 被误回收）。",
+  "downloadUrl": "https://gitee.com/YeMiao_cats/Dawn-Course/releases/download/v1.0.4.36/Dawn%20Course.apk",
+  "date": "2026-03-12",
+  "sha256": "3C9176D6DC18F3BA79162236F358FB3511CC47AF04AFD0DEF15C16669B681F8A",
   "forceUpdate": false
 }

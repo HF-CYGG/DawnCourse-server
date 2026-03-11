@@ -6,6 +6,6 @@
   "updateContent": "Dawn Course v1.0.4.36 紧急更新：\n\n1. 修复：深色模式下课程卡片文字显示异常（对比度不足/发灰难读）。\n2. 优化：主页面周头与时间轴文字可读性策略（无阴影，纯黑/纯白自动切换）。\n3. 优化：非本周课程卡片遮罩对比度（在有壁纸/无壁纸场景下自动切换样式）。\n4. 修复：壁纸亮度分析可能导致的闪退（Bitmap 被误回收）。",
   "downloadUrl": "https://gitee.com/YeMiao_cats/Dawn-Course/releases/download/v1.0.4.36/Dawn%20Course.apk",
   "date": "2026-03-12",
-  "sha256": "3C9176D6DC18F3BA79162236F358FB3511CC47AF04AFD0DEF15C16669B681F8A",
+  "sha256": "CBAAB93117FC888019295C3A3A0764859AA326815DF84057C99A3955FE1C3768",
   "forceUpdate": false
 }

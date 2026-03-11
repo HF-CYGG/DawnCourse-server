@@ -1,11 +1,11 @@
 {
-  "versionCode": 111,
-  "versionName": "v1.0.4.10",
-  "title": "自动静音与入口兼容优化",
-  "type": "feature",
-  "updateContent": "Dawn Course v1.0.4.10 更新日志：\n\n1. 新增：自动静音支持课程结束后自动解除静音。\n2. 修复：正方教务入口仅输入域名时，自动尝试拼接 /jwglxt 以提升兼容性。\n3. 优化：导入页面增加滚动适配，小屏/异形屏显示更完整。\n4. 优化：桌面小组件刷新更可靠，减少课程结束后残留显示。\n5. 优化：提醒/静音设置变更后立即生效，避免等待次日调度。",
-  "downloadUrl": "https://gitee.com/YeMiao_cats/Dawn-Course/releases/download/v1.0.4.10/Dawn%20Course.apk",
-  "date": "2026-03-09",
-  "sha256": "C74029BAC1BD2733C81A709FB162AA344BDFA54369FC5BA319B3F491E9307E58",
+  "versionCode": 130,
+  "versionName": "v1.0.4.29",
+  "title": "导入与设置体验优化",
+  "type": "standard",
+  "updateContent": "Dawn Course v1.0.4.29 更新日志：\n\n1. 优化：启动阶段延迟自动检查更新，减少首屏竞争与卡顿。\n2. 优化：Widget 相关后台调度与时间变化监听改为后台初始化。\n3. 修复：导入页适配系统导航栏，ICS 导入入口不再被遮挡。\n4. 修复：教务系统页面检测与兼容逻辑增强，覆盖更多学校与更多页面结构。\n5. 修复：正方自动登录脚本与登录状态判断优化，减少停留在登录页的情况。\n6. 优化：设置页弹窗加入渐入渐出动画，并加强正方入口地址校验。\n7. 优化：课程卡片样式与主题对比度/文字颜色策略，提升可读性与一致性。\n8. 修复：提醒/静音调度与周次计算边界问题，降低重复触发概率。\n9. 稳定性：DataStore 异常场景兜底；导入清空数据时同步设置状态。",
+  "downloadUrl": "https://gitee.com/YeMiao_cats/Dawn-Course/releases/download/v1.0.4.29/Dawn%20Course.apk",
+  "date": "2026-03-11",
+  "sha256": "5A9C87B78527337154FF70E81BEADABA2519A5B15C13804ED09CDA6EC92AD985",
   "forceUpdate": false
 }

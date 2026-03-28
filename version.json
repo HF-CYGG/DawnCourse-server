@@ -1,11 +1,11 @@
 {
-  "versionCode": 137,
-  "versionName": "v1.0.4.36",
-  "title": "紧急修复：深色模式课程文字异常",
-  "type": "bugfix",
-  "updateContent": "Dawn Course v1.0.4.36 紧急更新：\n\n1. 修复：深色模式下课程卡片文字显示异常（对比度不足/发灰难读）。\n2. 优化：主页面周头与时间轴文字可读性策略（无阴影，纯黑/纯白自动切换）。\n3. 优化：非本周课程卡片遮罩对比度（在有壁纸/无壁纸场景下自动切换样式）。\n4. 修复：壁纸亮度分析可能导致的闪退（Bitmap 被误回收）。",
-  "downloadUrl": "https://gitee.com/YeMiao_cats/Dawn-Course/releases/download/v1.0.4.36/Dawn%20Course.apk",
-  "date": "2026-03-12",
-  "sha256": "CBAAB93117FC888019295C3A3A0764859AA326815DF84057C99A3955FE1C3768",
+  "versionCode": 138,
+  "versionName": "v1.0.5.1",
+  "title": "全新数据同步、备份与日历导出体验",
+  "type": "feature",
+  "updateContent": "Dawn Course v1.0.5.1 核心更新：\n\n1. 新增：WebDAV 云端备份与恢复功能，支持后台自动同步。\n2. 新增：本地安全备份与还原功能，并提供还原前的数据预览与二次确认。\n3. 新增：导出日历 (ICS) 功能，完美支持将课程导入系统日历或 Outlook。\n4. 优化：全新设计的桌面组件 (Widget)，增加地点图标、统一主题配色与边缘渐变遮罩。\n5. 优化：提升凭据存储安全性并修复部分场景下的提醒通知问题。",
+  "downloadUrl": "https://gitee.com/YeMiao_cats/Dawn-Course/releases/download/v1.0.5.1/Dawn%20Course.apk",
+  "date": "2026-03-28",
+  "sha256": "E5D0B38BB931A9805614CF180B2C65EBBB6C12522256D9AA7936347C14311A47",
   "forceUpdate": false
 }

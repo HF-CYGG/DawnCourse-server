@@ -46,8 +46,13 @@ const summaryCostPerCall = Number(process.env.LLM_SUMMARY_COST_PER_CALL || 0);
 const scriptCostPerCall = Number(process.env.LLM_SCRIPT_COST_PER_CALL || 0);
 const parseCostPerCall = Number(process.env.LLM_PARSE_COST_PER_CALL || 0);
 const scriptSignKey = process.env.SCRIPT_SIGN_KEY || "";
+const scriptSignPrivateKey = process.env.SCRIPT_SIGN_PRIVATE_KEY || "";
+const schoolMetricsFile =
+  process.env.SCHOOL_METRICS_FILE || path.join(scriptOutputDir, "metrics", "school_metrics.txt");
+const metricsFlushMs = Number(process.env.METRICS_FLUSH_MS || 5000);
 // 单次脚本修复并发控制
 const schoolProcessing = new Map();
+let metricsFlushTimer = null;
 
 const redisClient = createClient({ url: redisUrl });
 redisClient.on("error", (error) => {
@@ -78,6 +83,21 @@ const server = http.createServer(async (req, res) => {
     }
     const status = await getSchoolStatus(schoolId);
     return sendJson(res, 200, { code: 200, data: status });
+  }
+  if (req.method === "GET" && url.pathname === "/api/v1/script_meta") {
+    const scriptName = url.searchParams.get("scriptName") || "";
+    if (!scriptName) {
+      return sendJson(res, 400, { code: 400, msg: "缺少 scriptName" });
+    }
+    const meta = await getScriptMeta(scriptName);
+    if (!meta) {
+      return sendJson(res, 404, { code: 404, msg: "meta 不存在" });
+    }
+    return sendJson(res, 200, { code: 200, data: meta });
+  }
+  if (req.method === "GET" && url.pathname === "/metrics") {
+    const text = await buildPrometheusMetrics();
+    return sendText(res, 200, text);
   }
   // 提交解析任务
   if (req.method === "POST" && url.pathname === "/api/v1/parse_task") {
@@ -111,7 +131,7 @@ const server = http.createServer(async (req, res) => {
     // 生成任务并进入异步处理
     const taskId = crypto.randomUUID();
     await saveTask(taskId, { status: "PROCESSING", result: null, createdAt: Date.now() });
-    runTask(taskId, safeContent).catch(async () => {
+    runTask(taskId, safeContent, schoolId).catch(async () => {
       await saveTask(taskId, { status: "FAILED", result: null, createdAt: Date.now() });
     });
     if (schoolId) {
@@ -202,7 +222,7 @@ async function processSchoolQueue(schoolId) {
       lastUpdatedAt: 0
     };
     const mergedText = recentQueue.map((item, index) => `【提交 ${index + 1}】\n${item.content}`).join("\n");
-    const summary = await summarizeSubmissions(mergedText);
+    const summary = await summarizeSubmissions(mergedText, schoolId);
     if (!summary) return;
     const summaryHash = hashText(summary);
     const shouldProcessIndividually =
@@ -214,7 +234,7 @@ async function processSchoolQueue(schoolId) {
     }
     const scriptName = resolveScriptName(schoolId, recentQueue);
     const previousScript = await readScript(scriptName);
-    const generatedScript = await generateParserScript(summary, previousScript);
+    const generatedScript = await generateParserScript(summary, previousScript, schoolId);
     if (!generatedScript) return;
     const applyResult = await applyScriptUpdate(scriptName, generatedScript, previousScript);
     if (!applyResult.ok) {
@@ -238,14 +258,14 @@ async function processSchoolQueue(schoolId) {
 async function processIndividualSummaries(schoolId, queue) {
   const summaries = [];
   for (const item of queue) {
-    const summary = await summarizeSubmissions(item.content);
+    const summary = await summarizeSubmissions(item.content, schoolId);
     if (summary) summaries.push(summary);
   }
   if (summaries.length === 0) return;
   const mergedSummary = summaries.map((text, index) => `【总结 ${index + 1}】\n${text}`).join("\n");
   const scriptName = resolveScriptName(schoolId, queue);
   const previousScript = await readScript(scriptName);
-  const generatedScript = await generateParserScript(mergedSummary, previousScript);
+  const generatedScript = await generateParserScript(mergedSummary, previousScript, schoolId);
   if (!generatedScript) return;
   const applyResult = await applyScriptUpdate(scriptName, generatedScript, previousScript);
   if (!applyResult.ok) {
@@ -265,7 +285,7 @@ async function processIndividualSummaries(schoolId, queue) {
  * @param taskId 任务 ID
  * @param content 已脱敏文本
  */
-async function runTask(taskId, content) {
+async function runTask(taskId, content, schoolId) {
   const startTime = Date.now();
   const resultText = await callProvider(content);
   const latencyMs = Date.now() - startTime;
@@ -274,13 +294,22 @@ async function runTask(taskId, content) {
   if (!resultText) {
     await saveTask(taskId, { status: "FAILED", result: null, createdAt });
     await recordMetric("parse_failed", latencyMs, parseCostPerCall);
+    if (schoolId) {
+      await recordSchoolMetric(schoolId, "parse_failed", latencyMs, parseCostPerCall);
+    }
     return;
   }
   await saveTask(taskId, { status: "SUCCESS", result: resultText, createdAt });
   if (isEmptyResult(resultText)) {
     await recordMetric("parse_empty", latencyMs, parseCostPerCall);
+    if (schoolId) {
+      await recordSchoolMetric(schoolId, "parse_empty", latencyMs, parseCostPerCall);
+    }
   } else {
     await recordMetric("parse_success", latencyMs, parseCostPerCall);
+    if (schoolId) {
+      await recordSchoolMetric(schoolId, "parse_success", latencyMs, parseCostPerCall);
+    }
   }
 }
 
@@ -371,7 +400,7 @@ async function callGeminiRaw(systemPrompt, userPrompt, options = {}) {
 /**
  * 使用模型 1 对提交内容进行总结
  */
-async function summarizeSubmissions(content) {
+async function summarizeSubmissions(content, schoolId) {
   const systemPrompt =
     "你是课表解析总结助手，目标是提炼教务系统课表页面结构的关键信息。" +
     "输出为中文要点列表，不包含任何个人信息。";
@@ -397,16 +426,22 @@ async function summarizeSubmissions(content) {
   const latencyMs = Date.now() - startTime;
   if (!rawText) {
     await recordMetric("summary_failed", latencyMs, summaryCostPerCall);
+    if (schoolId) {
+      await recordSchoolMetric(schoolId, "summary_failed", latencyMs, summaryCostPerCall);
+    }
     return "";
   }
   await recordMetric("summary_success", latencyMs, summaryCostPerCall);
+  if (schoolId) {
+    await recordSchoolMetric(schoolId, "summary_success", latencyMs, summaryCostPerCall);
+  }
   return rawText;
 }
 
 /**
  * 使用模型 2 生成或修复解析脚本
  */
-async function generateParserScript(summary, previousScript) {
+async function generateParserScript(summary, previousScript, schoolId) {
   const systemPrompt =
     "你是教务系统解析脚本工程师，输出必须是可直接运行的 JavaScript 解析脚本。" +
     "脚本运行环境为 QuickJS，无 DOM API，仅可使用字符串与正则。" +
@@ -436,9 +471,15 @@ async function generateParserScript(summary, previousScript) {
   const latencyMs = Date.now() - startTime;
   if (!rawText) {
     await recordMetric("script_failed", latencyMs, scriptCostPerCall);
+    if (schoolId) {
+      await recordSchoolMetric(schoolId, "script_failed", latencyMs, scriptCostPerCall);
+    }
     return "";
   }
   await recordMetric("script_success", latencyMs, scriptCostPerCall);
+  if (schoolId) {
+    await recordSchoolMetric(schoolId, "script_success", latencyMs, scriptCostPerCall);
+  }
   return cleanScriptOutput(rawText);
 }
 
@@ -549,12 +590,13 @@ async function buildScriptMeta(scriptName, content) {
   const previousMeta = await getScriptMeta(scriptName);
   const version = (previousMeta?.version || 0) + 1;
   const sha256 = hashText(content);
-  const signature = signScript(content);
+  const { signature, alg } = signScript(content);
   return {
     scriptName,
     version,
     sha256,
     signature,
+    alg,
     updatedAt: Date.now()
   };
 }
@@ -592,8 +634,16 @@ async function writeBackupScript(scriptName, content) {
 }
 
 function signScript(content) {
-  if (!scriptSignKey) return "";
-  return crypto.createHmac("sha256", scriptSignKey).update(content).digest("hex");
+  if (scriptSignPrivateKey) {
+    const signer = crypto.createSign("RSA-SHA256");
+    signer.update(content);
+    return { signature: signer.sign(scriptSignPrivateKey, "base64"), alg: "rsa-sha256" };
+  }
+  if (scriptSignKey) {
+    const signature = crypto.createHmac("sha256", scriptSignKey).update(content).digest("hex");
+    return { signature, alg: "hmac-sha256" };
+  }
+  return { signature: "", alg: "" };
 }
 
 async function recordScriptFailure(scriptName, reason) {
@@ -614,6 +664,26 @@ async function recordMetric(type, latencyMs, cost) {
     await redisClient.hIncrByFloat(key, "costTotal", cost);
   }
   await redisClient.hSet(key, { lastUpdatedAt: Date.now() });
+}
+
+async function recordSchoolMetric(schoolId, type, latencyMs, cost) {
+  const key = buildSchoolMetricKey(schoolId);
+  await redisClient.sAdd("school:metrics:ids", schoolId);
+  await redisClient.hIncrBy(key, type, 1);
+  await redisClient.hIncrByFloat(key, "latencyMsTotal", latencyMs);
+  if (cost > 0) {
+    await redisClient.hIncrByFloat(key, "costTotal", cost);
+  }
+  await redisClient.hSet(key, { lastUpdatedAt: Date.now() });
+  scheduleMetricsFlush();
+}
+
+function scheduleMetricsFlush() {
+  if (metricsFlushTimer) return;
+  metricsFlushTimer = setTimeout(async () => {
+    metricsFlushTimer = null;
+    await flushSchoolMetricsToFile();
+  }, metricsFlushMs);
 }
 
 function isEmptyResult(resultText) {
@@ -721,6 +791,79 @@ async function getMetricsSnapshot() {
   return result;
 }
 
+async function getSchoolMetricsSnapshot() {
+  const ids = await redisClient.sMembers("school:metrics:ids");
+  const result = {};
+  for (const schoolId of ids) {
+    const data = await redisClient.hGetAll(buildSchoolMetricKey(schoolId));
+    result[schoolId] = {
+      parse_success: Number(data.parse_success || 0),
+      parse_failed: Number(data.parse_failed || 0),
+      parse_empty: Number(data.parse_empty || 0),
+      summary_success: Number(data.summary_success || 0),
+      summary_failed: Number(data.summary_failed || 0),
+      script_success: Number(data.script_success || 0),
+      script_failed: Number(data.script_failed || 0),
+      latencyMsTotal: Number(data.latencyMsTotal || 0),
+      costTotal: Number(data.costTotal || 0),
+      lastUpdatedAt: Number(data.lastUpdatedAt || 0)
+    };
+  }
+  return result;
+}
+
+async function flushSchoolMetricsToFile() {
+  const snapshot = await getSchoolMetricsSnapshot();
+  const lines = [];
+  for (const [schoolId, data] of Object.entries(snapshot)) {
+    const parseTotal = data.parse_success + data.parse_failed + data.parse_empty;
+    const parseSuccessRate = parseTotal > 0 ? data.parse_success / parseTotal : 0;
+    lines.push(
+      [
+        schoolId,
+        parseSuccessRate.toFixed(6),
+        data.parse_success,
+        data.parse_failed,
+        data.parse_empty,
+        data.summary_success,
+        data.summary_failed,
+        data.script_success,
+        data.script_failed,
+        data.costTotal.toFixed(6),
+        data.lastUpdatedAt
+      ].join("\t")
+    );
+  }
+  await fs.mkdir(path.dirname(schoolMetricsFile), { recursive: true });
+  await fs.writeFile(schoolMetricsFile, lines.join("\n"), "utf-8");
+}
+
+async function buildPrometheusMetrics() {
+  const metrics = await getMetricsSnapshot();
+  const schoolMetrics = await getSchoolMetricsSnapshot();
+  const lines = [];
+  for (const [type, data] of Object.entries(metrics)) {
+    lines.push(`dawncourse_${type}_total ${data.count}`);
+    lines.push(`dawncourse_${type}_latency_avg_ms ${data.latencyMsAvg}`);
+    lines.push(`dawncourse_${type}_cost_total ${data.costTotal}`);
+    lines.push(`dawncourse_${type}_last_updated ${data.lastUpdatedAt}`);
+  }
+  for (const [schoolId, data] of Object.entries(schoolMetrics)) {
+    const safeSchoolId = String(schoolId).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+    const label = `schoolId="${safeSchoolId}"`;
+    lines.push(`dawncourse_school_parse_success_total{${label}} ${data.parse_success}`);
+    lines.push(`dawncourse_school_parse_failed_total{${label}} ${data.parse_failed}`);
+    lines.push(`dawncourse_school_parse_empty_total{${label}} ${data.parse_empty}`);
+    lines.push(`dawncourse_school_summary_success_total{${label}} ${data.summary_success}`);
+    lines.push(`dawncourse_school_summary_failed_total{${label}} ${data.summary_failed}`);
+    lines.push(`dawncourse_school_script_success_total{${label}} ${data.script_success}`);
+    lines.push(`dawncourse_school_script_failed_total{${label}} ${data.script_failed}`);
+    lines.push(`dawncourse_school_cost_total{${label}} ${data.costTotal}`);
+    lines.push(`dawncourse_school_last_updated{${label}} ${data.lastUpdatedAt}`);
+  }
+  return lines.join("\n");
+}
+
 async function getScriptFailures(limit) {
   const safeLimit = Math.min(Math.max(limit, 1), 200);
   const items = await redisClient.lRange("script:failures", 0, safeLimit - 1);
@@ -792,6 +935,10 @@ function buildSchoolStateKey(schoolId) {
 
 function buildSchoolLockKey(schoolId) {
   return `school:lock:${schoolId}`;
+}
+
+function buildSchoolMetricKey(schoolId) {
+  return `school:metrics:${schoolId}`;
 }
 
 function buildDedupKey(schoolId, hash) {
@@ -893,6 +1040,11 @@ function readBody(req, maxLen) {
 function sendJson(res, status, body) {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
   res.end(JSON.stringify(body));
+}
+
+function sendText(res, status, body) {
+  res.writeHead(status, { "Content-Type": "text/plain; version=0.0.4; charset=utf-8" });
+  res.end(body);
 }
 
 /**

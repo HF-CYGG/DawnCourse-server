@@ -46,6 +46,9 @@ services:
       LLM_SCRIPT_COST_PER_CALL: 0
       LLM_PARSE_COST_PER_CALL: 0
       SCRIPT_SIGN_KEY: ""
+      SCRIPT_SIGN_PRIVATE_KEY: ""
+      SCHOOL_METRICS_FILE: /shared/parsers/metrics/school_metrics.txt
+      METRICS_FLUSH_MS: 5000
     volumes:
       - ./html/scripts/parsers:/shared/parsers
     restart: always

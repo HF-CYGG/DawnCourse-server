@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dawn Course 兜底解析监控</title>
+    <style>
+      /* 主题色与基础变量 */
+      :root {
+        color-scheme: dark;
+        --bg: #0f1115;
+        --panel: #171a21;
+        --panel-2: #1f2430;
+        --text: #e6e9ef;
+        --muted: #9aa4b2;
+        --accent: #5b9dff;
+        --accent-2: #33d69f;
+        --danger: #ff6b6b;
+        --warning: #f6c177;
+        --border: #2b303b;
+        --shadow: rgba(0, 0, 0, 0.35);
+      }
+      /* 基础布局 */
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        font-family: "Inter", "PingFang SC", "Microsoft YaHei", sans-serif;
+        background: var(--bg);
+        color: var(--text);
+      }
+      /* 顶部栏 */
+      header {
+        padding: 24px 28px;
+        border-bottom: 1px solid var(--border);
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        background: linear-gradient(135deg, #171a21 0%, #11141a 100%);
+      }
+      header h1 {
+        font-size: 20px;
+        margin: 0;
+      }
+      header .meta {
+        font-size: 12px;
+        color: var(--muted);
+      }
+      /* 内容容器 */
+      .container {
+        padding: 24px 28px 48px;
+        display: flex;
+        flex-direction: column;
+        gap: 24px;
+      }
+      /* 网格布局 */
+      .grid {
+        display: grid;
+        gap: 16px;
+      }
+      .grid.cards {
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      }
+      /* 统计卡片 */
+      .card {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 16px;
+        box-shadow: 0 10px 30px var(--shadow);
+      }
+      .card h3 {
+        margin: 0 0 8px 0;
+        font-size: 14px;
+        color: var(--muted);
+      }
+      .card .value {
+        font-size: 26px;
+        font-weight: 600;
+      }
+      .card .sub {
+        margin-top: 6px;
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .section-title {
+        font-size: 16px;
+        margin: 0 0 12px 0;
+      }
+      /* 数据表格 */
+      .table {
+        width: 100%;
+        border-collapse: collapse;
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        overflow: hidden;
+      }
+      .table th,
+      .table td {
+        padding: 12px 10px;
+        border-bottom: 1px solid var(--border);
+        text-align: left;
+        font-size: 12px;
+      }
+      .table th {
+        color: var(--muted);
+        background: var(--panel-2);
+      }
+      .table tr:hover td {
+        background: rgba(91, 157, 255, 0.08);
+      }
+      /* 状态标签 */
+      .badge {
+        display: inline-flex;
+        padding: 2px 8px;
+        border-radius: 999px;
+        font-size: 11px;
+        background: rgba(91, 157, 255, 0.2);
+        color: var(--accent);
+      }
+      .badge.success {
+        background: rgba(51, 214, 159, 0.2);
+        color: var(--accent-2);
+      }
+      .badge.warning {
+        background: rgba(246, 193, 119, 0.2);
+        color: var(--warning);
+      }
+      .badge.danger {
+        background: rgba(255, 107, 107, 0.2);
+        color: var(--danger);
+      }
+      /* 操作按钮区 */
+      .actions {
+        display: flex;
+        gap: 12px;
+        align-items: center;
+      }
+      .btn {
+        background: var(--accent);
+        border: none;
+        color: #fff;
+        padding: 8px 14px;
+        border-radius: 8px;
+        cursor: pointer;
+        font-size: 12px;
+      }
+      .btn.secondary {
+        background: transparent;
+        border: 1px solid var(--border);
+        color: var(--text);
+      }
+      /* 登录遮罩 */
+      .login-overlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(10, 12, 16, 0.9);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 24px;
+        z-index: 10;
+      }
+      /* 登录面板 */
+      .login-panel {
+        width: min(420px, 100%);
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 16px;
+        padding: 24px;
+        box-shadow: 0 20px 40px var(--shadow);
+      }
+      .login-panel h2 {
+        margin: 0 0 16px 0;
+        font-size: 18px;
+      }
+      /* 表单行 */
+      .form-row {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        margin-bottom: 16px;
+      }
+      .form-row input {
+        background: #10141c;
+        border: 1px solid var(--border);
+        color: var(--text);
+        padding: 10px 12px;
+        border-radius: 8px;
+      }
+      .hint {
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .muted {
+        color: var(--muted);
+      }
+      /* 双列布局 */
+      .split {
+        display: grid;
+        grid-template-columns: 1.4fr 1fr;
+        gap: 16px;
+      }
+      @media (max-width: 960px) {
+        .split {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <!-- 头部状态栏 -->
+    <header>
+      <div>
+        <h1>兜底解析服务控制台</h1>
+        <div class="meta" id="headerMeta">等待数据…</div>
+      </div>
+      <div class="actions">
+        <button class="btn secondary" id="refreshBtn" type="button">刷新</button>
+        <button class="btn secondary" id="logoutBtn" type="button">退出</button>
+      </div>
+    </header>
+    <main class="container">
+      <!-- 顶部汇总卡片 -->
+      <section>
+        <div class="grid cards" id="summaryCards"></div>
+      </section>
+      <!-- 学校维度统计与失败记录 -->
+      <section class="split">
+        <div>
+          <h2 class="section-title">学校维度统计</h2>
+          <table class="table" id="schoolTable">
+            <thead>
+              <tr>
+                <th>学校</th>
+                <th>队列</th>
+                <th>成功率</th>
+                <th>解析</th>
+                <th>总结</th>
+                <th>脚本</th>
+                <th>费用</th>
+                <th>最近更新</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div>
+          <h2 class="section-title">最近失败</h2>
+          <table class="table" id="failureTable">
+            <thead>
+              <tr>
+                <th>脚本</th>
+                <th>原因</th>
+                <th>时间</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+    <!-- 登录遮罩层 -->
+    <div class="login-overlay" id="loginOverlay">
+      <div class="login-panel">
+        <h2>登录</h2>
+        <div class="form-row">
+          <label class="muted">账号</label>
+          <input id="loginUser" type="text" autocomplete="username" placeholder="请输入账号">
+        </div>
+        <div class="form-row">
+          <label class="muted">密码</label>
+          <input id="loginPass" type="password" autocomplete="current-password" placeholder="请输入密码">
+        </div>
+        <div class="actions">
+          <button class="btn" id="loginBtn" type="button">登录</button>
+          <span class="hint" id="loginHint"></span>
+        </div>
+      </div>
+    </div>
+    <script>
+      // 页面元素引用
+      const overlay = document.getElementById("loginOverlay");
+      const loginBtn = document.getElementById("loginBtn");
+      const loginHint = document.getElementById("loginHint");
+      const refreshBtn = document.getElementById("refreshBtn");
+      const logoutBtn = document.getElementById("logoutBtn");
+      const summaryCards = document.getElementById("summaryCards");
+      const schoolTableBody = document.querySelector("#schoolTable tbody");
+      const failureTableBody = document.querySelector("#failureTable tbody");
+      const headerMeta = document.getElementById("headerMeta");
+
+      // Token 存取
+      function getToken() {
+        return localStorage.getItem("dawn_admin_token") || "";
+      }
+      function setToken(token) {
+        localStorage.setItem("dawn_admin_token", token);
+      }
+      function clearToken() {
+        localStorage.removeItem("dawn_admin_token");
+      }
+      // 格式化展示
+      function formatTime(ts) {
+        if (!ts) return "-";
+        const date = new Date(ts);
+        return `${date.toLocaleDateString()} ${date.toLocaleTimeString()}`;
+      }
+      function formatCount(value) {
+        return Number(value || 0).toLocaleString();
+      }
+      function formatCost(value) {
+        return Number(value || 0).toFixed(4);
+      }
+      function calcSuccessRate(success, failed, empty) {
+        const total = success + failed + empty;
+        if (total <= 0) return 0;
+        return success / total;
+      }
+      // 渲染顶部汇总卡片
+      function renderCards(data) {
+        const metrics = data.metrics || {};
+        const latestMetricsAt = data.latestMetricsAt || 0;
+        const cards = [
+          {
+            title: "解析成功",
+            value: formatCount(metrics.parse_success?.count),
+            sub: `平均耗时 ${Number(metrics.parse_success?.latencyMsAvg || 0).toFixed(1)} ms`
+          },
+          {
+            title: "解析失败",
+            value: formatCount(metrics.parse_failed?.count),
+            sub: `空结果 ${formatCount(metrics.parse_empty?.count)}`
+          },
+          {
+            title: "总结成功",
+            value: formatCount(metrics.summary_success?.count),
+            sub: `失败 ${formatCount(metrics.summary_failed?.count)}`
+          },
+          {
+            title: "脚本修复成功",
+            value: formatCount(metrics.script_success?.count),
+            sub: `失败 ${formatCount(metrics.script_failed?.count)}`
+          },
+          {
+            title: "学校数量",
+            value: formatCount(data.schoolCount),
+            sub: "出现过的学校"
+          },
+          {
+            title: "队列总量",
+            value: formatCount(data.totalQueueLength),
+            sub: "待处理任务"
+          },
+          {
+            title: "失败记录",
+            value: formatCount(data.failureCount),
+            sub: "最近 200 条内"
+          },
+          {
+            title: "模型费用",
+            value: formatCost(
+              (metrics.parse_success?.costTotal || 0) +
+                (metrics.parse_failed?.costTotal || 0) +
+                (metrics.parse_empty?.costTotal || 0) +
+                (metrics.summary_success?.costTotal || 0) +
+                (metrics.summary_failed?.costTotal || 0) +
+                (metrics.script_success?.costTotal || 0) +
+                (metrics.script_failed?.costTotal || 0)
+            ),
+            sub: `指标更新时间 ${formatTime(latestMetricsAt)}`
+          }
+        ];
+        summaryCards.innerHTML = cards
+          .map(
+            (card) => `
+          <div class="card">
+            <h3>${card.title}</h3>
+            <div class="value">${card.value}</div>
+            <div class="sub">${card.sub}</div>
+          </div>
+        `
+          )
+          .join("");
+      }
+      // 渲染学校维度表格
+      function renderSchools(data) {
+        const entries = Object.entries(data.schoolMetrics || {});
+        entries.sort((a, b) => (b[1].lastUpdatedAt || 0) - (a[1].lastUpdatedAt || 0));
+        schoolTableBody.innerHTML = entries
+          .map(([schoolId, info]) => {
+            const queueLen = data.schoolQueues?.[schoolId] ?? 0;
+            const rate = calcSuccessRate(info.parse_success, info.parse_failed, info.parse_empty);
+            const badgeClass = rate >= 0.8 ? "success" : rate >= 0.5 ? "warning" : "danger";
+            return `
+            <tr>
+              <td>${schoolId}</td>
+              <td><span class="badge">${queueLen}</span></td>
+              <td><span class="badge ${badgeClass}">${(rate * 100).toFixed(1)}%</span></td>
+              <td>${info.parse_success}/${info.parse_failed}/${info.parse_empty}</td>
+              <td>${info.summary_success}/${info.summary_failed}</td>
+              <td>${info.script_success}/${info.script_failed}</td>
+              <td>${formatCost(info.costTotal)}</td>
+              <td>${formatTime(info.lastUpdatedAt)}</td>
+            </tr>
+          `;
+          })
+          .join("");
+        if (!entries.length) {
+          schoolTableBody.innerHTML = `<tr><td colspan="8" class="muted">暂无数据</td></tr>`;
+        }
+      }
+      // 渲染失败记录
+      function renderFailures(failures) {
+        const list = failures || [];
+        failureTableBody.innerHTML = list
+          .map(
+            (item) => `
+          <tr>
+            <td>${item.scriptName || "-"}</td>
+            <td>${item.reason || "-"}</td>
+            <td>${formatTime(item.createdAt)}</td>
+          </tr>
+        `
+          )
+          .join("");
+        if (!list.length) {
+          failureTableBody.innerHTML = `<tr><td colspan="3" class="muted">暂无失败记录</td></tr>`;
+        }
+      }
+      // 带登录态的请求封装
+      async function fetchWithAuth(path) {
+        const token = getToken();
+        const res = await fetch(path, {
+          headers: {
+            Authorization: `Bearer ${token}`
+          }
+        });
+        if (res.status === 401) {
+          throw new Error("unauthorized");
+        }
+        return res.json();
+      }
+      // 拉取并刷新页面数据
+      async function refreshData() {
+        const result = await fetchWithAuth("/api/v1/admin/data");
+        const data = result.data || {};
+        headerMeta.textContent = `启动时间：${formatTime(
+          data.serverStartedAt
+        )} | 指标刷新：${formatTime(data.latestMetricsAt)} | 最后刷新：${formatTime(
+          Date.now()
+        )} | 统计文件：${data.metricsFile || "-"}`;
+        renderCards(data);
+        renderSchools(data);
+        renderFailures(data.failures || []);
+      }
+      // 检查登录态并展示页面
+      async function checkSession() {
+        try {
+          await fetchWithAuth("/api/v1/admin/session");
+          overlay.style.display = "none";
+          await refreshData();
+        } catch {
+          overlay.style.display = "flex";
+        }
+      }
+      // 登录逻辑
+      loginBtn.addEventListener("click", async () => {
+        loginHint.textContent = "";
+        const username = document.getElementById("loginUser").value.trim();
+        const password = document.getElementById("loginPass").value.trim();
+        if (!username || !password) {
+          loginHint.textContent = "请输入账号和密码";
+          return;
+        }
+        const res = await fetch("/api/v1/admin/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ username, password })
+        });
+        if (!res.ok) {
+          loginHint.textContent = "账号或密码错误";
+          return;
+        }
+        const result = await res.json();
+        setToken(result.data.token);
+        overlay.style.display = "none";
+        await refreshData();
+      });
+      // 手动刷新
+      refreshBtn.addEventListener("click", async () => {
+        await refreshData();
+      });
+      // 退出登录
+      logoutBtn.addEventListener("click", async () => {
+        try {
+          await fetchWithAuth("/api/v1/admin/logout");
+        } catch {}
+        clearToken();
+        overlay.style.display = "flex";
+      });
+      // 初始化检查
+      checkSession();
+      // 定时刷新页面数据
+      setInterval(async () => {
+        if (overlay.style.display === "none") {
+          try {
+            await refreshData();
+          } catch {}
+        }
+      }, 10000);
+    </script>
+  </body>
+</html>

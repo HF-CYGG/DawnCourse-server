@@ -49,6 +49,7 @@ services:
       SCRIPT_SIGN_PRIVATE_KEY: ""
       SCHOOL_METRICS_FILE: /shared/parsers/metrics/school_metrics.txt
       METRICS_FLUSH_MS: 5000
+      ADMIN_SESSION_TTL_MS: 43200000
     volumes:
       - ./html/scripts/parsers:/shared/parsers
     restart: always

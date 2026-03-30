@@ -50,6 +50,10 @@ const scriptSignPrivateKey = process.env.SCRIPT_SIGN_PRIVATE_KEY || "";
 const schoolMetricsFile =
   process.env.SCHOOL_METRICS_FILE || path.join(scriptOutputDir, "metrics", "school_metrics.txt");
 const metricsFlushMs = Number(process.env.METRICS_FLUSH_MS || 5000);
+// 管理后台会话有效期（默认 12 小时）
+const adminSessionTtlMs = Number(process.env.ADMIN_SESSION_TTL_MS || 12 * 60 * 60 * 1000);
+// 服务启动时间戳，用于面板展示启动时长
+const serverStartedAt = Date.now();
 // 单次脚本修复并发控制
 const schoolProcessing = new Map();
 let metricsFlushTimer = null;
@@ -59,6 +63,13 @@ redisClient.on("error", (error) => {
   console.error("redis error:", error);
 });
 await redisClient.connect();
+// 初始化管理后台账号密码，仅首次启动生成一次
+const adminCredentialInfo = await initAdminCredentials();
+if (adminCredentialInfo) {
+  console.log(
+    `admin credentials: username=${adminCredentialInfo.username} password=${adminCredentialInfo.password}`
+  );
+}
 
 // HTTP 服务：提供提交任务与查询任务状态
 const server = http.createServer(async (req, res) => {
@@ -98,6 +109,51 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && url.pathname === "/metrics") {
     const text = await buildPrometheusMetrics();
     return sendText(res, 200, text);
+  }
+  // 管理后台登录
+  if (req.method === "POST" && url.pathname === "/api/v1/admin/login") {
+    const bodyText = await readBody(req, maxContentLength);
+    if (bodyText == null) {
+      return sendJson(res, 413, { code: 413, msg: "请求体过大" });
+    }
+    const body = safeJson(bodyText);
+    const username = (body?.username || "").toString();
+    const password = (body?.password || "").toString();
+    if (!username || !password) {
+      return sendJson(res, 400, { code: 400, msg: "缺少账号或密码" });
+    }
+    const verified = await verifyAdminCredentials(username, password);
+    if (!verified) {
+      return sendJson(res, 401, { code: 401, msg: "账号或密码错误" });
+    }
+    const token = await createAdminSession(username);
+    return sendJson(res, 200, { code: 200, data: { token, username } });
+  }
+  // 管理后台退出
+  if (req.method === "POST" && url.pathname === "/api/v1/admin/logout") {
+    const auth = await requireAdminAuth(req);
+    if (!auth.ok) {
+      return sendJson(res, 401, { code: 401, msg: "未登录" });
+    }
+    await deleteAdminSession(auth.token);
+    return sendJson(res, 200, { code: 200, msg: "ok" });
+  }
+  // 管理后台会话校验
+  if (req.method === "GET" && url.pathname === "/api/v1/admin/session") {
+    const auth = await requireAdminAuth(req);
+    if (!auth.ok) {
+      return sendJson(res, 401, { code: 401, msg: "未登录" });
+    }
+    return sendJson(res, 200, { code: 200, data: { username: auth.username } });
+  }
+  // 管理后台聚合数据
+  if (req.method === "GET" && url.pathname === "/api/v1/admin/data") {
+    const auth = await requireAdminAuth(req);
+    if (!auth.ok) {
+      return sendJson(res, 401, { code: 401, msg: "未登录" });
+    }
+    const data = await buildAdminDashboardData();
+    return sendJson(res, 200, { code: 200, data });
   }
   // 提交解析任务
   if (req.method === "POST" && url.pathname === "/api/v1/parse_task") {
@@ -177,6 +233,8 @@ async function enqueueSchoolSubmission(schoolId, content, scriptName) {
   const item = { content, scriptName, createdAt: now, hash: contentHash };
   const queueKey = buildQueueKey(schoolId);
   try {
+    // 记录出现过的学校，用于运维面板汇总展示
+    await redisClient.sAdd("school:ids", schoolId);
     await redisClient.rPush(queueKey, JSON.stringify(item));
     await redisClient.lTrim(queueKey, -maxQueueSize, -1);
     await redisClient.expire(queueKey, Math.ceil(queueItemTtlMs / 1000));
@@ -864,6 +922,136 @@ async function buildPrometheusMetrics() {
   return lines.join("\n");
 }
 
+/**
+ * 获取所有已出现的学校 ID（队列与指标两处合并）
+ */
+async function getKnownSchoolIds() {
+  const ids = await redisClient.sMembers("school:ids");
+  const metricIds = await redisClient.sMembers("school:metrics:ids");
+  return Array.from(new Set([...ids, ...metricIds]));
+}
+
+/**
+ * 构建管理后台聚合数据，避免前端多接口拼装
+ */
+async function buildAdminDashboardData() {
+  const [metrics, schoolMetrics, failures, schoolIds] = await Promise.all([
+    getMetricsSnapshot(),
+    getSchoolMetricsSnapshot(),
+    getScriptFailures(200),
+    getKnownSchoolIds()
+  ]);
+  const schoolQueues = {};
+  let totalQueueLength = 0;
+  for (const schoolId of schoolIds) {
+    const queueLength = await redisClient.lLen(buildQueueKey(schoolId));
+    schoolQueues[schoolId] = queueLength;
+    totalQueueLength += queueLength;
+  }
+  const metricUpdatedAtList = Object.values(metrics).map((item) => item.lastUpdatedAt || 0);
+  const schoolUpdatedAtList = Object.values(schoolMetrics).map((item) => item.lastUpdatedAt || 0);
+  const latestMetricsAt = Math.max(0, ...metricUpdatedAtList, ...schoolUpdatedAtList);
+  return {
+    serverStartedAt,
+    metrics,
+    schoolMetrics,
+    schoolQueues,
+    failures,
+    metricsFile: schoolMetricsFile,
+    schoolCount: schoolIds.length,
+    totalQueueLength,
+    failureCount: failures.length,
+    latestMetricsAt
+  };
+}
+
+/**
+ * 使用盐值对密码做不可逆哈希
+ */
+function hashPassword(password, salt) {
+  return hashText(`${salt}:${password}`);
+}
+
+/**
+ * 初始化管理后台账号密码，仅首次创建并写入 Redis
+ */
+async function initAdminCredentials() {
+  const key = buildAdminCredentialKey();
+  const cached = await redisClient.get(key);
+  if (cached) return null;
+  const username = `admin_${randomString(6)}`;
+  const password = randomString(12);
+  const salt = randomString(8);
+  const passwordHash = hashPassword(password, salt);
+  const payload = { username, passwordHash, salt, createdAt: Date.now() };
+  await redisClient.set(key, JSON.stringify(payload));
+  return { username, password };
+}
+
+/**
+ * 获取当前保存的管理后台账号信息
+ */
+async function getAdminCredentials() {
+  const raw = await redisClient.get(buildAdminCredentialKey());
+  return raw ? safeJson(raw) : null;
+}
+
+/**
+ * 校验管理后台账号密码
+ */
+async function verifyAdminCredentials(username, password) {
+  const credentials = await getAdminCredentials();
+  if (!credentials) return false;
+  if (credentials.username !== username) return false;
+  const hash = hashPassword(password, credentials.salt || "");
+  return hash === credentials.passwordHash;
+}
+
+/**
+ * 创建管理后台会话并返回 token
+ */
+async function createAdminSession(username) {
+  const token = crypto.randomUUID();
+  await redisClient.set(buildAdminSessionKey(token), username, { PX: adminSessionTtlMs });
+  return token;
+}
+
+/**
+ * 删除管理后台会话
+ */
+async function deleteAdminSession(token) {
+  await redisClient.del(buildAdminSessionKey(token));
+}
+
+/**
+ * 从请求中校验管理后台登录态
+ */
+async function requireAdminAuth(req) {
+  const token = getBearerToken(req);
+  if (!token) return { ok: false };
+  const username = await redisClient.get(buildAdminSessionKey(token));
+  if (!username) return { ok: false };
+  return { ok: true, username, token };
+}
+
+/**
+ * 解析 Bearer Token
+ */
+function getBearerToken(req) {
+  const auth = req.headers.authorization || "";
+  if (typeof auth === "string" && auth.startsWith("Bearer ")) {
+    return auth.slice(7).trim();
+  }
+  return "";
+}
+
+/**
+ * 生成指定长度的随机字符串
+ */
+function randomString(length) {
+  return crypto.randomBytes(length).toString("base64").replace(/[^a-zA-Z0-9]/g, "").slice(0, length);
+}
+
 async function getScriptFailures(limit) {
   const safeLimit = Math.min(Math.max(limit, 1), 200);
   const items = await redisClient.lRange("script:failures", 0, safeLimit - 1);
@@ -947,6 +1135,20 @@ function buildDedupKey(schoolId, hash) {
 
 function buildMetricKey(type) {
   return `metrics:${type}`;
+}
+
+/**
+ * 管理后台账号 Redis Key
+ */
+function buildAdminCredentialKey() {
+  return "admin:credentials";
+}
+
+/**
+ * 管理后台会话 Redis Key
+ */
+function buildAdminSessionKey(token) {
+  return `admin:session:${token}`;
 }
 
 function buildScriptMetaKey(scriptName) {

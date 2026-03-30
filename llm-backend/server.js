@@ -9,8 +9,8 @@ import { createClient } from "redis";
 const port = Number(process.env.PORT || 8080);
 // 单次请求超时
 const timeoutMs = Number(process.env.LLM_TIMEOUT_MS || 20000);
-// 请求体最大长度
-const maxContentLength = Number(process.env.MAX_CONTENT_LENGTH || 200000);
+// 请求体最大长度（默认 100 万字符，避免被动截断上传）
+const maxContentLength = Number(process.env.MAX_CONTENT_LENGTH || 1000000);
 // 任务缓存清理的最大存活时长
 const taskTtlMs = Number(process.env.TASK_TTL_MS || 1800000);
 // 低成本总结模型配置（模型 1）
@@ -169,9 +169,14 @@ const server = http.createServer(async (req, res) => {
     const schoolName = (body?.schoolName || body?.school_name || "").toString();
     const schoolSystemTypeInput = (body?.schoolSystemType || body?.systemType || "").toString();
     const scriptName = (body?.scriptName || body?.script_name || "").toString();
+    const userConsent = body?.userConsent === true || body?.consent === true;
     // content 不能为空
     if (!content) {
       return sendJson(res, 400, { code: 400, msg: "缺少 content" });
+    }
+    // 必须有用户明确同意，避免静默上传
+    if (!userConsent) {
+      return sendJson(res, 400, { code: 400, msg: "需要用户明确同意后才能上传" });
     }
     // 未配置密钥时阻断请求
     if (!apiKey && provider !== "gemini") {

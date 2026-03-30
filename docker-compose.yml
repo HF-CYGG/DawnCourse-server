@@ -10,24 +10,11 @@ services:
       - ./html:/usr/share/nginx/html
     depends_on:
       - llm-backend
+      - redis
   llm-backend:
     # LLM 异步解析服务
     build: ./llm-backend
     environment:
-      # 模型提供方
-      LLM_PROVIDER: gpt
-      # 模型密钥
-      LLM_API_KEY: ""
-      # 模型名称
-      LLM_MODEL: gpt-4o-mini
-      # 自定义模型网关（为空则走默认）
-      LLM_BASE_URL: ""
-      # 单次请求超时
-      LLM_TIMEOUT_MS: 20000
-      # 最大请求体长度
-      MAX_CONTENT_LENGTH: 200000
-      # 任务缓存最大存活时长
-      TASK_TTL_MS: 1800000
       # 模型 1（总结）配置
       LLM_SUMMARY_PROVIDER: gpt
       LLM_SUMMARY_API_KEY: ""
@@ -38,14 +25,37 @@ services:
       LLM_SCRIPT_API_KEY: ""
       LLM_SCRIPT_MODEL: gpt-4o
       LLM_SCRIPT_BASE_URL: ""
+      REDIS_URL: redis://redis:6379
       # 脚本输出目录
       SCRIPT_OUTPUT_DIR: /shared/parsers
+      # 单次请求超时
+      LLM_TIMEOUT_MS: 20000
+      # 最大请求体长度
+      MAX_CONTENT_LENGTH: 200000
+      # 任务缓存最大存活时长
+      TASK_TTL_MS: 1800000
       # 队列触发阈值
       MIN_QUEUE_SIZE: 3
       # 合并窗口
       MERGE_WINDOW_MS: 600000
       # 24 小时内二次提交处理窗口
       REPROCESS_WINDOW_MS: 86400000
+      RATE_LIMIT_PER_MIN: 120
+      RATE_LIMIT_SCHOOL_PER_MIN: 60
+      LLM_SUMMARY_COST_PER_CALL: 0
+      LLM_SCRIPT_COST_PER_CALL: 0
+      LLM_PARSE_COST_PER_CALL: 0
+      SCRIPT_SIGN_KEY: ""
     volumes:
       - ./html/scripts/parsers:/shared/parsers
     restart: always
+    depends_on:
+      - redis
+  redis:
+    image: redis:7-alpine
+    restart: always
+    volumes:
+      - redis-data:/data
+
+volumes:
+  redis-data:

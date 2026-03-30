@@ -1,17 +1,12 @@
 import http from "node:http";
 import { URL } from "node:url";
 import crypto from "node:crypto";
+import fs from "node:fs/promises";
+import path from "node:path";
+import { createClient } from "redis";
 
 // 服务端监听端口
 const port = Number(process.env.PORT || 8080);
-// 解析模型提供方：deepseek/qwen/glm/gemini/gpt
-const provider = (process.env.LLM_PROVIDER || "gpt").toLowerCase();
-// 解析模型 API Key
-const apiKey = process.env.LLM_API_KEY || "";
-// 解析模型名称
-const model = process.env.LLM_MODEL || defaultModel(provider);
-// 解析模型基础地址（可用于私有网关或代理）
-const baseUrl = process.env.LLM_BASE_URL || defaultBaseUrl(provider);
 // 单次请求超时
 const timeoutMs = Number(process.env.LLM_TIMEOUT_MS || 20000);
 // 请求体最大长度
@@ -19,15 +14,20 @@ const maxContentLength = Number(process.env.MAX_CONTENT_LENGTH || 200000);
 // 任务缓存清理的最大存活时长
 const taskTtlMs = Number(process.env.TASK_TTL_MS || 1800000);
 // 低成本总结模型配置（模型 1）
-const summaryProvider = (process.env.LLM_SUMMARY_PROVIDER || provider).toLowerCase();
-const summaryApiKey = process.env.LLM_SUMMARY_API_KEY || apiKey;
+const summaryProvider = (process.env.LLM_SUMMARY_PROVIDER || "gpt").toLowerCase();
+const summaryApiKey = process.env.LLM_SUMMARY_API_KEY || "";
 const summaryModel = process.env.LLM_SUMMARY_MODEL || defaultSummaryModel(summaryProvider);
 const summaryBaseUrl = process.env.LLM_SUMMARY_BASE_URL || defaultBaseUrl(summaryProvider);
 // 高成本脚本修复模型配置（模型 2）
-const scriptProvider = (process.env.LLM_SCRIPT_PROVIDER || provider).toLowerCase();
-const scriptApiKey = process.env.LLM_SCRIPT_API_KEY || apiKey;
+const scriptProvider = (process.env.LLM_SCRIPT_PROVIDER || "gpt").toLowerCase();
+const scriptApiKey = process.env.LLM_SCRIPT_API_KEY || "";
 const scriptModel = process.env.LLM_SCRIPT_MODEL || defaultScriptModel(scriptProvider);
 const scriptBaseUrl = process.env.LLM_SCRIPT_BASE_URL || defaultBaseUrl(scriptProvider);
+const provider = summaryProvider;
+const apiKey = summaryApiKey;
+const model = summaryModel;
+const baseUrl = summaryBaseUrl;
+const redisUrl = process.env.REDIS_URL || "redis://redis:6379";
 // 脚本输出目录
 const scriptOutputDir = process.env.SCRIPT_OUTPUT_DIR || "/shared/parsers";
 // 同一学校触发脚本修复的最小提交数
@@ -36,25 +36,20 @@ const minQueueSize = Number(process.env.MIN_QUEUE_SIZE || 3);
 const mergeWindowMs = Number(process.env.MERGE_WINDOW_MS || 10 * 60 * 1000);
 // 脚本更新后 24 小时内的二次提交处理窗口
 const reprocessWindowMs = Number(process.env.REPROCESS_WINDOW_MS || 24 * 60 * 60 * 1000);
+const rateLimitPerMin = Number(process.env.RATE_LIMIT_PER_MIN || 120);
+const rateLimitSchoolPerMin = Number(process.env.RATE_LIMIT_SCHOOL_PER_MIN || 60);
+const summaryCostPerCall = Number(process.env.LLM_SUMMARY_COST_PER_CALL || 0);
+const scriptCostPerCall = Number(process.env.LLM_SCRIPT_COST_PER_CALL || 0);
+const parseCostPerCall = Number(process.env.LLM_PARSE_COST_PER_CALL || 0);
+const scriptSignKey = process.env.SCRIPT_SIGN_KEY || "";
 // 单次脚本修复并发控制
 const schoolProcessing = new Map();
 
-// 内存任务缓存（生产可替换为 Redis）
-const tasks = new Map();
-// 学校维度的提交队列
-const schoolQueues = new Map();
-// 学校维度的脚本状态
-const schoolScriptState = new Map();
-// 定时清理过期任务，避免内存增长
-const cleanupInterval = Math.min(taskTtlMs, 600000);
-setInterval(() => {
-  const now = Date.now();
-  for (const [taskId, task] of tasks.entries()) {
-    if (now - task.createdAt > taskTtlMs) {
-      tasks.delete(taskId);
-    }
-  }
-}, cleanupInterval);
+const redisClient = createClient({ url: redisUrl });
+redisClient.on("error", (error) => {
+  console.error("redis error:", error);
+});
+await redisClient.connect();
 
 // HTTP 服务：提供提交任务与查询任务状态
 const server = http.createServer(async (req, res) => {
@@ -86,17 +81,20 @@ const server = http.createServer(async (req, res) => {
     if (!apiKey && provider === "gemini") {
       return sendJson(res, 500, { code: 500, msg: "服务端未配置 Gemini API Key" });
     }
+    const clientIp = getClientIp(req);
+    const rateAllowed = await checkRateLimit(clientIp, schoolId);
+    if (!rateAllowed) {
+      return sendJson(res, 429, { code: 429, msg: "请求过于频繁" });
+    }
+    const safeContent = sanitizeContent(content);
     // 生成任务并进入异步处理
     const taskId = crypto.randomUUID();
-    tasks.set(taskId, { status: "PROCESSING", result: null, createdAt: Date.now() });
-    runTask(taskId, content).catch(() => {
-      const task = tasks.get(taskId);
-      if (task) {
-        tasks.set(taskId, { ...task, status: "FAILED", result: null });
-      }
+    await saveTask(taskId, { status: "PROCESSING", result: null, createdAt: Date.now() });
+    runTask(taskId, safeContent).catch(async () => {
+      await saveTask(taskId, { status: "FAILED", result: null, createdAt: Date.now() });
     });
     if (schoolId) {
-      enqueueSchoolSubmission(schoolId, content, scriptName);
+      enqueueSchoolSubmission(schoolId, safeContent, scriptName);
     }
     return sendJson(res, 200, { code: 200, msg: "ok", taskId });
   }
@@ -106,7 +104,7 @@ const server = http.createServer(async (req, res) => {
     if (!taskId) {
       return sendJson(res, 400, { code: 400, msg: "缺少 taskId" });
     }
-    const task = tasks.get(taskId);
+    const task = await getTask(taskId);
     if (!task) {
       return sendJson(res, 404, { code: 404, msg: "任务不存在" });
     }
@@ -131,9 +129,12 @@ server.listen(port, () => {
  */
 function enqueueSchoolSubmission(schoolId, content, scriptName) {
   const now = Date.now();
-  const queue = schoolQueues.get(schoolId) || [];
-  queue.push({ content, scriptName, createdAt: now });
-  schoolQueues.set(schoolId, queue);
+  const item = { content, scriptName, createdAt: now };
+  const queueKey = buildQueueKey(schoolId);
+  redisClient
+    .rPush(queueKey, JSON.stringify(item))
+    .then(() => redisClient.expire(queueKey, Math.ceil(reprocessWindowMs / 1000)))
+    .catch((error) => console.error("enqueue error:", error));
   scheduleSchoolProcessing(schoolId);
 }
 
@@ -156,39 +157,50 @@ function scheduleSchoolProcessing(schoolId) {
  * 学校维度队列处理逻辑
  */
 async function processSchoolQueue(schoolId) {
-  const queue = schoolQueues.get(schoolId) || [];
-  if (queue.length < minQueueSize) return;
-  const now = Date.now();
-  const recentQueue = queue.filter((item) => now - item.createdAt <= mergeWindowMs);
-  if (recentQueue.length < minQueueSize) return;
-  const state = schoolScriptState.get(schoolId) || {
-    lastSummaryHash: "",
-    lastScriptHash: "",
-    lastUpdatedAt: 0
-  };
-  const mergedText = recentQueue.map((item, index) => `【提交 ${index + 1}】\n${item.content}`).join("\n");
-  const summary = await summarizeSubmissions(mergedText);
-  if (!summary) return;
-  const summaryHash = hashText(summary);
-  const shouldProcessIndividually =
-    state.lastUpdatedAt > 0 && now - state.lastUpdatedAt <= reprocessWindowMs && summaryHash !== state.lastSummaryHash;
-  if (shouldProcessIndividually) {
-    await processIndividualSummaries(schoolId, queue);
-    schoolQueues.set(schoolId, []);
-    return;
+  const lockKey = buildSchoolLockKey(schoolId);
+  const lockToken = crypto.randomUUID();
+  const lockAcquired = await acquireLock(lockKey, lockToken, mergeWindowMs);
+  if (!lockAcquired) return;
+  try {
+    const queue = await getSchoolQueue(schoolId);
+    if (queue.length < minQueueSize) return;
+    const now = Date.now();
+    const recentQueue = queue.filter((item) => now - item.createdAt <= mergeWindowMs);
+    if (recentQueue.length < minQueueSize) return;
+    const state = (await getSchoolState(schoolId)) || {
+      lastSummaryHash: "",
+      lastScriptHash: "",
+      lastUpdatedAt: 0
+    };
+    const mergedText = recentQueue.map((item, index) => `【提交 ${index + 1}】\n${item.content}`).join("\n");
+    const summary = await summarizeSubmissions(mergedText);
+    if (!summary) return;
+    const summaryHash = hashText(summary);
+    const shouldProcessIndividually =
+      state.lastUpdatedAt > 0 && now - state.lastUpdatedAt <= reprocessWindowMs && summaryHash !== state.lastSummaryHash;
+    if (shouldProcessIndividually) {
+      await processIndividualSummaries(schoolId, queue);
+      await clearSchoolQueue(schoolId);
+      return;
+    }
+    const scriptName = resolveScriptName(schoolId, recentQueue);
+    const previousScript = await readScript(scriptName);
+    const generatedScript = await generateParserScript(summary, previousScript);
+    if (!generatedScript) return;
+    const applyResult = await applyScriptUpdate(scriptName, generatedScript, previousScript);
+    if (!applyResult.ok) {
+      await recordScriptFailure(scriptName, applyResult.reason || "脚本校验失败");
+      return;
+    }
+    await setSchoolState(schoolId, {
+      lastSummaryHash: summaryHash,
+      lastScriptHash: hashText(generatedScript),
+      lastUpdatedAt: now
+    });
+    await clearSchoolQueue(schoolId);
+  } finally {
+    await releaseLock(lockKey, lockToken);
   }
-  const scriptName = resolveScriptName(schoolId, recentQueue);
-  const previousScript = await readScript(scriptName);
-  const generatedScript = await generateParserScript(summary, previousScript);
-  if (!generatedScript) return;
-  const scriptHash = hashText(generatedScript);
-  await writeScript(scriptName, generatedScript);
-  schoolScriptState.set(schoolId, {
-    lastSummaryHash: summaryHash,
-    lastScriptHash: scriptHash,
-    lastUpdatedAt: now
-  });
-  schoolQueues.set(schoolId, []);
 }
 
 /**
@@ -206,8 +218,12 @@ async function processIndividualSummaries(schoolId, queue) {
   const previousScript = await readScript(scriptName);
   const generatedScript = await generateParserScript(mergedSummary, previousScript);
   if (!generatedScript) return;
-  await writeScript(scriptName, generatedScript);
-  schoolScriptState.set(schoolId, {
+  const applyResult = await applyScriptUpdate(scriptName, generatedScript, previousScript);
+  if (!applyResult.ok) {
+    await recordScriptFailure(scriptName, applyResult.reason || "脚本校验失败");
+    return;
+  }
+  await setSchoolState(schoolId, {
     lastSummaryHash: hashText(mergedSummary),
     lastScriptHash: hashText(generatedScript),
     lastUpdatedAt: Date.now()
@@ -221,17 +237,21 @@ async function processIndividualSummaries(schoolId, queue) {
  * @param content 已脱敏文本
  */
 async function runTask(taskId, content) {
+  const startTime = Date.now();
   const resultText = await callProvider(content);
+  const latencyMs = Date.now() - startTime;
+  const existing = await getTask(taskId);
+  const createdAt = existing?.createdAt || Date.now();
   if (!resultText) {
-    const task = tasks.get(taskId);
-    if (task) {
-      tasks.set(taskId, { ...task, status: "FAILED", result: null });
-    }
+    await saveTask(taskId, { status: "FAILED", result: null, createdAt });
+    await recordMetric("parse_failed", latencyMs, parseCostPerCall);
     return;
   }
-  const task = tasks.get(taskId);
-  if (task) {
-    tasks.set(taskId, { ...task, status: "SUCCESS", result: resultText });
+  await saveTask(taskId, { status: "SUCCESS", result: resultText, createdAt });
+  if (isEmptyResult(resultText)) {
+    await recordMetric("parse_empty", latencyMs, parseCostPerCall);
+  } else {
+    await recordMetric("parse_success", latencyMs, parseCostPerCall);
   }
 }
 
@@ -272,6 +292,7 @@ async function callOpenAICompatibleRaw(systemPrompt, userPrompt, options = {}) {
   const requestApiKey = options.apiKey || apiKey;
   const requestModel = options.model || model;
   const requestBaseUrl = options.baseUrl || baseUrl;
+  if (!requestApiKey) return null;
   const endpoint = `${requestBaseUrl}${openAiPath(requestProvider)}`;
   const body = {
     model: requestModel,
@@ -297,6 +318,7 @@ async function callGeminiRaw(systemPrompt, userPrompt, options = {}) {
   const requestApiKey = options.apiKey || apiKey;
   const requestModel = options.model || model;
   const requestBaseUrl = options.baseUrl || baseUrl;
+  if (!requestApiKey) return null;
   const endpoint = `${requestBaseUrl}/models/${requestModel}:generateContent?key=${requestApiKey}`;
   const body = {
     contents: [
@@ -328,20 +350,28 @@ async function summarizeSubmissions(content) {
     "请总结以下多条提交内容的共同结构特征、字段含义、课程信息位置与可能的异常点。" +
     "输出格式为 6-12 条中文要点列表，每条不超过 30 字。\n" +
     `内容如下：\n${content}`;
-  if (summaryProvider === "gemini") {
-    return await callGeminiRaw(systemPrompt, userPrompt, {
-      provider: summaryProvider,
-      apiKey: summaryApiKey,
-      model: summaryModel,
-      baseUrl: summaryBaseUrl
-    });
+  const startTime = Date.now();
+  const rawText =
+    summaryProvider === "gemini"
+      ? await callGeminiRaw(systemPrompt, userPrompt, {
+          provider: summaryProvider,
+          apiKey: summaryApiKey,
+          model: summaryModel,
+          baseUrl: summaryBaseUrl
+        })
+      : await callOpenAICompatibleRaw(systemPrompt, userPrompt, {
+          provider: summaryProvider,
+          apiKey: summaryApiKey,
+          model: summaryModel,
+          baseUrl: summaryBaseUrl
+        });
+  const latencyMs = Date.now() - startTime;
+  if (!rawText) {
+    await recordMetric("summary_failed", latencyMs, summaryCostPerCall);
+    return "";
   }
-  return await callOpenAICompatibleRaw(systemPrompt, userPrompt, {
-    provider: summaryProvider,
-    apiKey: summaryApiKey,
-    model: summaryModel,
-    baseUrl: summaryBaseUrl
-  });
+  await recordMetric("summary_success", latencyMs, summaryCostPerCall);
+  return rawText;
 }
 
 /**
@@ -359,6 +389,7 @@ async function generateParserScript(summary, previousScript) {
     `【结构总结】\n${summary}\n` +
     `【旧脚本】\n${previousScript || "无"}\n` +
     "请仅输出 JS 源码。";
+  const startTime = Date.now();
   const rawText =
     scriptProvider === "gemini"
       ? await callGeminiRaw(systemPrompt, userPrompt, {
@@ -373,7 +404,12 @@ async function generateParserScript(summary, previousScript) {
           model: scriptModel,
           baseUrl: scriptBaseUrl
         });
-  if (!rawText) return "";
+  const latencyMs = Date.now() - startTime;
+  if (!rawText) {
+    await recordMetric("script_failed", latencyMs, scriptCostPerCall);
+    return "";
+  }
+  await recordMetric("script_success", latencyMs, scriptCostPerCall);
   return cleanScriptOutput(rawText);
 }
 
@@ -391,23 +427,11 @@ function resolveScriptName(schoolId, queue) {
  */
 async function readScript(scriptName) {
   try {
-    const fs = await import("node:fs/promises");
-    const fullPath = `${scriptOutputDir}/${scriptName}`;
+    const fullPath = buildScriptPath(scriptName);
     return await fs.readFile(fullPath, "utf-8");
   } catch {
     return "";
   }
-}
-
-/**
- * 写入脚本文件
- */
-async function writeScript(scriptName, content) {
-  const fs = await import("node:fs/promises");
-  const path = await import("node:path");
-  const fullPath = `${scriptOutputDir}/${scriptName}`;
-  await fs.mkdir(path.dirname(fullPath), { recursive: true });
-  await fs.writeFile(fullPath, content, "utf-8");
 }
 
 /**
@@ -433,6 +457,247 @@ function cleanScriptOutput(text) {
     }
   }
   return trimmed;
+}
+
+async function applyScriptUpdate(scriptName, content, previousContent) {
+  const validation = validateScriptStructure(content);
+  if (!validation.ok) {
+    return { ok: false, reason: validation.reason };
+  }
+  const fullPath = buildScriptPath(scriptName);
+  try {
+    await fs.mkdir(path.dirname(fullPath), { recursive: true });
+    if (previousContent) {
+      await writeBackupScript(scriptName, previousContent);
+    }
+    await fs.writeFile(fullPath, content, "utf-8");
+    const meta = await buildScriptMeta(scriptName, content);
+    await writeScriptMeta(scriptName, meta);
+    return { ok: true };
+  } catch (error) {
+    if (previousContent) {
+      try {
+        await fs.writeFile(fullPath, previousContent, "utf-8");
+      } catch {
+        return { ok: false, reason: "脚本写入失败且回滚失败" };
+      }
+    }
+    return { ok: false, reason: error?.message || "脚本写入失败" };
+  }
+}
+
+function validateScriptStructure(content) {
+  const trimmed = content.trim();
+  if (!trimmed || trimmed.length < 50) {
+    return { ok: false, reason: "脚本内容过短" };
+  }
+  if (!/return\s+/.test(trimmed)) {
+    return { ok: false, reason: "脚本缺少 return 语句" };
+  }
+  if (!/JSON\.stringify/.test(trimmed) && !/__dawnResult/.test(trimmed)) {
+    return { ok: false, reason: "脚本缺少 JSON 输出" };
+  }
+  if (/require\s*\(/.test(trimmed)) {
+    return { ok: false, reason: "脚本包含不允许的模块依赖" };
+  }
+  return { ok: true };
+}
+
+async function buildScriptMeta(scriptName, content) {
+  const previousMeta = await getScriptMeta(scriptName);
+  const version = (previousMeta?.version || 0) + 1;
+  const sha256 = hashText(content);
+  const signature = signScript(content);
+  return {
+    scriptName,
+    version,
+    sha256,
+    signature,
+    updatedAt: Date.now()
+  };
+}
+
+async function getScriptMeta(scriptName) {
+  const metaKey = buildScriptMetaKey(scriptName);
+  const cached = await redisClient.get(metaKey);
+  if (cached) return safeJson(cached);
+  try {
+    const metaPath = buildScriptMetaPath(scriptName);
+    const raw = await fs.readFile(metaPath, "utf-8");
+    return safeJson(raw);
+  } catch {
+    return null;
+  }
+}
+
+async function writeScriptMeta(scriptName, meta) {
+  const metaKey = buildScriptMetaKey(scriptName);
+  const metaPath = buildScriptMetaPath(scriptName);
+  await fs.mkdir(path.dirname(metaPath), { recursive: true });
+  const raw = JSON.stringify(meta);
+  await Promise.all([
+    redisClient.set(metaKey, raw),
+    fs.writeFile(metaPath, raw, "utf-8")
+  ]);
+}
+
+async function writeBackupScript(scriptName, content) {
+  const baseName = sanitizeScriptName(scriptName).replace(/\.js$/i, "");
+  const backupName = `${baseName}.bak.${Date.now()}.js`;
+  const fullPath = path.join(scriptOutputDir, backupName);
+  await fs.mkdir(path.dirname(fullPath), { recursive: true });
+  await fs.writeFile(fullPath, content, "utf-8");
+}
+
+function signScript(content) {
+  if (!scriptSignKey) return "";
+  return crypto.createHmac("sha256", scriptSignKey).update(content).digest("hex");
+}
+
+async function recordScriptFailure(scriptName, reason) {
+  const payload = {
+    scriptName: sanitizeScriptName(scriptName),
+    reason,
+    createdAt: Date.now()
+  };
+  await redisClient.lPush("script:failures", JSON.stringify(payload));
+  await redisClient.lTrim("script:failures", 0, 200);
+}
+
+async function recordMetric(type, latencyMs, cost) {
+  const key = buildMetricKey(type);
+  await redisClient.hIncrBy(key, "count", 1);
+  await redisClient.hIncrByFloat(key, "latencyMsTotal", latencyMs);
+  if (cost > 0) {
+    await redisClient.hIncrByFloat(key, "costTotal", cost);
+  }
+  await redisClient.hSet(key, { lastUpdatedAt: Date.now() });
+}
+
+function isEmptyResult(resultText) {
+  const data = safeJson(resultText);
+  return Array.isArray(data) && data.length === 0;
+}
+
+function getClientIp(req) {
+  const forwarded = req.headers["x-forwarded-for"];
+  if (typeof forwarded === "string" && forwarded.trim()) {
+    return forwarded.split(",")[0].trim();
+  }
+  return req.socket?.remoteAddress || "unknown";
+}
+
+async function checkRateLimit(ip, schoolId) {
+  const ipKey = `rate:ip:${ip}`;
+  const ipCount = await redisClient.incr(ipKey);
+  if (ipCount === 1) {
+    await redisClient.expire(ipKey, 60);
+  }
+  if (ipCount > rateLimitPerMin) return false;
+  if (schoolId) {
+    const schoolKey = `rate:school:${schoolId}`;
+    const schoolCount = await redisClient.incr(schoolKey);
+    if (schoolCount === 1) {
+      await redisClient.expire(schoolKey, 60);
+    }
+    if (schoolCount > rateLimitSchoolPerMin) return false;
+  }
+  return true;
+}
+
+async function saveTask(taskId, task) {
+  const key = buildTaskKey(taskId);
+  await redisClient.set(key, JSON.stringify(task), { PX: taskTtlMs });
+}
+
+async function getTask(taskId) {
+  const key = buildTaskKey(taskId);
+  const raw = await redisClient.get(key);
+  return raw ? safeJson(raw) : null;
+}
+
+async function getSchoolQueue(schoolId) {
+  const key = buildQueueKey(schoolId);
+  const items = await redisClient.lRange(key, 0, -1);
+  return items.map((item) => safeJson(item)).filter(Boolean);
+}
+
+async function clearSchoolQueue(schoolId) {
+  const key = buildQueueKey(schoolId);
+  await redisClient.del(key);
+}
+
+async function getSchoolState(schoolId) {
+  const key = buildSchoolStateKey(schoolId);
+  const raw = await redisClient.get(key);
+  return raw ? safeJson(raw) : null;
+}
+
+async function setSchoolState(schoolId, state) {
+  const key = buildSchoolStateKey(schoolId);
+  await redisClient.set(key, JSON.stringify(state), { PX: reprocessWindowMs });
+}
+
+async function acquireLock(key, token, ttlMs) {
+  const result = await redisClient.set(key, token, { NX: true, PX: ttlMs });
+  return Boolean(result);
+}
+
+async function releaseLock(key, token) {
+  const value = await redisClient.get(key);
+  if (value === token) {
+    await redisClient.del(key);
+  }
+}
+
+function sanitizeContent(content) {
+  let result = content || "";
+  result = result.replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, "[邮箱]");
+  result = result.replace(/1\d{10}/g, "[手机号]");
+  result = result.replace(/\b\d{17}[\dXx]\b/g, "[身份证]");
+  result = result.replace(/\b\d{9,12}\b/g, "[学号]");
+  result = result.replace(/(姓名|name)[:：]\s*[^\s<]{2,10}/gi, "$1:[姓名]");
+  return result;
+}
+
+function buildScriptPath(scriptName) {
+  const safeName = sanitizeScriptName(scriptName);
+  return path.join(scriptOutputDir, safeName);
+}
+
+function buildScriptMetaPath(scriptName) {
+  const safeName = sanitizeScriptName(scriptName).replace(/\.js$/i, "");
+  return path.join(scriptOutputDir, `${safeName}.meta.json`);
+}
+
+function sanitizeScriptName(scriptName) {
+  const name = (scriptName || "").replace(/[\\/]/g, "_").trim();
+  if (name.toLowerCase().endsWith(".js")) return name;
+  return `${name || "unknown"}.js`;
+}
+
+function buildTaskKey(taskId) {
+  return `task:${taskId}`;
+}
+
+function buildQueueKey(schoolId) {
+  return `queue:${schoolId}`;
+}
+
+function buildSchoolStateKey(schoolId) {
+  return `school:state:${schoolId}`;
+}
+
+function buildSchoolLockKey(schoolId) {
+  return `school:lock:${schoolId}`;
+}
+
+function buildMetricKey(type) {
+  return `metrics:${type}`;
+}
+
+function buildScriptMetaKey(scriptName) {
+  return `script:meta:${sanitizeScriptName(scriptName)}`;
 }
 
 /**

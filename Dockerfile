@@ -1,7 +1,5 @@
 FROM nginx:alpine
-
-# Copy static assets to default nginx public folder
-COPY . /usr/share/nginx/html
-
-# Expose port 80
+COPY ./html /usr/share/nginx/html
+COPY ./version.json /usr/share/nginx/html/version.json
+COPY ./nginx.conf /etc/nginx/nginx.conf
 EXPOSE 80

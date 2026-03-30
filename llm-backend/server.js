@@ -166,6 +166,8 @@ const server = http.createServer(async (req, res) => {
     const body = safeJson(bodyText);
     const content = (body?.content || "").toString();
     const schoolId = (body?.schoolId || body?.school_id || "").toString();
+    const schoolName = (body?.schoolName || body?.school_name || "").toString();
+    const schoolSystemTypeInput = (body?.schoolSystemType || body?.systemType || "").toString();
     const scriptName = (body?.scriptName || body?.script_name || "").toString();
     // content 不能为空
     if (!content) {
@@ -184,16 +186,44 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 429, { code: 429, msg: "请求过于频繁" });
     }
     const safeContent = sanitizeContent(content);
+    const schoolSystemType = resolveSchoolSystemType(safeContent, schoolSystemTypeInput);
+    if (schoolId) {
+      await saveSchoolInfo(schoolId, schoolName, schoolSystemType);
+    }
     // 生成任务并进入异步处理
     const taskId = crypto.randomUUID();
-    await saveTask(taskId, { status: "PROCESSING", result: null, createdAt: Date.now() });
+    await saveTask(taskId, {
+      status: "PROCESSING",
+      result: null,
+      createdAt: Date.now(),
+      schoolId,
+      schoolName,
+      schoolSystemType
+    });
     runTask(taskId, safeContent, schoolId).catch(async () => {
-      await saveTask(taskId, { status: "FAILED", result: null, createdAt: Date.now() });
+      await saveTask(taskId, {
+        status: "FAILED",
+        result: null,
+        createdAt: Date.now(),
+        schoolId,
+        schoolName,
+        schoolSystemType
+      });
     });
     if (schoolId) {
-      await enqueueSchoolSubmission(schoolId, safeContent, scriptName);
+      await enqueueSchoolSubmission(schoolId, safeContent, scriptName, {
+        schoolName,
+        schoolSystemType
+      });
     }
-    return sendJson(res, 200, { code: 200, msg: "ok", taskId });
+    return sendJson(res, 200, {
+      code: 200,
+      msg: "ok",
+      taskId,
+      schoolId,
+      schoolName,
+      schoolSystemType
+    });
   }
   // 查询任务状态
   if (req.method === "GET" && url.pathname === "/api/v1/task_status") {
@@ -209,7 +239,10 @@ const server = http.createServer(async (req, res) => {
       code: 200,
       data: {
         status: task.status,
-        result: task.result
+        result: task.result,
+        schoolId: task.schoolId || "",
+        schoolName: task.schoolName || "",
+        schoolSystemType: task.schoolSystemType || "unknown"
       }
     });
   }
@@ -224,13 +257,20 @@ server.listen(port, () => {
 /**
  * 将提交内容加入学校队列
  */
-async function enqueueSchoolSubmission(schoolId, content, scriptName) {
+async function enqueueSchoolSubmission(schoolId, content, scriptName, schoolInfo) {
   const now = Date.now();
   const contentHash = hashText(content);
   const dedupKey = buildDedupKey(schoolId, contentHash);
   const deduped = await redisClient.set(dedupKey, "1", { NX: true, PX: dedupWindowMs });
   if (!deduped) return;
-  const item = { content, scriptName, createdAt: now, hash: contentHash };
+  const item = {
+    content,
+    scriptName,
+    createdAt: now,
+    hash: contentHash,
+    schoolName: schoolInfo?.schoolName || "",
+    schoolSystemType: schoolInfo?.schoolSystemType || "unknown"
+  };
   const queueKey = buildQueueKey(schoolId);
   try {
     // 记录出现过的学校，用于运维面板汇总展示
@@ -296,7 +336,12 @@ async function processSchoolQueue(schoolId) {
     if (!generatedScript) return;
     const applyResult = await applyScriptUpdate(scriptName, generatedScript, previousScript);
     if (!applyResult.ok) {
-      await recordScriptFailure(scriptName, applyResult.reason || "脚本校验失败");
+      await recordScriptFailure(
+        scriptName,
+        applyResult.reason || "脚本校验失败",
+        applyResult.failureType || "unknown",
+        schoolId
+      );
       return;
     }
     await setSchoolState(schoolId, {
@@ -327,7 +372,12 @@ async function processIndividualSummaries(schoolId, queue) {
   if (!generatedScript) return;
   const applyResult = await applyScriptUpdate(scriptName, generatedScript, previousScript);
   if (!applyResult.ok) {
-    await recordScriptFailure(scriptName, applyResult.reason || "脚本校验失败");
+    await recordScriptFailure(
+      scriptName,
+      applyResult.reason || "脚本校验失败",
+      applyResult.failureType || "unknown",
+      schoolId
+    );
     return;
   }
   await setSchoolState(schoolId, {
@@ -349,15 +399,20 @@ async function runTask(taskId, content, schoolId) {
   const latencyMs = Date.now() - startTime;
   const existing = await getTask(taskId);
   const createdAt = existing?.createdAt || Date.now();
+  const baseTask = {
+    schoolId: existing?.schoolId || schoolId || "",
+    schoolName: existing?.schoolName || "",
+    schoolSystemType: existing?.schoolSystemType || "unknown"
+  };
   if (!resultText) {
-    await saveTask(taskId, { status: "FAILED", result: null, createdAt });
+    await saveTask(taskId, { ...baseTask, status: "FAILED", result: null, createdAt });
     await recordMetric("parse_failed", latencyMs, parseCostPerCall);
     if (schoolId) {
       await recordSchoolMetric(schoolId, "parse_failed", latencyMs, parseCostPerCall);
     }
     return;
   }
-  await saveTask(taskId, { status: "SUCCESS", result: resultText, createdAt });
+  await saveTask(taskId, { ...baseTask, status: "SUCCESS", result: resultText, createdAt });
   if (isEmptyResult(resultText)) {
     await recordMetric("parse_empty", latencyMs, parseCostPerCall);
     if (schoolId) {
@@ -590,7 +645,7 @@ function cleanScriptOutput(text) {
 async function applyScriptUpdate(scriptName, content, previousContent) {
   const validation = validateScriptStructure(content);
   if (!validation.ok) {
-    return { ok: false, reason: validation.reason };
+    return { ok: false, reason: validation.reason, failureType: "validation" };
   }
   if (previousContent && hashText(previousContent) === hashText(content)) {
     const existingMeta = await getScriptMeta(scriptName);
@@ -615,10 +670,10 @@ async function applyScriptUpdate(scriptName, content, previousContent) {
       try {
         await fs.writeFile(fullPath, previousContent, "utf-8");
       } catch {
-        return { ok: false, reason: "脚本写入失败且回滚失败" };
+        return { ok: false, reason: "脚本写入失败且回滚失败", failureType: "rollback" };
       }
     }
-    return { ok: false, reason: error?.message || "脚本写入失败" };
+    return { ok: false, reason: error?.message || "脚本写入失败", failureType: "write" };
   }
 }
 
@@ -704,10 +759,12 @@ function signScript(content) {
   return { signature: "", alg: "" };
 }
 
-async function recordScriptFailure(scriptName, reason) {
+async function recordScriptFailure(scriptName, reason, failureType, schoolId) {
   const payload = {
     scriptName: sanitizeScriptName(scriptName),
     reason,
+    failureType: failureType || "unknown",
+    schoolId: schoolId || "",
     createdAt: Date.now()
   };
   await redisClient.lPush("script:failures", JSON.stringify(payload));
@@ -935,11 +992,12 @@ async function getKnownSchoolIds() {
  * 构建管理后台聚合数据，避免前端多接口拼装
  */
 async function buildAdminDashboardData() {
-  const [metrics, schoolMetrics, failures, schoolIds] = await Promise.all([
+  const [metrics, schoolMetrics, failures, schoolIds, schoolInfoById] = await Promise.all([
     getMetricsSnapshot(),
     getSchoolMetricsSnapshot(),
     getScriptFailures(200),
-    getKnownSchoolIds()
+    getKnownSchoolIds(),
+    getSchoolInfoMap()
   ]);
   const schoolQueues = {};
   let totalQueueLength = 0;
@@ -947,6 +1005,11 @@ async function buildAdminDashboardData() {
     const queueLength = await redisClient.lLen(buildQueueKey(schoolId));
     schoolQueues[schoolId] = queueLength;
     totalQueueLength += queueLength;
+  }
+  const failureTypeStats = {};
+  for (const item of failures) {
+    const type = item?.failureType || "unknown";
+    failureTypeStats[type] = (failureTypeStats[type] || 0) + 1;
   }
   const metricUpdatedAtList = Object.values(metrics).map((item) => item.lastUpdatedAt || 0);
   const schoolUpdatedAtList = Object.values(schoolMetrics).map((item) => item.lastUpdatedAt || 0);
@@ -961,7 +1024,9 @@ async function buildAdminDashboardData() {
     schoolCount: schoolIds.length,
     totalQueueLength,
     failureCount: failures.length,
-    latestMetricsAt
+    latestMetricsAt,
+    schoolInfoById,
+    failureTypeStats
   };
 }
 
@@ -1107,6 +1172,63 @@ function sanitizeScriptName(scriptName) {
   const name = (scriptName || "").replace(/[\\/]/g, "_").trim();
   if (name.toLowerCase().endsWith(".js")) return name;
   return `${name || "unknown"}.js`;
+}
+
+function normalizeSchoolSystemType(value) {
+  const text = (value || "").toString().trim().toLowerCase();
+  if (!text) return "";
+  if (text.includes("正方") || text.includes("zhengfang") || text === "zf") return "zhengfang";
+  if (text.includes("强智") || text.includes("qiangzhi")) return "qiangzhi";
+  if (text.includes("青果") || text.includes("kingosoft")) return "kingosoft";
+  if (text.includes("超星") || text.includes("chaoxing") || text.includes("学习通")) {
+    return "chaoxing";
+  }
+  if (text.includes("未知") || text.includes("unknown")) return "unknown";
+  return text;
+}
+
+function detectSchoolSystemType(content) {
+  const text = (content || "").toString();
+  if (/正方|zhengfang|jwglxt|zfwz/i.test(text)) return "zhengfang";
+  if (/强智|qiangzhi/i.test(text)) return "qiangzhi";
+  if (/青果|kingosoft/i.test(text)) return "kingosoft";
+  if (/超星|chaoxing|学习通/i.test(text)) return "chaoxing";
+  return "unknown";
+}
+
+function resolveSchoolSystemType(content, input) {
+  const normalized = normalizeSchoolSystemType(input);
+  if (normalized) return normalized;
+  return detectSchoolSystemType(content);
+}
+
+async function saveSchoolInfo(schoolId, schoolName, schoolSystemType) {
+  if (!schoolId) return;
+  const key = "school:info";
+  const existingRaw = await redisClient.hGet(key, schoolId);
+  const existing = existingRaw ? safeJson(existingRaw) : null;
+  const payload = {
+    schoolId,
+    schoolName: schoolName || existing?.schoolName || "",
+    schoolSystemType: schoolSystemType || existing?.schoolSystemType || "unknown",
+    updatedAt: Date.now()
+  };
+  await redisClient.hSet(key, schoolId, JSON.stringify(payload));
+}
+
+async function getSchoolInfoMap() {
+  const raw = await redisClient.hGetAll("school:info");
+  const result = {};
+  for (const [schoolId, value] of Object.entries(raw)) {
+    const info = safeJson(value) || {};
+    result[schoolId] = {
+      schoolId,
+      schoolName: info.schoolName || "",
+      schoolSystemType: normalizeSchoolSystemType(info.schoolSystemType) || "unknown",
+      updatedAt: Number(info.updatedAt || 0)
+    };
+  }
+  return result;
 }
 
 function buildTaskKey(taskId) {

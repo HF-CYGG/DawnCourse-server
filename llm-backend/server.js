@@ -36,6 +36,10 @@ const minQueueSize = Number(process.env.MIN_QUEUE_SIZE || 3);
 const mergeWindowMs = Number(process.env.MERGE_WINDOW_MS || 10 * 60 * 1000);
 // 脚本更新后 24 小时内的二次提交处理窗口
 const reprocessWindowMs = Number(process.env.REPROCESS_WINDOW_MS || 24 * 60 * 60 * 1000);
+const maxQueueSize = Number(process.env.MAX_QUEUE_SIZE || 200);
+const queueItemTtlMs = Number(process.env.QUEUE_ITEM_TTL_MS || 24 * 60 * 60 * 1000);
+const processDelayMs = Number(process.env.PROCESS_DELAY_MS || 2000);
+const dedupWindowMs = Number(process.env.DEDUP_WINDOW_MS || 10 * 60 * 1000);
 const rateLimitPerMin = Number(process.env.RATE_LIMIT_PER_MIN || 120);
 const rateLimitSchoolPerMin = Number(process.env.RATE_LIMIT_SCHOOL_PER_MIN || 60);
 const summaryCostPerCall = Number(process.env.LLM_SUMMARY_COST_PER_CALL || 0);
@@ -57,6 +61,23 @@ const server = http.createServer(async (req, res) => {
   // 健康检查接口
   if (req.method === "GET" && url.pathname === "/health") {
     return sendJson(res, 200, { ok: true });
+  }
+  if (req.method === "GET" && url.pathname === "/api/v1/metrics") {
+    const metrics = await getMetricsSnapshot();
+    return sendJson(res, 200, { code: 200, data: metrics });
+  }
+  if (req.method === "GET" && url.pathname === "/api/v1/script_failures") {
+    const limit = Number(url.searchParams.get("limit") || 50);
+    const failures = await getScriptFailures(limit);
+    return sendJson(res, 200, { code: 200, data: failures });
+  }
+  if (req.method === "GET" && url.pathname === "/api/v1/school_status") {
+    const schoolId = url.searchParams.get("schoolId") || "";
+    if (!schoolId) {
+      return sendJson(res, 400, { code: 400, msg: "缺少 schoolId" });
+    }
+    const status = await getSchoolStatus(schoolId);
+    return sendJson(res, 200, { code: 200, data: status });
   }
   // 提交解析任务
   if (req.method === "POST" && url.pathname === "/api/v1/parse_task") {
@@ -94,7 +115,7 @@ const server = http.createServer(async (req, res) => {
       await saveTask(taskId, { status: "FAILED", result: null, createdAt: Date.now() });
     });
     if (schoolId) {
-      enqueueSchoolSubmission(schoolId, safeContent, scriptName);
+      await enqueueSchoolSubmission(schoolId, safeContent, scriptName);
     }
     return sendJson(res, 200, { code: 200, msg: "ok", taskId });
   }
@@ -127,14 +148,21 @@ server.listen(port, () => {
 /**
  * 将提交内容加入学校队列
  */
-function enqueueSchoolSubmission(schoolId, content, scriptName) {
+async function enqueueSchoolSubmission(schoolId, content, scriptName) {
   const now = Date.now();
-  const item = { content, scriptName, createdAt: now };
+  const contentHash = hashText(content);
+  const dedupKey = buildDedupKey(schoolId, contentHash);
+  const deduped = await redisClient.set(dedupKey, "1", { NX: true, PX: dedupWindowMs });
+  if (!deduped) return;
+  const item = { content, scriptName, createdAt: now, hash: contentHash };
   const queueKey = buildQueueKey(schoolId);
-  redisClient
-    .rPush(queueKey, JSON.stringify(item))
-    .then(() => redisClient.expire(queueKey, Math.ceil(reprocessWindowMs / 1000)))
-    .catch((error) => console.error("enqueue error:", error));
+  try {
+    await redisClient.rPush(queueKey, JSON.stringify(item));
+    await redisClient.lTrim(queueKey, -maxQueueSize, -1);
+    await redisClient.expire(queueKey, Math.ceil(queueItemTtlMs / 1000));
+  } catch (error) {
+    console.error("enqueue error:", error);
+  }
   scheduleSchoolProcessing(schoolId);
 }
 
@@ -150,7 +178,7 @@ function scheduleSchoolProcessing(schoolId) {
     } finally {
       schoolProcessing.set(schoolId, false);
     }
-  }, 0);
+  }, processDelayMs);
 }
 
 /**
@@ -163,9 +191,10 @@ async function processSchoolQueue(schoolId) {
   if (!lockAcquired) return;
   try {
     const queue = await getSchoolQueue(schoolId);
-    if (queue.length < minQueueSize) return;
+    const prunedQueue = await pruneQueueIfNeeded(schoolId, queue);
+    if (prunedQueue.length < minQueueSize) return;
     const now = Date.now();
-    const recentQueue = queue.filter((item) => now - item.createdAt <= mergeWindowMs);
+    const recentQueue = prunedQueue.filter((item) => now - item.createdAt <= mergeWindowMs);
     if (recentQueue.length < minQueueSize) return;
     const state = (await getSchoolState(schoolId)) || {
       lastSummaryHash: "",
@@ -179,7 +208,7 @@ async function processSchoolQueue(schoolId) {
     const shouldProcessIndividually =
       state.lastUpdatedAt > 0 && now - state.lastUpdatedAt <= reprocessWindowMs && summaryHash !== state.lastSummaryHash;
     if (shouldProcessIndividually) {
-      await processIndividualSummaries(schoolId, queue);
+      await processIndividualSummaries(schoolId, prunedQueue);
       await clearSchoolQueue(schoolId);
       return;
     }
@@ -464,6 +493,14 @@ async function applyScriptUpdate(scriptName, content, previousContent) {
   if (!validation.ok) {
     return { ok: false, reason: validation.reason };
   }
+  if (previousContent && hashText(previousContent) === hashText(content)) {
+    const existingMeta = await getScriptMeta(scriptName);
+    if (!existingMeta) {
+      const meta = await buildScriptMeta(scriptName, content);
+      await writeScriptMeta(scriptName, meta);
+    }
+    return { ok: true, skipped: true };
+  }
   const fullPath = buildScriptPath(scriptName);
   try {
     await fs.mkdir(path.dirname(fullPath), { recursive: true });
@@ -499,6 +536,11 @@ function validateScriptStructure(content) {
   }
   if (/require\s*\(/.test(trimmed)) {
     return { ok: false, reason: "脚本包含不允许的模块依赖" };
+  }
+  try {
+    new Function(trimmed);
+  } catch {
+    return { ok: false, reason: "脚本语法不合法" };
   }
   return { ok: true };
 }
@@ -638,6 +680,66 @@ async function setSchoolState(schoolId, state) {
   await redisClient.set(key, JSON.stringify(state), { PX: reprocessWindowMs });
 }
 
+async function pruneQueueIfNeeded(schoolId, queue) {
+  if (!Array.isArray(queue) || queue.length === 0) return [];
+  const now = Date.now();
+  const filtered = queue.filter((item) => now - item.createdAt <= queueItemTtlMs);
+  if (filtered.length === queue.length) return filtered;
+  const key = buildQueueKey(schoolId);
+  await redisClient.del(key);
+  if (filtered.length > 0) {
+    await redisClient.rPush(key, ...filtered.map((item) => JSON.stringify(item)));
+    await redisClient.expire(key, Math.ceil(queueItemTtlMs / 1000));
+  }
+  return filtered;
+}
+
+async function getMetricsSnapshot() {
+  const types = [
+    "parse_success",
+    "parse_failed",
+    "parse_empty",
+    "summary_success",
+    "summary_failed",
+    "script_success",
+    "script_failed"
+  ];
+  const result = {};
+  for (const type of types) {
+    const key = buildMetricKey(type);
+    const data = await redisClient.hGetAll(key);
+    const count = Number(data.count || 0);
+    const latencyMsTotal = Number(data.latencyMsTotal || 0);
+    const costTotal = Number(data.costTotal || 0);
+    result[type] = {
+      count,
+      latencyMsAvg: count > 0 ? latencyMsTotal / count : 0,
+      costTotal,
+      lastUpdatedAt: Number(data.lastUpdatedAt || 0)
+    };
+  }
+  return result;
+}
+
+async function getScriptFailures(limit) {
+  const safeLimit = Math.min(Math.max(limit, 1), 200);
+  const items = await redisClient.lRange("script:failures", 0, safeLimit - 1);
+  return items.map((item) => safeJson(item)).filter(Boolean);
+}
+
+async function getSchoolStatus(schoolId) {
+  const queueKey = buildQueueKey(schoolId);
+  const queueLength = await redisClient.lLen(queueKey);
+  const state = await getSchoolState(schoolId);
+  const latestFailureRaw = await redisClient.lRange("script:failures", 0, 0);
+  const latestFailure = latestFailureRaw.length > 0 ? safeJson(latestFailureRaw[0]) : null;
+  return {
+    queueLength,
+    state,
+    latestFailure
+  };
+}
+
 async function acquireLock(key, token, ttlMs) {
   const result = await redisClient.set(key, token, { NX: true, PX: ttlMs });
   return Boolean(result);
@@ -690,6 +792,10 @@ function buildSchoolStateKey(schoolId) {
 
 function buildSchoolLockKey(schoolId) {
   return `school:lock:${schoolId}`;
+}
+
+function buildDedupKey(schoolId, hash) {
+  return `dedup:${schoolId}:${hash}`;
 }
 
 function buildMetricKey(type) {

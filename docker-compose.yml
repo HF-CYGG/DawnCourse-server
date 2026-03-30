@@ -6,6 +6,8 @@ services:
     ports:
       - "10000:80"
     restart: always
+    volumes:
+      - ./html:/usr/share/nginx/html
     depends_on:
       - llm-backend
   llm-backend:
@@ -26,4 +28,24 @@ services:
       MAX_CONTENT_LENGTH: 200000
       # 任务缓存最大存活时长
       TASK_TTL_MS: 1800000
+      # 模型 1（总结）配置
+      LLM_SUMMARY_PROVIDER: gpt
+      LLM_SUMMARY_API_KEY: ""
+      LLM_SUMMARY_MODEL: gpt-4o-mini
+      LLM_SUMMARY_BASE_URL: ""
+      # 模型 2（脚本修复）配置
+      LLM_SCRIPT_PROVIDER: gpt
+      LLM_SCRIPT_API_KEY: ""
+      LLM_SCRIPT_MODEL: gpt-4o
+      LLM_SCRIPT_BASE_URL: ""
+      # 脚本输出目录
+      SCRIPT_OUTPUT_DIR: /shared/parsers
+      # 队列触发阈值
+      MIN_QUEUE_SIZE: 3
+      # 合并窗口
+      MERGE_WINDOW_MS: 600000
+      # 24 小时内二次提交处理窗口
+      REPROCESS_WINDOW_MS: 86400000
+    volumes:
+      - ./html/scripts/parsers:/shared/parsers
     restart: always

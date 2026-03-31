@@ -94,6 +94,7 @@ const adminWebRoot = (process.env.ADMIN_WEB_ROOT || "").trim();
 const adminIndexPath = adminWebRoot
   ? path.resolve(adminWebRoot, "admin", "index.html")
   : "";
+const adminLocalMode = process.env.ADMIN_LOCAL_MODE === "true";
 // 服务启动时间戳，用于面板展示启动时长
 const serverStartedAt = Date.now();
 // 单次脚本修复并发控制（按学校粒度）
@@ -108,6 +109,8 @@ let schoolAliasCache = {
   updatedAt: 0,
   map: new Map()
 };
+let adminLocalCredentials = null;
+const adminLocalSessions = new Map();
 const canarySchoolSet = parseCommaSet(canarySchoolsRaw);
 const offlineReplayDataset = parseOfflineReplayDataset(offlineReplayDatasetJson);
 
@@ -118,7 +121,9 @@ const redisClient = createClient({ url: redisUrl });
 redisClient.on("error", (error) => {
   console.error("redis error:", error);
 });
-await redisClient.connect();
+if (!adminLocalMode) {
+  await redisClient.connect();
+}
 // 初始化管理后台账号密码，仅首次启动生成一次
 const adminCredentialInfo = await initAdminCredentials();
 if (adminCredentialInfo) {
@@ -149,6 +154,13 @@ const server = http.createServer(async (req, res) => {
       url.pathname === "/admin/index.html")
   ) {
     return sendHtmlFile(res, adminIndexPath);
+  }
+  if (
+    adminLocalMode &&
+    !url.pathname.startsWith("/admin") &&
+    !url.pathname.startsWith("/api/v1/admin")
+  ) {
+    return sendJson(res, 503, { code: 503, msg: "admin local mode only" });
   }
   if (req.method === "GET" && url.pathname === "/api/v1/metrics") {
     const metrics = await getMetricsSnapshot();
@@ -1858,6 +1870,22 @@ async function getKnownSchoolIds() {
  * 包括整体成功率、按教务类型的任务分布、失败分类以及最近的异常记录
  */
 async function buildAdminDashboardData() {
+  if (adminLocalMode) {
+    return {
+      serverStartedAt,
+      metrics: {},
+      schoolMetrics: {},
+      schoolQueues: {},
+      failures: [],
+      metricsFile: "",
+      schoolCount: 0,
+      totalQueueLength: 0,
+      failureCount: 0,
+      latestMetricsAt: 0,
+      schoolInfoById: {},
+      failureTypeStats: {}
+    };
+  }
   const [metrics, schoolMetrics, failures, schoolIds, schoolInfoById] = await Promise.all([
     getMetricsSnapshot(),
     getSchoolMetricsSnapshot(),
@@ -1907,6 +1935,15 @@ function hashPassword(password, salt) {
  * 初始化管理后台账号密码，仅首次创建并写入 Redis
  */
 async function initAdminCredentials() {
+  if (adminLocalMode) {
+    if (adminLocalCredentials) return null;
+    const username = `admin_${randomString(6)}`;
+    const password = randomString(12);
+    const salt = randomString(8);
+    const passwordHash = hashPassword(password, salt);
+    adminLocalCredentials = { username, passwordHash, salt, createdAt: Date.now() };
+    return { username, password };
+  }
   const key = buildAdminCredentialKey();
   const cached = await redisClient.get(key);
   if (cached) return null;
@@ -1923,6 +1960,7 @@ async function initAdminCredentials() {
  * 获取当前保存的管理后台账号信息
  */
 async function getAdminCredentials() {
+  if (adminLocalMode) return adminLocalCredentials;
   const raw = await redisClient.get(buildAdminCredentialKey());
   return raw ? safeJson(raw) : null;
 }
@@ -1943,6 +1981,10 @@ async function verifyAdminCredentials(username, password) {
  */
 async function createAdminSession(username) {
   const token = crypto.randomUUID();
+  if (adminLocalMode) {
+    adminLocalSessions.set(token, { username, expiresAt: Date.now() + adminSessionTtlMs });
+    return token;
+  }
   await redisClient.set(buildAdminSessionKey(token), username, { PX: adminSessionTtlMs });
   return token;
 }
@@ -1951,6 +1993,10 @@ async function createAdminSession(username) {
  * 删除管理后台会话
  */
 async function deleteAdminSession(token) {
+  if (adminLocalMode) {
+    adminLocalSessions.delete(token);
+    return;
+  }
   await redisClient.del(buildAdminSessionKey(token));
 }
 
@@ -1960,6 +2006,15 @@ async function deleteAdminSession(token) {
 async function requireAdminAuth(req) {
   const token = getBearerToken(req);
   if (!token) return { ok: false };
+  if (adminLocalMode) {
+    const session = adminLocalSessions.get(token);
+    if (!session) return { ok: false };
+    if (session.expiresAt <= Date.now()) {
+      adminLocalSessions.delete(token);
+      return { ok: false };
+    }
+    return { ok: true, username: session.username, token };
+  }
   const username = await redisClient.get(buildAdminSessionKey(token));
   if (!username) return { ok: false };
   return { ok: true, username, token };

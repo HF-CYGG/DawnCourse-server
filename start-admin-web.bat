@@ -8,4 +8,5 @@ set "REDIS_URL="
 if not exist "node_modules\redis" (
   npm install
 )
+start "" "http://localhost:8080/admin/"
 node server.js

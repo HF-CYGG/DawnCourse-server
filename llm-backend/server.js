@@ -155,6 +155,11 @@ const server = http.createServer(async (req, res) => {
   ) {
     return sendHtmlFile(res, adminIndexPath);
   }
+  if (adminLocalMode && req.method === "GET" && url.pathname === "/") {
+    res.writeHead(302, { Location: "/admin/" });
+    res.end();
+    return;
+  }
   if (
     adminLocalMode &&
     !url.pathname.startsWith("/admin") &&

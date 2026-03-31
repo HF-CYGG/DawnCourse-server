@@ -36,13 +36,28 @@ const minQueueSize = Number(process.env.MIN_QUEUE_SIZE || 3);
 const mergeWindowMs = Number(process.env.MERGE_WINDOW_MS || 10 * 60 * 1000);
 // 脚本更新后 24 小时内的二次提交处理窗口
 const reprocessWindowMs = Number(process.env.REPROCESS_WINDOW_MS || 24 * 60 * 60 * 1000);
+// 队列最大长度，避免单校堆积过多导致内存/Redis 膨胀
 const maxQueueSize = Number(process.env.MAX_QUEUE_SIZE || 200);
+// 单条提交在队列中的最长存活时间，过期后自动清理
 const queueItemTtlMs = Number(process.env.QUEUE_ITEM_TTL_MS || 24 * 60 * 60 * 1000);
+// 调度延迟，降低同一时间大量任务扎堆执行
 const processDelayMs = Number(process.env.PROCESS_DELAY_MS || 2000);
+// 去重窗口：同校同内容短时间重复提交直接忽略
 const dedupWindowMs = Number(process.env.DEDUP_WINDOW_MS || 10 * 60 * 1000);
+// 全局限流：保护服务端与模型调用
 const rateLimitPerMin = Number(process.env.RATE_LIMIT_PER_MIN || 120);
+// 单学校限流：避免单校刷爆队列
 const rateLimitSchoolPerMin = Number(process.env.RATE_LIMIT_SCHOOL_PER_MIN || 60);
+// 全局并发上限：控制同时处理的学校数，平滑高负载
 const maxSchoolConcurrency = Number(process.env.MAX_SCHOOL_CONCURRENCY || 4);
+// 学校名模糊匹配阈值（越高越严格）
+const schoolFuzzyThreshold = Number(process.env.SCHOOL_FUZZY_THRESHOLD || 0.82);
+// 触发模糊匹配的最短名称长度，避免过短导致误归类
+const schoolFuzzyMinLength = Number(process.env.SCHOOL_FUZZY_MIN_LENGTH || 4);
+// 别名映射缓存时间，减少频繁读 Redis
+const schoolAliasCacheMs = Number(process.env.SCHOOL_ALIAS_CACHE_MS || 10 * 60 * 1000);
+// 模糊匹配结果缓存 TTL，避免重复计算
+const schoolFuzzyCacheTtlSec = Number(process.env.SCHOOL_FUZZY_CACHE_TTL_SEC || 7 * 24 * 60 * 60);
 const summaryCostPerCall = Number(process.env.LLM_SUMMARY_COST_PER_CALL || 0);
 const scriptCostPerCall = Number(process.env.LLM_SCRIPT_COST_PER_CALL || 0);
 const parseCostPerCall = Number(process.env.LLM_PARSE_COST_PER_CALL || 0);
@@ -55,11 +70,18 @@ const metricsFlushMs = Number(process.env.METRICS_FLUSH_MS || 5000);
 const adminSessionTtlMs = Number(process.env.ADMIN_SESSION_TTL_MS || 12 * 60 * 60 * 1000);
 // 服务启动时间戳，用于面板展示启动时长
 const serverStartedAt = Date.now();
-// 单次脚本修复并发控制
+// 单次脚本修复并发控制（按学校粒度）
 const schoolProcessing = new Map();
+// 待处理学校集合，用于全局并发调度
 const pendingSchools = new Set();
+// 当前正在处理的学校数量
 let activeSchoolProcessing = 0;
 let metricsFlushTimer = null;
+// 学校别名缓存，避免频繁扫描 Redis
+let schoolAliasCache = {
+  updatedAt: 0,
+  map: new Map()
+};
 
 const redisClient = createClient({ url: redisUrl });
 redisClient.on("error", (error) => {
@@ -1230,6 +1252,7 @@ function resolveSchoolSystemType(content, input) {
 }
 
 function normalizeSchoolNameKey(value) {
+  // 归一化学校名称：去噪、去括号、去标点、统一小写
   let text = (value || "").toString().trim();
   if (!text) return "";
   text = text.replace(/（[^）]{0,20}）/g, "");
@@ -1270,10 +1293,87 @@ function normalizeSchoolNameKey(value) {
       }
     }
   }
+  // 优先返回裁剪后的核心名称，避免过度归一化导致信息丢失
   return trimmed || text;
 }
 
+function buildNameBigrams(text) {
+  // 生成双字片段集合，避免仅靠单字造成误判
+  const value = (text || "").toString();
+  if (value.length <= 1) return new Set([value]);
+  const result = new Set();
+  for (let i = 0; i < value.length - 1; i += 1) {
+    result.add(value.slice(i, i + 2));
+  }
+  return result;
+}
+
+function calcSchoolNameSimilarity(a, b) {
+  // 相似度计算：Jaccard + 长度惩罚 + 包含关系加分
+  if (!a || !b) return 0;
+  if (a === b) return 1;
+  const minLen = Math.min(a.length, b.length);
+  const maxLen = Math.max(a.length, b.length);
+  if (minLen <= 1) return 0;
+  const aSet = buildNameBigrams(a);
+  const bSet = buildNameBigrams(b);
+  let intersection = 0;
+  for (const value of aSet) {
+    if (bSet.has(value)) intersection += 1;
+  }
+  const union = aSet.size + bSet.size - intersection;
+  const jaccard = union > 0 ? intersection / union : 0;
+  const containsBonus = a.includes(b) || b.includes(a) ? 0.12 : 0;
+  const lengthPenalty = maxLen > 0 ? Math.max(0, 1 - Math.abs(a.length - b.length) / maxLen) : 0;
+  return Math.min(1, jaccard * 0.85 + lengthPenalty * 0.15 + containsBonus);
+}
+
+async function getSchoolAliasMapCached() {
+  // 优先走内存缓存，降低 Redis 压力
+  const now = Date.now();
+  if (schoolAliasCache.map.size > 0 && now - schoolAliasCache.updatedAt < schoolAliasCacheMs) {
+    return schoolAliasCache.map;
+  }
+  const raw = await redisClient.hGetAll("school:alias");
+  const map = new Map();
+  for (const [alias, schoolId] of Object.entries(raw)) {
+    if (!alias || !schoolId) continue;
+    map.set(alias, schoolId);
+  }
+  schoolAliasCache = {
+    updatedAt: now,
+    map
+  };
+  return map;
+}
+
+async function resolveSchoolIdByFuzzyName(normalizedName) {
+  // 模糊匹配只在名称足够长时启用，避免过短误归类
+  if (!normalizedName || normalizedName.length < schoolFuzzyMinLength) return "";
+  // 命中缓存直接返回，避免重复计算
+  const cached = await redisClient.get(`school:fuzzy:${normalizedName}`);
+  if (cached) return cached;
+  const aliasMap = await getSchoolAliasMapCached();
+  let bestId = "";
+  let bestScore = 0;
+  for (const [alias, schoolId] of aliasMap.entries()) {
+    if (!alias || !schoolId) continue;
+    const score = calcSchoolNameSimilarity(normalizedName, alias);
+    if (score > bestScore) {
+      bestScore = score;
+      bestId = schoolId;
+    }
+  }
+  if (bestScore >= schoolFuzzyThreshold && bestId) {
+    // 模糊命中后写入缓存，提升后续命中效率
+    await redisClient.set(`school:fuzzy:${normalizedName}`, bestId, { EX: schoolFuzzyCacheTtlSec });
+    return bestId;
+  }
+  return "";
+}
+
 function resolveBestSchoolName(existingName, incomingName) {
+  // 取更完整的学校名称，便于后续展示与别名映射
   const incoming = (incomingName || "").toString().trim();
   const existing = (existingName || "").toString().trim();
   if (!incoming) return existing;
@@ -1282,6 +1382,7 @@ function resolveBestSchoolName(existingName, incomingName) {
 }
 
 async function saveSchoolAlias(schoolId, schoolName) {
+  // 用归一化名称写入别名映射，统一归类入口
   if (!schoolId || !schoolName) return;
   const normalized = normalizeSchoolNameKey(schoolName);
   if (!normalized) return;
@@ -1289,20 +1390,31 @@ async function saveSchoolAlias(schoolId, schoolName) {
 }
 
 async function resolveSchoolIdByName(schoolIdInput, schoolNameInput) {
+  // 优先使用上报的 schoolId，保证强一致归类
   const rawId = (schoolIdInput || "").toString().trim();
   if (rawId) {
     await saveSchoolAlias(rawId, schoolNameInput);
     return rawId;
   }
+  // schoolId 缺失时使用学校名归一化结果
   const normalized = normalizeSchoolNameKey(schoolNameInput);
   if (!normalized) return "";
+  // 先走精确别名命中
   const existing = await redisClient.hGet("school:alias", normalized);
   if (existing) return existing;
+  // 再走模糊匹配命中，成功后写回别名
+  const fuzzyMatched = await resolveSchoolIdByFuzzyName(normalized);
+  if (fuzzyMatched) {
+    await redisClient.hSet("school:alias", normalized, fuzzyMatched);
+    return fuzzyMatched;
+  }
+  // 兜底：将归一化名称自身作为 schoolId
   await redisClient.hSet("school:alias", normalized, normalized);
   return normalized;
 }
 
 async function saveSchoolInfo(schoolId, schoolName, schoolSystemType) {
+  // 维护学校基础信息，便于面板展示与统计
   if (!schoolId) return;
   const key = "school:info";
   const existingRaw = await redisClient.hGet(key, schoolId);
@@ -1315,6 +1427,7 @@ async function saveSchoolInfo(schoolId, schoolName, schoolSystemType) {
     updatedAt: Date.now()
   };
   await redisClient.hSet(key, schoolId, JSON.stringify(payload));
+  // 同步写入别名，确保后续模糊/精确匹配可归并
   await saveSchoolAlias(schoolId, resolvedSchoolName);
 }
 

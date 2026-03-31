@@ -2793,6 +2793,7 @@ function normalizeModelName(name) {
   let value = raw.toLowerCase().replace(/[\s_]+/g, "-");
   value = value.replace(/(glm|deepseek|qwen|gemini|gpt)(\d)/g, "$1-$2");
   value = value.replace(/(\d)(codex)/g, "$1-codex");
+  value = value.replace(/(\d)(mini|nano|flash|pro|turbo|lite)/g, "$1-$2");
   value = value.replace(/-+codex/g, "-codex");
   value = value.replace(/-+/g, "-");
   return value;

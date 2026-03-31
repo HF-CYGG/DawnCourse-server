@@ -42,6 +42,7 @@ const processDelayMs = Number(process.env.PROCESS_DELAY_MS || 2000);
 const dedupWindowMs = Number(process.env.DEDUP_WINDOW_MS || 10 * 60 * 1000);
 const rateLimitPerMin = Number(process.env.RATE_LIMIT_PER_MIN || 120);
 const rateLimitSchoolPerMin = Number(process.env.RATE_LIMIT_SCHOOL_PER_MIN || 60);
+const maxSchoolConcurrency = Number(process.env.MAX_SCHOOL_CONCURRENCY || 4);
 const summaryCostPerCall = Number(process.env.LLM_SUMMARY_COST_PER_CALL || 0);
 const scriptCostPerCall = Number(process.env.LLM_SCRIPT_COST_PER_CALL || 0);
 const parseCostPerCall = Number(process.env.LLM_PARSE_COST_PER_CALL || 0);
@@ -56,6 +57,8 @@ const adminSessionTtlMs = Number(process.env.ADMIN_SESSION_TTL_MS || 12 * 60 * 6
 const serverStartedAt = Date.now();
 // 单次脚本修复并发控制
 const schoolProcessing = new Map();
+const pendingSchools = new Set();
+let activeSchoolProcessing = 0;
 let metricsFlushTimer = null;
 
 const redisClient = createClient({ url: redisUrl });
@@ -165,8 +168,8 @@ const server = http.createServer(async (req, res) => {
     // 解析 JSON
     const body = safeJson(bodyText);
     const content = (body?.content || "").toString();
-    const schoolId = (body?.schoolId || body?.school_id || "").toString();
-    const schoolName = (body?.schoolName || body?.school_name || "").toString();
+    const schoolIdInput = (body?.schoolId || body?.school_id || "").toString();
+    const schoolNameInput = (body?.schoolName || body?.school_name || "").toString();
     const schoolSystemTypeInput = (body?.schoolSystemType || body?.systemType || "").toString();
     const scriptName = (body?.scriptName || body?.script_name || "").toString();
     const userConsent = body?.userConsent === true || body?.consent === true;
@@ -185,6 +188,8 @@ const server = http.createServer(async (req, res) => {
     if (!apiKey && provider === "gemini") {
       return sendJson(res, 500, { code: 500, msg: "服务端未配置 Gemini API Key" });
     }
+    const schoolId = await resolveSchoolIdByName(schoolIdInput, schoolNameInput);
+    const schoolName = schoolNameInput || "";
     const clientIp = getClientIp(req);
     const rateAllowed = await checkRateLimit(clientIp, schoolId);
     if (!rateAllowed) {
@@ -293,15 +298,32 @@ async function enqueueSchoolSubmission(schoolId, content, scriptName, schoolInfo
  * 调度学校维度的脚本修复流程
  */
 function scheduleSchoolProcessing(schoolId) {
+  if (!schoolId) return;
   if (schoolProcessing.get(schoolId)) return;
-  schoolProcessing.set(schoolId, true);
-  setTimeout(async () => {
-    try {
-      await processSchoolQueue(schoolId);
-    } finally {
-      schoolProcessing.set(schoolId, false);
-    }
-  }, processDelayMs);
+  pendingSchools.add(schoolId);
+  drainSchoolProcessing();
+}
+
+function drainSchoolProcessing() {
+  if (activeSchoolProcessing >= maxSchoolConcurrency) return;
+  if (pendingSchools.size === 0) return;
+  while (activeSchoolProcessing < maxSchoolConcurrency && pendingSchools.size > 0) {
+    const iterator = pendingSchools.values();
+    const schoolId = iterator.next().value;
+    if (!schoolId) break;
+    pendingSchools.delete(schoolId);
+    schoolProcessing.set(schoolId, true);
+    activeSchoolProcessing += 1;
+    setTimeout(async () => {
+      try {
+        await processSchoolQueue(schoolId);
+      } finally {
+        schoolProcessing.set(schoolId, false);
+        activeSchoolProcessing = Math.max(0, activeSchoolProcessing - 1);
+        drainSchoolProcessing();
+      }
+    }, processDelayMs);
+  }
 }
 
 /**
@@ -1207,6 +1229,79 @@ function resolveSchoolSystemType(content, input) {
   return detectSchoolSystemType(content);
 }
 
+function normalizeSchoolNameKey(value) {
+  let text = (value || "").toString().trim();
+  if (!text) return "";
+  text = text.replace(/（[^）]{0,20}）/g, "");
+  text = text.replace(/\([^)]{0,20}\)/g, "");
+  text = text.replace(/[\s·•・.,，。;；:：'"“”‘’/\\\-\[\]【】<>《》、|_]+/g, "");
+  text = text.toLowerCase();
+  const suffixes = [
+    "高等专科学校",
+    "职业技术学院",
+    "职业学院",
+    "技术学院",
+    "科技学院",
+    "师范大学",
+    "师范学院",
+    "医学院",
+    "中医药大学",
+    "外国语大学",
+    "外语学院",
+    "信息工程学院",
+    "信息工程大学",
+    "交通大学",
+    "工业大学",
+    "科技大学",
+    "财经大学",
+    "农业大学",
+    "理工大学",
+    "大学",
+    "学院"
+  ];
+  let trimmed = text;
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const suffix of suffixes) {
+      if (trimmed.endsWith(suffix)) {
+        trimmed = trimmed.slice(0, -suffix.length);
+        changed = true;
+      }
+    }
+  }
+  return trimmed || text;
+}
+
+function resolveBestSchoolName(existingName, incomingName) {
+  const incoming = (incomingName || "").toString().trim();
+  const existing = (existingName || "").toString().trim();
+  if (!incoming) return existing;
+  if (!existing) return incoming;
+  return incoming.length >= existing.length ? incoming : existing;
+}
+
+async function saveSchoolAlias(schoolId, schoolName) {
+  if (!schoolId || !schoolName) return;
+  const normalized = normalizeSchoolNameKey(schoolName);
+  if (!normalized) return;
+  await redisClient.hSet("school:alias", normalized, schoolId);
+}
+
+async function resolveSchoolIdByName(schoolIdInput, schoolNameInput) {
+  const rawId = (schoolIdInput || "").toString().trim();
+  if (rawId) {
+    await saveSchoolAlias(rawId, schoolNameInput);
+    return rawId;
+  }
+  const normalized = normalizeSchoolNameKey(schoolNameInput);
+  if (!normalized) return "";
+  const existing = await redisClient.hGet("school:alias", normalized);
+  if (existing) return existing;
+  await redisClient.hSet("school:alias", normalized, normalized);
+  return normalized;
+}
+
 async function saveSchoolInfo(schoolId, schoolName, schoolSystemType) {
   if (!schoolId) return;
   const key = "school:info";
@@ -1214,7 +1309,7 @@ async function saveSchoolInfo(schoolId, schoolName, schoolSystemType) {
   const existing = existingRaw ? safeJson(existingRaw) : null;
   const payload = {
     schoolId,
-    schoolName: schoolName || existing?.schoolName || "",
+    schoolName: resolveBestSchoolName(existing?.schoolName, schoolName),
     schoolSystemType: schoolSystemType || existing?.schoolSystemType || "unknown",
     updatedAt: Date.now()
   };

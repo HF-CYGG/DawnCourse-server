@@ -1307,13 +1307,15 @@ async function saveSchoolInfo(schoolId, schoolName, schoolSystemType) {
   const key = "school:info";
   const existingRaw = await redisClient.hGet(key, schoolId);
   const existing = existingRaw ? safeJson(existingRaw) : null;
+  const resolvedSchoolName = resolveBestSchoolName(existing?.schoolName, schoolName);
   const payload = {
     schoolId,
-    schoolName: resolveBestSchoolName(existing?.schoolName, schoolName),
+    schoolName: resolvedSchoolName,
     schoolSystemType: schoolSystemType || existing?.schoolSystemType || "unknown",
     updatedAt: Date.now()
   };
   await redisClient.hSet(key, schoolId, JSON.stringify(payload));
+  await saveSchoolAlias(schoolId, resolvedSchoolName);
 }
 
 async function getSchoolInfoMap() {

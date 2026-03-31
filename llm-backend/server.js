@@ -89,6 +89,11 @@ const degradeHighCostEnabled = process.env.DEGRADE_HIGH_COST === "true";
 const issueClusterSimilarity = Number(process.env.ISSUE_CLUSTER_SIMILARITY || 0.45);
 // 管理后台会话有效期（默认 12 小时）
 const adminSessionTtlMs = Number(process.env.ADMIN_SESSION_TTL_MS || 12 * 60 * 60 * 1000);
+// 管理后台静态页面本地调试根目录（为空则不启用静态页面服务）
+const adminWebRoot = (process.env.ADMIN_WEB_ROOT || "").trim();
+const adminIndexPath = adminWebRoot
+  ? path.resolve(adminWebRoot, "admin", "index.html")
+  : "";
 // 服务启动时间戳，用于面板展示启动时长
 const serverStartedAt = Date.now();
 // 单次脚本修复并发控制（按学校粒度）
@@ -132,6 +137,18 @@ const server = http.createServer(async (req, res) => {
   // 健康检查接口
   if (req.method === "GET" && url.pathname === "/health") {
     return sendJson(res, 200, { ok: true });
+  }
+  // ---------------------------------------------------------------------------
+  // [本地调试] 管理后台静态页面（仅当配置 ADMIN_WEB_ROOT 时启用）
+  // ---------------------------------------------------------------------------
+  if (
+    adminWebRoot &&
+    req.method === "GET" &&
+    (url.pathname === "/admin" ||
+      url.pathname === "/admin/" ||
+      url.pathname === "/admin/index.html")
+  ) {
+    return sendHtmlFile(res, adminIndexPath);
   }
   if (req.method === "GET" && url.pathname === "/api/v1/metrics") {
     const metrics = await getMetricsSnapshot();
@@ -2572,9 +2589,31 @@ function sendJson(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
+/**
+ * 返回 HTML 响应
+ */
+function sendHtml(res, status, body) {
+  res.writeHead(status, { "Content-Type": "text/html; charset=utf-8" });
+  res.end(body);
+}
+
 function sendText(res, status, body) {
   res.writeHead(status, { "Content-Type": "text/plain; version=0.0.4; charset=utf-8" });
   res.end(body);
+}
+
+/**
+ * 读取并返回 HTML 文件
+ */
+async function sendHtmlFile(res, filePath) {
+  if (!filePath) {
+    return sendText(res, 404, "admin html not configured");
+  }
+  const html = await readTextIfExists(filePath);
+  if (html == null) {
+    return sendText(res, 404, "admin html not found");
+  }
+  return sendHtml(res, 200, html);
 }
 
 /**

@@ -32,6 +32,7 @@ const baseUrl = summaryBaseUrl;
 const redisUrl = process.env.REDIS_URL || "redis://redis:6379";
 // 脚本输出目录
 const scriptOutputDir = process.env.SCRIPT_OUTPUT_DIR || "/shared/parsers";
+// 老版本脚本目录（支持逗号分隔多个目录），用于升级时回退读取与自动迁移
 const legacyScriptOutputDirs = parseCommaList(
   process.env.LEGACY_SCRIPT_OUTPUT_DIRS || "/shared/scripts"
 );
@@ -1026,6 +1027,9 @@ function resolveScriptName(schoolId, queue) {
 
 /**
  * 读取已有脚本
+ * - 优先读取新目录
+ * - 读取失败时回退 legacy 目录
+ * - 命中 legacy 后会自动迁移到新目录并尝试补齐 meta
  */
 async function readScript(scriptName) {
   const fullPath = buildScriptPath(scriptName);
@@ -1039,6 +1043,9 @@ async function readScript(scriptName) {
   return legacyContent;
 }
 
+/**
+ * 读取文本文件（不存在时返回 null）
+ */
 async function readTextIfExists(filePath) {
   try {
     return await fs.readFile(filePath, "utf-8");
@@ -1047,6 +1054,9 @@ async function readTextIfExists(filePath) {
   }
 }
 
+/**
+ * 判断文件是否存在
+ */
 async function fileExists(filePath) {
   try {
     await fs.access(filePath);
@@ -1056,6 +1066,9 @@ async function fileExists(filePath) {
   }
 }
 
+/**
+ * 在 legacy 目录中寻找脚本路径
+ */
 async function findLegacyScriptPath(scriptName) {
   const safeName = sanitizeScriptName(scriptName);
   for (const legacyDir of legacyScriptOutputDirs) {
@@ -1065,6 +1078,12 @@ async function findLegacyScriptPath(scriptName) {
   return "";
 }
 
+/**
+ * 迁移 legacy 脚本到新目录
+ * - 确保新目录存在
+ * - 仅在新目录缺失时才写入，避免覆盖现有脚本
+ * - 如果 legacy meta 存在且新目录缺失，则同步迁移 meta
+ */
 async function migrateLegacyScript(scriptName, legacyPath, legacyContent) {
   const targetPath = buildScriptPath(scriptName);
   await fs.mkdir(path.dirname(targetPath), { recursive: true });
@@ -1081,6 +1100,10 @@ async function migrateLegacyScript(scriptName, legacyPath, legacyContent) {
   await fs.writeFile(targetMetaPath, legacyMeta, "utf-8");
 }
 
+/**
+ * 寻找 legacy 的 meta 路径
+ * 先尝试脚本同目录，再遍历 legacy 目录列表兜底
+ */
 async function findLegacyMetaPath(scriptName, legacyScriptPath) {
   const legacyDir = legacyScriptPath ? path.dirname(legacyScriptPath) : "";
   const metaFileName = buildScriptMetaFileName(scriptName);
@@ -1095,6 +1118,9 @@ async function findLegacyMetaPath(scriptName, legacyScriptPath) {
   return "";
 }
 
+/**
+ * 确保脚本与指标目录存在，避免首次启动写入失败
+ */
 async function ensureStorageLayout() {
   await fs.mkdir(scriptOutputDir, { recursive: true });
   await fs.mkdir(path.dirname(schoolMetricsFile), { recursive: true });
@@ -1138,6 +1164,10 @@ function parseCommaSet(value) {
   );
 }
 
+/**
+ * 解析逗号分隔的列表
+ * 用于读取目录列表或白名单配置
+ */
 function parseCommaList(value) {
   return (value || "")
     .split(",")
@@ -1406,6 +1436,12 @@ async function buildScriptMeta(scriptName, content, options = {}) {
   };
 }
 
+/**
+ * 获取脚本 meta
+ * - 优先读取 Redis 缓存
+ * - 若磁盘 meta 缺失，尝试 legacy 目录迁移
+ * - 仍缺失则根据当前脚本内容生成 meta 并落盘
+ */
 async function getScriptMeta(scriptName) {
   const metaKey = buildScriptMetaKey(scriptName);
   const cached = await redisClient.get(metaKey);
@@ -1434,6 +1470,9 @@ async function getScriptMeta(scriptName) {
   return null;
 }
 
+/**
+ * 读取 legacy 目录的 meta（若存在）
+ */
 async function readLegacyMeta(scriptName) {
   const metaFileName = buildScriptMetaFileName(scriptName);
   for (const legacyDir of legacyScriptOutputDirs) {
@@ -2140,6 +2179,9 @@ function buildScriptMetaPath(scriptName) {
   return path.join(scriptOutputDir, buildScriptMetaFileName(scriptName));
 }
 
+/**
+ * 构建脚本 meta 文件名（不含目录）
+ */
 function buildScriptMetaFileName(scriptName) {
   const safeName = sanitizeScriptName(scriptName).replace(/\.js$/i, "");
   return `${safeName}.meta.json`;

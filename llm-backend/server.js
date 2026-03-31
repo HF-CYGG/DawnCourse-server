@@ -32,6 +32,9 @@ const baseUrl = summaryBaseUrl;
 const redisUrl = process.env.REDIS_URL || "redis://redis:6379";
 // 脚本输出目录
 const scriptOutputDir = process.env.SCRIPT_OUTPUT_DIR || "/shared/parsers";
+const legacyScriptOutputDirs = parseCommaList(
+  process.env.LEGACY_SCRIPT_OUTPUT_DIRS || "/shared/scripts"
+);
 // 同一学校触发脚本修复的最小提交数
 const minQueueSize = Number(process.env.MIN_QUEUE_SIZE || 3);
 // 同一学校合并窗口（毫秒）
@@ -117,6 +120,7 @@ if (adminCredentialInfo) {
     `admin credentials: username=${adminCredentialInfo.username} password=${adminCredentialInfo.password}`
   );
 }
+await ensureStorageLayout();
 
 // ---------------------------------------------------------------------------
 // HTTP 服务入口
@@ -1024,12 +1028,76 @@ function resolveScriptName(schoolId, queue) {
  * 读取已有脚本
  */
 async function readScript(scriptName) {
+  const fullPath = buildScriptPath(scriptName);
+  const content = await readTextIfExists(fullPath);
+  if (content != null) return content;
+  const legacyPath = await findLegacyScriptPath(scriptName);
+  if (!legacyPath) return "";
+  const legacyContent = await readTextIfExists(legacyPath);
+  if (legacyContent == null) return "";
+  await migrateLegacyScript(scriptName, legacyPath, legacyContent);
+  return legacyContent;
+}
+
+async function readTextIfExists(filePath) {
   try {
-    const fullPath = buildScriptPath(scriptName);
-    return await fs.readFile(fullPath, "utf-8");
+    return await fs.readFile(filePath, "utf-8");
   } catch {
-    return "";
+    return null;
   }
+}
+
+async function fileExists(filePath) {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function findLegacyScriptPath(scriptName) {
+  const safeName = sanitizeScriptName(scriptName);
+  for (const legacyDir of legacyScriptOutputDirs) {
+    const legacyPath = path.join(legacyDir, safeName);
+    if (await fileExists(legacyPath)) return legacyPath;
+  }
+  return "";
+}
+
+async function migrateLegacyScript(scriptName, legacyPath, legacyContent) {
+  const targetPath = buildScriptPath(scriptName);
+  await fs.mkdir(path.dirname(targetPath), { recursive: true });
+  if (!(await fileExists(targetPath))) {
+    await fs.writeFile(targetPath, legacyContent, "utf-8");
+  }
+  const legacyMetaPath = await findLegacyMetaPath(scriptName, legacyPath);
+  if (!legacyMetaPath) return;
+  const targetMetaPath = buildScriptMetaPath(scriptName);
+  if (await fileExists(targetMetaPath)) return;
+  const legacyMeta = await readTextIfExists(legacyMetaPath);
+  if (!legacyMeta) return;
+  await fs.mkdir(path.dirname(targetMetaPath), { recursive: true });
+  await fs.writeFile(targetMetaPath, legacyMeta, "utf-8");
+}
+
+async function findLegacyMetaPath(scriptName, legacyScriptPath) {
+  const legacyDir = legacyScriptPath ? path.dirname(legacyScriptPath) : "";
+  const metaFileName = buildScriptMetaFileName(scriptName);
+  if (legacyDir) {
+    const metaPath = path.join(legacyDir, metaFileName);
+    if (await fileExists(metaPath)) return metaPath;
+  }
+  for (const legacyDir of legacyScriptOutputDirs) {
+    const metaPath = path.join(legacyDir, metaFileName);
+    if (await fileExists(metaPath)) return metaPath;
+  }
+  return "";
+}
+
+async function ensureStorageLayout() {
+  await fs.mkdir(scriptOutputDir, { recursive: true });
+  await fs.mkdir(path.dirname(schoolMetricsFile), { recursive: true });
 }
 
 /**
@@ -1068,6 +1136,13 @@ function parseCommaSet(value) {
       .map((item) => item.trim())
       .filter(Boolean)
   );
+}
+
+function parseCommaList(value) {
+  return (value || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
 }
 
 /**
@@ -1335,13 +1410,38 @@ async function getScriptMeta(scriptName) {
   const metaKey = buildScriptMetaKey(scriptName);
   const cached = await redisClient.get(metaKey);
   if (cached) return safeJson(cached);
-  try {
-    const metaPath = buildScriptMetaPath(scriptName);
-    const raw = await fs.readFile(metaPath, "utf-8");
+  const metaPath = buildScriptMetaPath(scriptName);
+  const raw = await readTextIfExists(metaPath);
+  if (raw) {
+    await redisClient.set(metaKey, raw);
     return safeJson(raw);
-  } catch {
-    return null;
   }
+  const legacyMeta = await readLegacyMeta(scriptName);
+  if (legacyMeta) {
+    await writeScriptMeta(scriptName, legacyMeta);
+    return legacyMeta;
+  }
+  const scriptContent = await readScript(scriptName);
+  if (scriptContent) {
+    const meta = await buildScriptMeta(scriptName, scriptContent, {
+      previousMeta: { version: 0, sha256: "" },
+      appliedBy: "legacy-migrate",
+      releaseStage: "active"
+    });
+    await writeScriptMeta(scriptName, meta);
+    return meta;
+  }
+  return null;
+}
+
+async function readLegacyMeta(scriptName) {
+  const metaFileName = buildScriptMetaFileName(scriptName);
+  for (const legacyDir of legacyScriptOutputDirs) {
+    const metaPath = path.join(legacyDir, metaFileName);
+    const raw = await readTextIfExists(metaPath);
+    if (raw) return safeJson(raw);
+  }
+  return null;
 }
 
 async function writeScriptMeta(scriptName, meta) {
@@ -2037,8 +2137,12 @@ function buildScriptPath(scriptName) {
 }
 
 function buildScriptMetaPath(scriptName) {
+  return path.join(scriptOutputDir, buildScriptMetaFileName(scriptName));
+}
+
+function buildScriptMetaFileName(scriptName) {
   const safeName = sanitizeScriptName(scriptName).replace(/\.js$/i, "");
-  return path.join(scriptOutputDir, `${safeName}.meta.json`);
+  return `${safeName}.meta.json`;
 }
 
 function sanitizeScriptName(scriptName) {

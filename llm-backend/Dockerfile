@@ -5,6 +5,9 @@ WORKDIR /app
 COPY package.json ./
 COPY server.js ./
 RUN npm install --only=production
+ENV SCRIPT_OUTPUT_DIR=/shared/parsers
+RUN mkdir -p /shared/parsers/metrics
+VOLUME ["/shared/parsers"]
 # 对外暴露服务端口
 EXPOSE 8080
 # 启动服务

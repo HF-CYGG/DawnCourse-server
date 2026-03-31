@@ -398,6 +398,9 @@
       function formatCost(value) {
         return Number(value || 0).toFixed(4);
       }
+      function formatTokens(value) {
+        return Number(value || 0).toLocaleString();
+      }
       function formatSystemType(value) {
         const key = value || "unknown";
         return systemTypeLabels[key] || key;
@@ -418,6 +421,19 @@
       function renderCards(data) {
         const metrics = data.metrics || {};
         const latestMetricsAt = data.latestMetricsAt || 0;
+        const modelUsage = data.modelUsage || {};
+        const summaryUsage = modelUsage.summary || {};
+        const scriptUsage = modelUsage.script || {};
+        const summarySub = summaryUsage.error
+          ? `错误 ${summaryUsage.error}`
+          : `费用 ${formatCost(summaryUsage.costTotal)}${summaryUsage.currency ? " " : ""}${
+              summaryUsage.currency || ""
+            } | 更新 ${formatTime(summaryUsage.updatedAt)}`;
+        const scriptSub = scriptUsage.error
+          ? `错误 ${scriptUsage.error}`
+          : `费用 ${formatCost(scriptUsage.costTotal)}${scriptUsage.currency ? " " : ""}${
+              scriptUsage.currency || ""
+            } | 更新 ${formatTime(scriptUsage.updatedAt)}`;
         const cards = [
           {
             title: "解析成功",
@@ -453,6 +469,16 @@
             title: "失败记录",
             value: formatCount(data.failureCount),
             sub: "最近 200 条内"
+          },
+          {
+            title: "模型1 Token",
+            value: formatTokens(summaryUsage.tokenTotal),
+            sub: summarySub
+          },
+          {
+            title: "模型2 Token",
+            value: formatTokens(scriptUsage.tokenTotal),
+            sub: scriptSub
           },
           {
             title: "模型费用",

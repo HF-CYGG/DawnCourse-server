@@ -69,6 +69,13 @@ const schoolFuzzyCacheTtlSec = Number(process.env.SCHOOL_FUZZY_CACHE_TTL_SEC || 
 const summaryCostPerCall = Number(process.env.LLM_SUMMARY_COST_PER_CALL || 0);
 const scriptCostPerCall = Number(process.env.LLM_SCRIPT_COST_PER_CALL || 0);
 const parseCostPerCall = Number(process.env.LLM_PARSE_COST_PER_CALL || 0);
+const usageEnabled = process.env.LLM_USAGE_ENABLED !== "false";
+const usageLookbackDays = Number(process.env.LLM_USAGE_LOOKBACK_DAYS || 1);
+const usageRefreshMs = Number(process.env.LLM_USAGE_REFRESH_MINUTES || 30) * 60 * 1000;
+const summaryUsageUrl = (process.env.LLM_SUMMARY_USAGE_URL || "").trim();
+const scriptUsageUrl = (process.env.LLM_SCRIPT_USAGE_URL || "").trim();
+const summaryCostUrl = (process.env.LLM_SUMMARY_COST_URL || "").trim();
+const scriptCostUrl = (process.env.LLM_SCRIPT_COST_URL || "").trim();
 const scriptSignKey = process.env.SCRIPT_SIGN_KEY || "";
 const scriptSignPrivateKey = process.env.SCRIPT_SIGN_PRIVATE_KEY || "";
 const schoolMetricsFile =
@@ -111,6 +118,7 @@ let schoolAliasCache = {
 };
 let adminLocalCredentials = null;
 const adminLocalSessions = new Map();
+let usageRefreshTimer = null;
 const canarySchoolSet = parseCommaSet(canarySchoolsRaw);
 const offlineReplayDataset = parseOfflineReplayDataset(offlineReplayDatasetJson);
 
@@ -132,6 +140,9 @@ if (adminCredentialInfo) {
   );
 }
 await ensureStorageLayout();
+if (usageEnabled && !adminLocalMode) {
+  scheduleUsageRefresh();
+}
 
 // ---------------------------------------------------------------------------
 // HTTP 服务入口
@@ -1888,16 +1899,49 @@ async function buildAdminDashboardData() {
       failureCount: 0,
       latestMetricsAt: 0,
       schoolInfoById: {},
-      failureTypeStats: {}
+      failureTypeStats: {},
+      modelUsage: {
+        summary: {
+          provider: summaryProvider,
+          model: summaryModel,
+          inputTokens: 0,
+          outputTokens: 0,
+          tokenTotal: 0,
+          costTotal: 0,
+          currency: "",
+          updatedAt: 0,
+          window: null,
+          usageUrl: "",
+          costUrl: "",
+          error: "local_mode"
+        },
+        script: {
+          provider: scriptProvider,
+          model: scriptModel,
+          inputTokens: 0,
+          outputTokens: 0,
+          tokenTotal: 0,
+          costTotal: 0,
+          currency: "",
+          updatedAt: 0,
+          window: null,
+          usageUrl: "",
+          costUrl: "",
+          error: "local_mode"
+        }
+      }
     };
   }
-  const [metrics, schoolMetrics, failures, schoolIds, schoolInfoById] = await Promise.all([
-    getMetricsSnapshot(),
-    getSchoolMetricsSnapshot(),
-    getScriptFailures(200),
-    getKnownSchoolIds(),
-    getSchoolInfoMap()
-  ]);
+  const [metrics, schoolMetrics, failures, schoolIds, schoolInfoById, usageSummary, usageScript] =
+    await Promise.all([
+      getMetricsSnapshot(),
+      getSchoolMetricsSnapshot(),
+      getScriptFailures(200),
+      getKnownSchoolIds(),
+      getSchoolInfoMap(),
+      getUsageSnapshot("summary"),
+      getUsageSnapshot("script")
+    ]);
   const schoolQueues = {};
   let totalQueueLength = 0;
   for (const schoolId of schoolIds) {
@@ -1925,7 +1969,11 @@ async function buildAdminDashboardData() {
     failureCount: failures.length,
     latestMetricsAt,
     schoolInfoById,
-    failureTypeStats
+    failureTypeStats,
+    modelUsage: {
+      summary: usageSummary,
+      script: usageScript
+    }
   };
 }
 
@@ -2556,8 +2604,33 @@ function buildAdminSessionKey(token) {
   return `admin:session:${token}`;
 }
 
+function buildUsageKey(type) {
+  return `usage:${type}`;
+}
+
 function buildScriptMetaKey(scriptName) {
   return `script:meta:${sanitizeScriptName(scriptName)}`;
+}
+
+async function httpGetJson(url, headers) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      headers: {
+        ...headers
+      },
+      signal: controller.signal
+    });
+    if (!response.ok) return null;
+    const text = await response.text();
+    return safeJson(text);
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 /**
@@ -2621,6 +2694,204 @@ function safeJson(text) {
   } catch {
     return null;
   }
+}
+
+function formatUsageDate(date) {
+  return date.toISOString().slice(0, 10);
+}
+
+function buildUsageWindow() {
+  const end = new Date();
+  const start = new Date(end.getTime() - usageLookbackDays * 24 * 60 * 60 * 1000);
+  return {
+    startDate: formatUsageDate(start),
+    endDate: formatUsageDate(end),
+    startTime: Math.floor(start.getTime() / 1000),
+    endTime: Math.floor(end.getTime() / 1000)
+  };
+}
+
+function fillUsageUrl(template, window) {
+  if (!template) return "";
+  return template
+    .replaceAll("{start_date}", window.startDate)
+    .replaceAll("{end_date}", window.endDate)
+    .replaceAll("{start_time}", String(window.startTime))
+    .replaceAll("{end_time}", String(window.endTime));
+}
+
+function buildUsageHeaders(providerName, apiKeyValue) {
+  if (!apiKeyValue) return {};
+  if (providerName === "gemini") {
+    return { "x-goog-api-key": apiKeyValue };
+  }
+  return { Authorization: `Bearer ${apiKeyValue}` };
+}
+
+function collectUsageTokens(payload) {
+  const result = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+  const stack = [payload];
+  while (stack.length) {
+    const current = stack.pop();
+    if (!current) continue;
+    if (Array.isArray(current)) {
+      for (const item of current) stack.push(item);
+      continue;
+    }
+    if (typeof current !== "object") continue;
+    for (const [key, value] of Object.entries(current)) {
+      if (typeof value === "number") {
+        const k = key.toLowerCase();
+        if (k.includes("prompt") || k.includes("input") || k.includes("context")) {
+          result.inputTokens += value;
+        }
+        if (k.includes("completion") || k.includes("output") || k.includes("generated")) {
+          result.outputTokens += value;
+        }
+        if (k.includes("total") && k.includes("token")) {
+          result.totalTokens += value;
+        }
+      } else if (value && typeof value === "object") {
+        stack.push(value);
+      }
+    }
+  }
+  if (result.totalTokens <= 0) {
+    result.totalTokens = result.inputTokens + result.outputTokens;
+  }
+  return result;
+}
+
+function collectUsageCost(payload) {
+  const result = { costTotal: 0, currency: "" };
+  const stack = [payload];
+  while (stack.length) {
+    const current = stack.pop();
+    if (!current) continue;
+    if (Array.isArray(current)) {
+      for (const item of current) stack.push(item);
+      continue;
+    }
+    if (typeof current !== "object") continue;
+    for (const [key, value] of Object.entries(current)) {
+      if (typeof value === "number") {
+        const k = key.toLowerCase();
+        if (k.includes("cost") || k.includes("amount") || k.includes("usd")) {
+          result.costTotal += value;
+        }
+      } else if (typeof value === "string") {
+        const k = key.toLowerCase();
+        if (!result.currency && k.includes("currency")) {
+          result.currency = value;
+        }
+      } else if (value && typeof value === "object") {
+        stack.push(value);
+      }
+    }
+  }
+  return result;
+}
+
+function trimBaseUrl(url) {
+  return url.endsWith("/") ? url.slice(0, -1) : url;
+}
+
+async function fetchUsageByUrl(url, providerName, apiKeyValue) {
+  if (!url) return null;
+  const headers = buildUsageHeaders(providerName, apiKeyValue);
+  return await httpGetJson(url, headers);
+}
+
+async function fetchModelUsage(config) {
+  const window = buildUsageWindow();
+  const providerName = (config.provider || "").toLowerCase();
+  const apiKeyValue = config.apiKey || "";
+  const base = trimBaseUrl(config.baseUrl || "");
+  const modelName = config.model || "";
+  const result = {
+    provider: providerName,
+    model: modelName,
+    inputTokens: 0,
+    outputTokens: 0,
+    tokenTotal: 0,
+    costTotal: 0,
+    currency: "",
+    updatedAt: Date.now(),
+    window,
+    usageUrl: "",
+    costUrl: "",
+    error: ""
+  };
+  if (!apiKeyValue) {
+    result.error = "missing_api_key";
+    return result;
+  }
+  let usageUrl = fillUsageUrl(config.usageUrl || "", window);
+  if (!usageUrl) {
+    if (providerName === "gpt" || providerName === "openai") {
+      usageUrl = `${base}/v1/usage?start_date=${window.startDate}&end_date=${window.endDate}`;
+    } else if (providerName === "deepseek" || providerName === "qwen" || providerName === "glm") {
+      usageUrl = `${base}/v1/usage?start_date=${window.startDate}&end_date=${window.endDate}`;
+    }
+  }
+  let costUrl = fillUsageUrl(config.costUrl || "", window);
+  if (!costUrl && (providerName === "gpt" || providerName === "openai")) {
+    costUrl = `${base}/v1/organization/costs?start_time=${window.startTime}&end_time=${window.endTime}`;
+  }
+  result.usageUrl = usageUrl;
+  result.costUrl = costUrl;
+  const usagePayload = await fetchUsageByUrl(usageUrl, providerName, apiKeyValue);
+  const costPayload = await fetchUsageByUrl(costUrl, providerName, apiKeyValue);
+  if (!usagePayload && !costPayload) {
+    result.error = "usage_request_failed";
+    return result;
+  }
+  const tokenInfo = collectUsageTokens(usagePayload);
+  const costInfo = collectUsageCost(costPayload || usagePayload);
+  result.inputTokens = tokenInfo.inputTokens;
+  result.outputTokens = tokenInfo.outputTokens;
+  result.tokenTotal = tokenInfo.totalTokens;
+  result.costTotal = costInfo.costTotal;
+  result.currency = costInfo.currency;
+  if (!usagePayload) {
+    result.error = "usage_unavailable";
+  }
+  return result;
+}
+
+async function updateModelUsage(type, config) {
+  const snapshot = await fetchModelUsage(config);
+  await redisClient.set(buildUsageKey(type), JSON.stringify(snapshot));
+  return snapshot;
+}
+
+async function getUsageSnapshot(type) {
+  const raw = await redisClient.get(buildUsageKey(type));
+  return raw ? safeJson(raw) : null;
+}
+
+function scheduleUsageRefresh() {
+  if (usageRefreshTimer) return;
+  const run = async () => {
+    await updateModelUsage("summary", {
+      provider: summaryProvider,
+      apiKey: summaryApiKey,
+      model: summaryModel,
+      baseUrl: summaryBaseUrl,
+      usageUrl: summaryUsageUrl,
+      costUrl: summaryCostUrl
+    });
+    await updateModelUsage("script", {
+      provider: scriptProvider,
+      apiKey: scriptApiKey,
+      model: scriptModel,
+      baseUrl: scriptBaseUrl,
+      usageUrl: scriptUsageUrl,
+      costUrl: scriptCostUrl
+    });
+  };
+  usageRefreshTimer = setInterval(run, usageRefreshMs);
+  setTimeout(run, 0);
 }
 
 /**

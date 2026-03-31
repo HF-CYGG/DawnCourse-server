@@ -16,14 +16,22 @@ const taskTtlMs = Number(process.env.TASK_TTL_MS || 1800000);
 // 请求幂等键缓存时间，避免短时间重复入队
 const idempotentTtlMs = Number(process.env.IDEMPOTENT_TTL_MS || 10 * 60 * 1000);
 // 低成本总结模型配置（模型 1）
-const summaryProvider = (process.env.LLM_SUMMARY_PROVIDER || "gpt").toLowerCase();
+const summaryProviderRaw = (process.env.LLM_SUMMARY_PROVIDER || "gpt").toLowerCase();
 const summaryApiKey = process.env.LLM_SUMMARY_API_KEY || "";
-const summaryModel = process.env.LLM_SUMMARY_MODEL || defaultSummaryModel(summaryProvider);
+const summaryModelRaw =
+  process.env.LLM_SUMMARY_MODEL ||
+  defaultSummaryModel(summaryProviderRaw === "auto" ? "gpt" : summaryProviderRaw);
+const summaryModel = resolveModelName(summaryModelRaw);
+const summaryProvider = normalizeProvider(summaryProviderRaw, summaryModel);
 const summaryBaseUrl = process.env.LLM_SUMMARY_BASE_URL || defaultBaseUrl(summaryProvider);
 // 高成本脚本修复模型配置（模型 2）
-const scriptProvider = (process.env.LLM_SCRIPT_PROVIDER || "gpt").toLowerCase();
+const scriptProviderRaw = (process.env.LLM_SCRIPT_PROVIDER || "gpt").toLowerCase();
 const scriptApiKey = process.env.LLM_SCRIPT_API_KEY || "";
-const scriptModel = process.env.LLM_SCRIPT_MODEL || defaultScriptModel(scriptProvider);
+const scriptModelRaw =
+  process.env.LLM_SCRIPT_MODEL ||
+  defaultScriptModel(scriptProviderRaw === "auto" ? "gpt" : scriptProviderRaw);
+const scriptModel = resolveModelName(scriptModelRaw);
+const scriptProvider = normalizeProvider(scriptProviderRaw, scriptModel);
 const scriptBaseUrl = process.env.LLM_SCRIPT_BASE_URL || defaultBaseUrl(scriptProvider);
 const provider = summaryProvider;
 const apiKey = summaryApiKey;
@@ -66,9 +74,27 @@ const schoolFuzzyMinLength = Number(process.env.SCHOOL_FUZZY_MIN_LENGTH || 4);
 const schoolAliasCacheMs = Number(process.env.SCHOOL_ALIAS_CACHE_MS || 10 * 60 * 1000);
 // 模糊匹配结果缓存 TTL，避免重复计算
 const schoolFuzzyCacheTtlSec = Number(process.env.SCHOOL_FUZZY_CACHE_TTL_SEC || 7 * 24 * 60 * 60);
+// 每次调用模型的按次固定成本（USD），如需精细计费推荐使用 Per_MTOKEN
 const summaryCostPerCall = Number(process.env.LLM_SUMMARY_COST_PER_CALL || 0);
 const scriptCostPerCall = Number(process.env.LLM_SCRIPT_COST_PER_CALL || 0);
 const parseCostPerCall = Number(process.env.LLM_PARSE_COST_PER_CALL || 0);
+// 模型的 Token 计费单价（每百万 Token 的 USD 价格）
+const summaryInputCostPerMTokens = Number(process.env.LLM_SUMMARY_INPUT_COST_PER_MTOKEN || 0);
+const summaryOutputCostPerMTokens = Number(process.env.LLM_SUMMARY_OUTPUT_COST_PER_MTOKEN || 0);
+const scriptInputCostPerMTokens = Number(process.env.LLM_SCRIPT_INPUT_COST_PER_MTOKEN || 0);
+const scriptOutputCostPerMTokens = Number(process.env.LLM_SCRIPT_OUTPUT_COST_PER_MTOKEN || 0);
+// 模型调用的额外请求体参数（JSON 格式），可用于配置如 response_format, tools 等平台专有参数
+const summaryRequestExtraJson = (process.env.LLM_SUMMARY_REQUEST_EXTRA_JSON || "").trim();
+const scriptRequestExtraJson = (process.env.LLM_SCRIPT_REQUEST_EXTRA_JSON || "").trim();
+const summaryRequestExtra = safeJson(summaryRequestExtraJson) || null;
+const scriptRequestExtra = safeJson(scriptRequestExtraJson) || null;
+// 强制指定 API 风格（chat 或 responses），留空则自动推断（例如 GPT-5 默认 responses）
+const summaryApiStyleRaw = (process.env.LLM_SUMMARY_API_STYLE || "").trim().toLowerCase();
+const scriptApiStyleRaw = (process.env.LLM_SCRIPT_API_STYLE || "").trim().toLowerCase();
+// 模型名称别名映射表（JSON 格式），例如将 "glm5" 映射为 "glm-5"
+const modelAliasJson = (process.env.LLM_MODEL_ALIAS_JSON || "").trim();
+const modelAliasMap = safeJson(modelAliasJson) || {};
+// 用量统计功能开关与查询配置
 const usageEnabled = process.env.LLM_USAGE_ENABLED !== "false";
 const usageLookbackDays = Number(process.env.LLM_USAGE_LOOKBACK_DAYS || 1);
 const usageRefreshMs = Number(process.env.LLM_USAGE_REFRESH_MINUTES || 30) * 60 * 1000;
@@ -795,59 +821,90 @@ async function callProvider(content) {
   // Gemini 使用官方内容生成接口
   const rawText =
     provider === "gemini"
-      ? await callGeminiRaw(systemPrompt, userPrompt)
-      : await callOpenAICompatibleRaw(systemPrompt, userPrompt);
-  return extractJsonArray(rawText || "");
+      ? await callGemini(systemPrompt, userPrompt, {
+          usageType: "summary",
+          extra: summaryRequestExtra
+        })
+      : await callOpenAICompatible(systemPrompt, userPrompt, {
+          usageType: "summary",
+          extra: summaryRequestExtra,
+          apiStyle: summaryApiStyleRaw
+        });
+  return extractJsonArray(rawText?.text || "");
 }
 
 /**
- * OpenAI 兼容接口调用（deepseek/qwen/glm/gpt）
+ * OpenAI 兼容接口调用（包括 DeepSeek/Qwen/GLM/GPT 等），返回原始文本及用量信息
+ * 支持自动适配 Chat Completions (/v1/chat/completions) 和 Responses API (/v1/responses)
  */
-/**
- * OpenAI 兼容接口调用（返回原始文本）
- */
-async function callOpenAICompatibleRaw(systemPrompt, userPrompt, options = {}) {
+async function callOpenAICompatible(systemPrompt, userPrompt, options = {}) {
   const requestProvider = (options.provider || provider).toLowerCase();
   const requestApiKey = options.apiKey || apiKey;
-  const requestModel = options.model || model;
+  const requestModel = resolveModelName(options.model || model);
   const requestBaseUrl = options.baseUrl || baseUrl;
   if (!requestApiKey) return null;
-  const endpoint = `${requestBaseUrl}${openAiPath(requestProvider)}`;
-  const body = {
-    model: requestModel,
-    temperature: 0,
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: userPrompt }
-    ]
-  };
+  const apiStyle =
+    normalizeApiStyle(options.apiStyle) || resolveApiStyle(requestProvider, requestModel);
+  const endpoint =
+    apiStyle === "responses"
+      ? `${requestBaseUrl}/v1/responses`
+      : `${requestBaseUrl}${openAiPath(requestProvider)}`;
+  const baseBody =
+    apiStyle === "responses"
+      ? {
+          model: requestModel,
+          input: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userPrompt }
+          ],
+          temperature: 0
+        }
+      : {
+          model: requestModel,
+          temperature: 0,
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userPrompt }
+          ]
+        };
+  const body = mergeRequestExtras(baseBody, options.extra);
   const responseText = await httpPostJson(endpoint, body, {
     Authorization: `Bearer ${requestApiKey}`
   });
   if (!responseText) return null;
   const json = safeJson(responseText);
-  const text = json?.choices?.[0]?.message?.content || "";
-  return text;
+  const text =
+    apiStyle === "responses" ? extractResponsesText(json) : json?.choices?.[0]?.message?.content || "";
+  const usage = extractOpenAIUsage(json);
+  if (options.usageType) {
+    await recordLocalUsage(options.usageType, usage, requestProvider, requestModel);
+  }
+  return { text, usage, raw: json };
 }
 
 /**
- * Gemini 官方接口调用（返回原始文本）
+ * Gemini 官方接口调用，返回原始文本及用量信息
+ * 根据 Gemini 最佳实践，将系统提示词 (systemInstruction) 与用户提示词分离
  */
-async function callGeminiRaw(systemPrompt, userPrompt, options = {}) {
+async function callGemini(systemPrompt, userPrompt, options = {}) {
   const requestApiKey = options.apiKey || apiKey;
-  const requestModel = options.model || model;
+  const requestModel = resolveModelName(options.model || model);
   const requestBaseUrl = options.baseUrl || baseUrl;
   if (!requestApiKey) return null;
   const endpoint = `${requestBaseUrl}/models/${requestModel}:generateContent?key=${requestApiKey}`;
-  const body = {
+  const baseBody = {
     contents: [
       {
         role: "user",
-        parts: [{ text: `${systemPrompt}\n${userPrompt}` }]
+        parts: [{ text: userPrompt }]
       }
     ],
     generationConfig: { temperature: 0 }
   };
+  if (systemPrompt) {
+    baseBody.systemInstruction = { parts: [{ text: systemPrompt }] };
+  }
+  const body = mergeRequestExtras(baseBody, options.extra);
   const responseText = await httpPostJson(endpoint, body, {});
   if (!responseText) return null;
   const json = safeJson(responseText);
@@ -855,7 +912,11 @@ async function callGeminiRaw(systemPrompt, userPrompt, options = {}) {
     json?.candidates?.[0]?.content?.parts?.[0]?.text ||
     json?.candidates?.[0]?.content?.text ||
     "";
-  return text;
+  const usage = extractGeminiUsage(json);
+  if (options.usageType) {
+    await recordLocalUsage(options.usageType, usage, "gemini", requestModel);
+  }
+  return { text, usage, raw: json };
 }
 
 /**
@@ -872,20 +933,26 @@ async function summarizeSubmissions(content, schoolId) {
   const startTime = Date.now();
   const rawText =
     summaryProvider === "gemini"
-      ? await callGeminiRaw(systemPrompt, userPrompt, {
+      ? await callGemini(systemPrompt, userPrompt, {
           provider: summaryProvider,
           apiKey: summaryApiKey,
           model: summaryModel,
-          baseUrl: summaryBaseUrl
+          baseUrl: summaryBaseUrl,
+          usageType: "summary",
+          extra: summaryRequestExtra,
+          apiStyle: summaryApiStyleRaw
         })
-      : await callOpenAICompatibleRaw(systemPrompt, userPrompt, {
+      : await callOpenAICompatible(systemPrompt, userPrompt, {
           provider: summaryProvider,
           apiKey: summaryApiKey,
           model: summaryModel,
-          baseUrl: summaryBaseUrl
+          baseUrl: summaryBaseUrl,
+          usageType: "summary",
+          extra: summaryRequestExtra,
+          apiStyle: summaryApiStyleRaw
         });
   const latencyMs = Date.now() - startTime;
-  if (!rawText) {
+  if (!rawText?.text) {
     await recordMetric("summary_failed", latencyMs, summaryCostPerCall);
     if (schoolId) {
       await recordSchoolMetric(schoolId, "summary_failed", latencyMs, summaryCostPerCall);
@@ -896,7 +963,7 @@ async function summarizeSubmissions(content, schoolId) {
   if (schoolId) {
     await recordSchoolMetric(schoolId, "summary_success", latencyMs, summaryCostPerCall);
   }
-  return rawText;
+  return rawText.text;
 }
 
 /**
@@ -919,19 +986,26 @@ async function normalizeIssueBatch(items, schoolId) {
     `${JSON.stringify(payload)}`;
   const rawText =
     summaryProvider === "gemini"
-      ? await callGeminiRaw(systemPrompt, userPrompt, {
+      ? await callGemini(systemPrompt, userPrompt, {
           provider: summaryProvider,
           apiKey: summaryApiKey,
           model: summaryModel,
-          baseUrl: summaryBaseUrl
+          baseUrl: summaryBaseUrl,
+          usageType: "summary",
+          extra: summaryRequestExtra,
+          apiStyle: summaryApiStyleRaw
         })
-      : await callOpenAICompatibleRaw(systemPrompt, userPrompt, {
+      : await callOpenAICompatible(systemPrompt, userPrompt, {
           provider: summaryProvider,
           apiKey: summaryApiKey,
           model: summaryModel,
-          baseUrl: summaryBaseUrl
+          baseUrl: summaryBaseUrl,
+          usageType: "summary",
+          extra: summaryRequestExtra,
+          apiStyle: summaryApiStyleRaw
         });
-  const parsed = rawText ? safeJson(rawText) : null;
+  const rawTextContent = rawText?.text || "";
+  const parsed = rawTextContent ? safeJson(rawTextContent) : null;
   if (!Array.isArray(parsed)) {
     return items.map((item, index) => ({
       index: index + 1,
@@ -983,20 +1057,26 @@ async function generatePatchGuidance(summary, schoolId) {
   const startTime = Date.now();
   const rawText =
     summaryProvider === "gemini"
-      ? await callGeminiRaw(systemPrompt, userPrompt, {
+      ? await callGemini(systemPrompt, userPrompt, {
           provider: summaryProvider,
           apiKey: summaryApiKey,
           model: summaryModel,
-          baseUrl: summaryBaseUrl
+          baseUrl: summaryBaseUrl,
+          usageType: "summary",
+          extra: summaryRequestExtra,
+          apiStyle: summaryApiStyleRaw
         })
-      : await callOpenAICompatibleRaw(systemPrompt, userPrompt, {
+      : await callOpenAICompatible(systemPrompt, userPrompt, {
           provider: summaryProvider,
           apiKey: summaryApiKey,
           model: summaryModel,
-          baseUrl: summaryBaseUrl
+          baseUrl: summaryBaseUrl,
+          usageType: "summary",
+          extra: summaryRequestExtra,
+          apiStyle: summaryApiStyleRaw
         });
   const latencyMs = Date.now() - startTime;
-  if (!rawText) {
+  if (!rawText?.text) {
     await recordMetric("summary_failed", latencyMs, summaryCostPerCall);
     if (schoolId) {
       await recordSchoolMetric(schoolId, "summary_failed", latencyMs, summaryCostPerCall);
@@ -1007,7 +1087,7 @@ async function generatePatchGuidance(summary, schoolId) {
   if (schoolId) {
     await recordSchoolMetric(schoolId, "summary_success", latencyMs, summaryCostPerCall);
   }
-  return rawText;
+  return rawText.text;
 }
 
 /**
@@ -1034,20 +1114,26 @@ async function generateParserScript(summary, patchGuidance, previousScript, scho
   const startTime = Date.now();
   const rawText =
     scriptProvider === "gemini"
-      ? await callGeminiRaw(systemPrompt, userPrompt, {
+      ? await callGemini(systemPrompt, userPrompt, {
           provider: scriptProvider,
           apiKey: scriptApiKey,
           model: scriptModel,
-          baseUrl: scriptBaseUrl
+          baseUrl: scriptBaseUrl,
+          usageType: "script",
+          extra: scriptRequestExtra,
+          apiStyle: scriptApiStyleRaw
         })
-      : await callOpenAICompatibleRaw(systemPrompt, userPrompt, {
+      : await callOpenAICompatible(systemPrompt, userPrompt, {
           provider: scriptProvider,
           apiKey: scriptApiKey,
           model: scriptModel,
-          baseUrl: scriptBaseUrl
+          baseUrl: scriptBaseUrl,
+          usageType: "script",
+          extra: scriptRequestExtra,
+          apiStyle: scriptApiStyleRaw
         });
   const latencyMs = Date.now() - startTime;
-  if (!rawText) {
+  if (!rawText?.text) {
     await recordMetric("script_failed", latencyMs, scriptCostPerCall);
     if (schoolId) {
       await recordSchoolMetric(schoolId, "script_failed", latencyMs, scriptCostPerCall);
@@ -1058,7 +1144,7 @@ async function generateParserScript(summary, patchGuidance, previousScript, scho
   if (schoolId) {
     await recordSchoolMetric(schoolId, "script_success", latencyMs, scriptCostPerCall);
   }
-  return cleanScriptOutput(rawText);
+  return cleanScriptOutput(rawText.text);
 }
 
 /**
@@ -2696,6 +2782,202 @@ function safeJson(text) {
   }
 }
 
+/**
+ * 标准化模型名称，处理常见缩写与后缀格式
+ * 例如：glm5 -> glm-5, gpt5.2codex -> gpt-5.2-codex
+ */
+function normalizeModelName(name) {
+  if (!name) return "";
+  const raw = String(name).trim();
+  if (!raw) return "";
+  let value = raw.toLowerCase().replace(/[\s_]+/g, "-");
+  value = value.replace(/(glm|deepseek|qwen|gemini|gpt)(\d)/g, "$1-$2");
+  value = value.replace(/(\d)(codex)/g, "$1-codex");
+  value = value.replace(/-+codex/g, "-codex");
+  value = value.replace(/-+/g, "-");
+  return value;
+}
+
+/**
+ * 解析最终模型名称，优先使用别名映射表 (LLM_MODEL_ALIAS_JSON)，其次使用标准化名称
+ */
+function resolveModelName(name) {
+  if (!name) return "";
+  const normalized = normalizeModelName(name);
+  if (modelAliasMap && typeof modelAliasMap === "object") {
+    if (modelAliasMap[name]) return modelAliasMap[name];
+    if (modelAliasMap[normalized]) return modelAliasMap[normalized];
+  }
+  return normalized || name;
+}
+
+/**
+ * 根据模型名称前缀自动推断服务提供商
+ * 例如：qwen-plus 推断为 qwen，deepseek-chat 推断为 deepseek
+ */
+function inferProviderFromModel(name) {
+  const normalized = normalizeModelName(name);
+  if (normalized.startsWith("glm")) return "glm";
+  if (normalized.startsWith("deepseek")) return "deepseek";
+  if (normalized.startsWith("qwen")) return "qwen";
+  if (normalized.startsWith("gemini")) return "gemini";
+  if (normalized.startsWith("gpt")) return "gpt";
+  return "";
+}
+
+/**
+ * 标准化 Provider 名称，支持 "auto" 自动推断
+ */
+function normalizeProvider(providerName, modelName) {
+  const normalized = (providerName || "").toLowerCase();
+  if (!normalized || normalized === "auto") {
+    const inferred = inferProviderFromModel(modelName);
+    return inferred || "gpt";
+  }
+  return normalized;
+}
+
+/**
+ * 标准化 API 风格配置，仅允许 chat 或 responses
+ */
+function normalizeApiStyle(value) {
+  if (!value) return "";
+  const normalized = value.toLowerCase();
+  if (normalized === "chat" || normalized === "responses") return normalized;
+  return "";
+}
+
+/**
+ * 决定使用的 API 调用风格：
+ * GPT-5 及其 codex 系列默认使用 OpenAI 的 Responses API，其余默认使用 Chat Completions
+ */
+function resolveApiStyle(providerName, modelName) {
+  if (providerName === "gpt" || providerName === "openai") {
+    const normalized = normalizeModelName(modelName);
+    if (normalized.startsWith("gpt-5") || normalized.includes("codex")) {
+      return "responses";
+    }
+  }
+  return "chat";
+}
+
+/**
+ * 合并平台特有的请求体扩展参数（如 response_format, tools 等）
+ */
+function mergeRequestExtras(baseBody, extraBody) {
+  if (!extraBody || typeof extraBody !== "object") return baseBody;
+  return { ...baseBody, ...extraBody };
+}
+
+/**
+ * 从 OpenAI Responses API (非 Chat Completions) 的返回体中提取文本
+ */
+function extractResponsesText(payload) {
+  const output = payload?.output || [];
+  const texts = [];
+  for (const item of output) {
+    const content = item?.content || [];
+    for (const part of content) {
+      if (part?.type === "output_text" && part?.text) {
+        texts.push(part.text);
+      }
+    }
+  }
+  if (texts.length) return texts.join("\n");
+  return payload?.output_text || payload?.text || "";
+}
+
+/**
+ * 提取 OpenAI 兼容接口（包括 DeepSeek/Qwen/GLM/GPT）的用量信息
+ */
+function extractOpenAIUsage(payload) {
+  if (!payload) return { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+  if (payload.usage) {
+    const usage = payload.usage;
+    const inputTokens =
+      usage.prompt_tokens || usage.input_tokens || usage.promptTokens || usage.inputTokens || 0;
+    const outputTokens =
+      usage.completion_tokens ||
+      usage.output_tokens ||
+      usage.completionTokens ||
+      usage.outputTokens ||
+      0;
+    const totalTokens =
+      usage.total_tokens || usage.totalTokens || inputTokens + outputTokens || 0;
+    return { inputTokens, outputTokens, totalTokens };
+  }
+  return collectUsageTokens(payload);
+}
+
+/**
+ * 提取 Gemini 官方接口的用量信息
+ */
+function extractGeminiUsage(payload) {
+  const usage = payload?.usageMetadata || payload?.usage_metadata;
+  if (!usage) return { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+  const inputTokens = usage.promptTokenCount || usage.inputTokenCount || 0;
+  const outputTokens = usage.candidatesTokenCount || usage.outputTokenCount || 0;
+  const totalTokens = usage.totalTokenCount || inputTokens + outputTokens;
+  return { inputTokens, outputTokens, totalTokens };
+}
+
+function calculateUsageCost(usageType, usage) {
+  if (!usage) return 0;
+  const inputTokens = usage.inputTokens || 0;
+  const outputTokens = usage.outputTokens || 0;
+  if (usageType === "summary") {
+    const inputCost = (inputTokens / 1_000_000) * summaryInputCostPerMTokens;
+    const outputCost = (outputTokens / 1_000_000) * summaryOutputCostPerMTokens;
+    return inputCost + outputCost;
+  }
+  if (usageType === "script") {
+    const inputCost = (inputTokens / 1_000_000) * scriptInputCostPerMTokens;
+    const outputCost = (outputTokens / 1_000_000) * scriptOutputCostPerMTokens;
+    return inputCost + outputCost;
+  }
+  return 0;
+}
+
+function buildLocalUsageKey(usageType) {
+  return `${redisKeyPrefix}usage:local:${usageType}`;
+}
+
+async function recordLocalUsage(usageType, usage, providerName, modelName) {
+  if (!usageType || !redisClient || !usage) return;
+  const key = buildLocalUsageKey(usageType);
+  const inputTokens = usage.inputTokens || 0;
+  const outputTokens = usage.outputTokens || 0;
+  const totalTokens = usage.totalTokens || inputTokens + outputTokens;
+  const costTotal = calculateUsageCost(usageType, { inputTokens, outputTokens, totalTokens });
+  await redisClient.hIncrBy(key, "inputTokens", Math.round(inputTokens));
+  await redisClient.hIncrBy(key, "outputTokens", Math.round(outputTokens));
+  await redisClient.hIncrBy(key, "tokenTotal", Math.round(totalTokens));
+  if (costTotal) {
+    await redisClient.hIncrByFloat(key, "costTotal", costTotal);
+  }
+  await redisClient.hSet(key, "provider", providerName || "");
+  await redisClient.hSet(key, "model", modelName || "");
+  await redisClient.hSet(key, "updatedAt", Date.now().toString());
+}
+
+async function getLocalUsageSnapshot(usageType) {
+  if (!redisClient) return null;
+  const key = buildLocalUsageKey(usageType);
+  const data = await redisClient.hGetAll(key);
+  if (!data || Object.keys(data).length === 0) return null;
+  return {
+    provider: data.provider || "",
+    model: data.model || "",
+    inputTokens: Number(data.inputTokens || 0),
+    outputTokens: Number(data.outputTokens || 0),
+    tokenTotal: Number(data.tokenTotal || 0),
+    costTotal: Number(data.costTotal || 0),
+    currency: "usd",
+    updatedAt: Number(data.updatedAt || 0),
+    error: ""
+  };
+}
+
 function formatUsageDate(date) {
   return date.toISOString().slice(0, 10);
 }
@@ -2830,8 +3112,6 @@ async function fetchModelUsage(config) {
   if (!usageUrl) {
     if (providerName === "gpt" || providerName === "openai") {
       usageUrl = `${base}/v1/usage?start_date=${window.startDate}&end_date=${window.endDate}`;
-    } else if (providerName === "deepseek" || providerName === "qwen" || providerName === "glm") {
-      usageUrl = `${base}/v1/usage?start_date=${window.startDate}&end_date=${window.endDate}`;
     }
   }
   let costUrl = fillUsageUrl(config.costUrl || "", window);
@@ -2867,7 +3147,21 @@ async function updateModelUsage(type, config) {
 
 async function getUsageSnapshot(type) {
   const raw = await redisClient.get(buildUsageKey(type));
-  return raw ? safeJson(raw) : null;
+  const snapshot = raw ? safeJson(raw) : null;
+  if (!snapshot) {
+    const local = await getLocalUsageSnapshot(type);
+    if (local) {
+      return { ...local, error: "local_only" };
+    }
+    return null;
+  }
+  if (snapshot.error === "usage_request_failed" || snapshot.error === "usage_unavailable") {
+    const local = await getLocalUsageSnapshot(type);
+    if (local) {
+      return { ...local, error: "local_fallback" };
+    }
+  }
+  return snapshot;
 }
 
 function scheduleUsageRefresh() {

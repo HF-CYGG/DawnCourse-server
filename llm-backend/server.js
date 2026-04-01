@@ -122,13 +122,14 @@ const degradeHighCostEnabled = process.env.DEGRADE_HIGH_COST === "true";
 const issueClusterSimilarity = Number(process.env.ISSUE_CLUSTER_SIMILARITY || 0.45);
 // 管理后台会话有效期（默认 12 小时）
 const adminSessionTtlMs = Number(process.env.ADMIN_SESSION_TTL_MS || 12 * 60 * 60 * 1000);
-// 管理后台静态页面本地调试根目录（为空则不启用静态页面服务）
-const adminWebRoot = (process.env.ADMIN_WEB_ROOT || "").trim();
-const adminStaticDir = adminWebRoot ? path.resolve(adminWebRoot, "admin") : "";
-const adminIndexPath = adminWebRoot
-  ? path.resolve(adminWebRoot, "admin", "index.html")
-  : "";
 const adminLocalMode = process.env.ADMIN_LOCAL_MODE === "true";
+// 管理后台静态页面本地调试根目录
+// - ADMIN_WEB_ROOT：显式指定 server/html 的上级目录（内部会拼接 /admin）
+// - 未指定时：若开启 ADMIN_LOCAL_MODE，则默认使用仓库自带的 server/html，便于本地直接访问 /admin/
+const adminWebRootRaw = (process.env.ADMIN_WEB_ROOT || "").trim();
+const adminWebRoot = adminWebRootRaw || (adminLocalMode ? path.resolve(__dirname, "..", "html") : "");
+const adminStaticDir = adminWebRoot ? path.resolve(adminWebRoot, "admin") : "";
+const adminIndexPath = adminWebRoot ? path.resolve(adminWebRoot, "admin", "index.html") : "";
 // 服务启动时间戳，用于面板展示启动时长
 const serverStartedAt = Date.now();
 // 单次脚本修复并发控制（按学校粒度）

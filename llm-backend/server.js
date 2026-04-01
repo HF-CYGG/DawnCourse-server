@@ -561,6 +561,41 @@ const server = http.createServer((req, res) => {
     const meta = await getScriptMeta(scriptName);
     return sendJson(res, 200, { code: 200, data: { meta } });
   }
+  if (req.method === "GET" && url.pathname === "/api/v1/admin/scripts") {
+    const auth = await requireAdminAuth(req);
+    if (!auth.ok) {
+      return sendJson(res, 401, { code: 401, msg: "未登录" });
+    }
+    const list = await listAdminScripts();
+    return sendJson(res, 200, { code: 200, data: { list } });
+  }
+  if (req.method === "GET" && url.pathname === "/api/v1/admin/script_content") {
+    const auth = await requireAdminAuth(req);
+    if (!auth.ok) {
+      return sendJson(res, 401, { code: 401, msg: "未登录" });
+    }
+    const scriptName = (url.searchParams.get("scriptName") || url.searchParams.get("script_name") || "")
+      .toString()
+      .trim();
+    const source = (url.searchParams.get("source") || "current").toString();
+    const version = Number(url.searchParams.get("version") || 0);
+    if (!scriptName) {
+      return sendJson(res, 400, { code: 400, msg: "缺少 scriptName" });
+    }
+    let content = "";
+    if (source === "pending") {
+      content = (await loadPendingScript(scriptName)) || "";
+    } else if (source === "backup") {
+      content = (await loadScriptBackup(scriptName, version)) || "";
+    } else {
+      content = (await readScript(scriptName)) || "";
+    }
+    if (!content) {
+      return sendJson(res, 404, { code: 404, msg: "内容不存在或已过期" });
+    }
+    const meta = await getScriptMeta(scriptName);
+    return sendJson(res, 200, { code: 200, data: { content, meta } });
+  }
   if (req.method === "GET" && url.pathname === "/api/v1/admin/config") {
     const auth = await requireAdminAuth(req);
     if (!auth.ok) {
@@ -2972,6 +3007,49 @@ function buildAdminCredentialKey() {
  */
 function buildAdminSessionKey(token) {
   return `admin:session:${token}`;
+}
+
+async function listAdminScripts() {
+  let entries = [];
+  try {
+    entries = await fs.readdir(scriptOutputDir, { withFileTypes: true });
+  } catch {
+    entries = [];
+  }
+  const names = new Set();
+  for (const entry of entries) {
+    if (!entry?.isFile?.()) continue;
+    const name = entry.name || "";
+    if (name.endsWith(".meta.json")) {
+      const base = name.replace(/\.meta\.json$/i, "");
+      if (base) names.add(`${base}.js`);
+      continue;
+    }
+    if (name.endsWith(".js") && !name.includes(".bak.")) {
+      names.add(name);
+    }
+  }
+  const list = await Promise.all(
+    Array.from(names).map(async (scriptName) => {
+      const meta = await getScriptMeta(scriptName);
+      const pendingContent = await loadPendingScript(scriptName);
+      const pendingAvailable = Boolean(pendingContent);
+      const rollbackTargetVersion = Number(meta?.parentVersion || 0);
+      const rollbackContent = rollbackTargetVersion
+        ? await loadScriptBackup(scriptName, rollbackTargetVersion)
+        : "";
+      const rollbackAvailable = Boolean(rollbackContent);
+      return {
+        scriptName,
+        meta,
+        pendingAvailable,
+        rollbackAvailable,
+        rollbackTargetVersion
+      };
+    })
+  );
+  list.sort((a, b) => Number(b?.meta?.updatedAt || 0) - Number(a?.meta?.updatedAt || 0));
+  return list;
 }
 
 function buildUsageKey(type) {

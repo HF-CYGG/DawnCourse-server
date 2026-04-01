@@ -17,6 +17,9 @@
           <div class="nav-item active" data-target="page-dashboard">
             概览与监控
           </div>
+          <div class="nav-item" data-target="page-scripts">
+            脚本发布
+          </div>
           <div class="nav-item" data-target="page-config">
             模型配置
           </div>
@@ -219,7 +222,53 @@
             </div>
           </div>
 
+          <div id="page-scripts" class="page-section">
+            <section class="mb-24">
+              <div class="grid cards" id="scriptSummaryCards"></div>
+            </section>
+            <section class="mb-24">
+              <h3 class="section-title">脚本列表</h3>
+              <table class="table" id="scriptTable">
+                <thead>
+                  <tr>
+                    <th>脚本</th>
+                    <th>阶段</th>
+                    <th>版本</th>
+                    <th>父版本</th>
+                    <th>Pending</th>
+                    <th>回滚</th>
+                    <th>更新时间</th>
+                    <th>操作人</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </section>
+          </div>
+
         </main>
+      </div>
+    </div>
+    <div class="modal-overlay" id="scriptModal" style="display: none">
+      <div class="modal-panel">
+        <div class="modal-header">
+          <div>
+            <h2 id="scriptModalTitle">脚本</h2>
+            <div class="meta" id="scriptModalMeta"></div>
+          </div>
+          <div class="actions">
+            <select id="scriptModalSource" class="modal-select">
+              <option value="current">当前脚本</option>
+              <option value="pending">Pending</option>
+              <option value="backup">父版本备份</option>
+            </select>
+            <button class="btn secondary" id="scriptModalClose" type="button">关闭</button>
+          </div>
+        </div>
+        <div class="modal-body">
+          <pre class="code-block" id="scriptModalCode"></pre>
+        </div>
       </div>
     </div>
     <div class="login-overlay" id="loginOverlay">

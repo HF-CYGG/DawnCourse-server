@@ -12,8 +12,18 @@ const summaryCards = document.getElementById("summaryCards");
 const schoolTableBody = document.querySelector("#schoolTable tbody");
 const failureTableBody = document.querySelector("#failureTable tbody");
 const headerMeta = document.getElementById("headerMeta");
+const scriptSummaryCards = document.getElementById("scriptSummaryCards");
+const scriptTableBody = document.querySelector("#scriptTable tbody");
+const scriptModal = document.getElementById("scriptModal");
+const scriptModalTitle = document.getElementById("scriptModalTitle");
+const scriptModalMeta = document.getElementById("scriptModalMeta");
+const scriptModalCode = document.getElementById("scriptModalCode");
+const scriptModalClose = document.getElementById("scriptModalClose");
+const scriptModalSource = document.getElementById("scriptModalSource");
 let currentData = null;
 let eventSource = null;
+let scriptsCache = null;
+let scriptModalState = { scriptName: "", rollbackTargetVersion: 0 };
 
 const navItems = document.querySelectorAll(".nav-item");
 const pageSections = document.querySelectorAll(".page-section");
@@ -146,12 +156,81 @@ navItems.forEach((item) => {
       if (page.id === target) {
         page.classList.add("active");
         if (target === "page-config") loadConfig();
+        if (target === "page-scripts") loadScriptsPage();
       } else {
         page.classList.remove("active");
       }
     });
   });
 });
+
+function isScriptsPageActive() {
+  const active = document.querySelector(".page-section.active");
+  return active?.id === "page-scripts";
+}
+
+function stageBadge(stage) {
+  const value = (stage || "unknown").toString();
+  if (value === "active") return `<span class="badge success">active</span>`;
+  if (value === "canary") return `<span class="badge warning">canary</span>`;
+  if (value === "pending") return `<span class="badge danger">pending</span>`;
+  if (value === "rollback") return `<span class="badge danger">rollback</span>`;
+  return `<span class="badge">${value}</span>`;
+}
+
+function showScriptModal(scriptName, rollbackTargetVersion) {
+  scriptModalState = {
+    scriptName: (scriptName || "").toString(),
+    rollbackTargetVersion: Number(rollbackTargetVersion || 0)
+  };
+  scriptModalTitle.textContent = scriptModalState.scriptName || "脚本";
+  scriptModalMeta.textContent = "";
+  scriptModalCode.textContent = "加载中...";
+  scriptModalSource.value = "current";
+  scriptModal.style.display = "flex";
+  loadScriptModalContent();
+}
+
+function closeScriptModal() {
+  scriptModal.style.display = "none";
+  scriptModalCode.textContent = "";
+  scriptModalMeta.textContent = "";
+  scriptModalState = { scriptName: "", rollbackTargetVersion: 0 };
+}
+
+async function loadScriptModalContent() {
+  const scriptName = scriptModalState.scriptName;
+  if (!scriptName) return;
+  const source = scriptModalSource.value || "current";
+  const version = source === "backup" ? scriptModalState.rollbackTargetVersion : 0;
+  const qs = new URLSearchParams();
+  qs.set("scriptName", scriptName);
+  qs.set("source", source);
+  if (version) qs.set("version", String(version));
+  try {
+    const result = await fetchWithAuth(`/api/v1/admin/script_content?${qs.toString()}`);
+    const payload = result.data || {};
+    const meta = payload.meta || {};
+    scriptModalMeta.textContent = `阶段 ${meta.releaseStage || "-"} | 版本 ${meta.version || 0} | 父版本 ${
+      meta.parentVersion || 0
+    } | 更新时间 ${formatTime(meta.updatedAt)} | 操作人 ${meta.appliedBy || "-"}`;
+    scriptModalCode.textContent = payload.content || "";
+  } catch (e) {
+    scriptModalCode.textContent = e?.message === "unauthorized" ? "未登录" : "加载失败";
+  }
+}
+
+if (scriptModalClose) {
+  scriptModalClose.addEventListener("click", closeScriptModal);
+}
+if (scriptModalSource) {
+  scriptModalSource.addEventListener("change", loadScriptModalContent);
+}
+if (scriptModal) {
+  scriptModal.addEventListener("click", (e) => {
+    if (e.target === scriptModal) closeScriptModal();
+  });
+}
 
 async function loadConfig() {
   try {
@@ -490,6 +569,22 @@ async function fetchWithAuth(requestPath) {
   return res.json();
 }
 
+async function postWithAuth(requestPath, payload) {
+  const token = getToken();
+  const res = await fetch(requestPath, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`
+    },
+    body: JSON.stringify(payload || {})
+  });
+  if (res.status === 401) {
+    throw new Error("unauthorized");
+  }
+  return res.json();
+}
+
 async function refreshData() {
   const result = await fetchWithAuth("/api/v1/admin/data");
   const data = result.data || {};
@@ -500,6 +595,165 @@ async function refreshData() {
   renderCards(data);
   updateFilterOptions(data);
   applyFilters();
+}
+
+function renderScriptCards(list) {
+  if (!scriptSummaryCards) return;
+  const items = Array.isArray(list) ? list : [];
+  const countByStage = { active: 0, canary: 0, pending: 0, rollback: 0, unknown: 0 };
+  let pendingMissing = 0;
+  let rollbackMissing = 0;
+  for (const item of items) {
+    const stage = (item?.meta?.releaseStage || "unknown").toString();
+    countByStage[stage] = (countByStage[stage] || 0) + 1;
+    if (stage === "pending" && !item?.pendingAvailable) pendingMissing += 1;
+    if (item?.meta?.parentVersion && !item?.rollbackAvailable) rollbackMissing += 1;
+  }
+  const cards = [
+    { title: "脚本总数", value: formatCount(items.length), sub: "scriptOutputDir 根目录" },
+    { title: "Active", value: formatCount(countByStage.active), sub: "全量生效" },
+    { title: "Canary", value: formatCount(countByStage.canary), sub: "灰度生效" },
+    { title: "Pending", value: formatCount(countByStage.pending), sub: `待发布（过期 ${formatCount(pendingMissing)}）` },
+    { title: "回滚不可用", value: formatCount(rollbackMissing), sub: "父版本备份缺失/过期" }
+  ];
+  scriptSummaryCards.innerHTML = cards
+    .map(
+      (card) => `
+          <div class="card">
+            <h3>${card.title}</h3>
+            <div class="value">${card.value}</div>
+            <div class="sub">${card.sub}</div>
+          </div>
+        `
+    )
+    .join("");
+}
+
+function renderScriptsTable(list) {
+  if (!scriptTableBody) return;
+  const items = Array.isArray(list) ? list : [];
+  scriptTableBody.innerHTML = items
+    .map((item) => {
+      const meta = item.meta || {};
+      const stage = meta.releaseStage || "unknown";
+      const v = Number(meta.version || 0);
+      const pv = Number(meta.parentVersion || 0);
+      const pendingBadge = item.pendingAvailable
+        ? `<span class="badge warning">可发布</span>`
+        : stage === "pending"
+          ? `<span class="badge danger">已过期</span>`
+          : `<span class="badge">无</span>`;
+      const rollbackBadge =
+        pv > 0
+          ? item.rollbackAvailable
+            ? `<span class="badge warning">可回滚</span>`
+            : `<span class="badge danger">缺失</span>`
+          : `<span class="badge">无</span>`;
+      const promoteDisabled = item.pendingAvailable ? "" : "disabled";
+      const rollbackDisabled = item.rollbackAvailable ? "" : "disabled";
+      return `
+        <tr>
+          <td>${item.scriptName || "-"}</td>
+          <td>${stageBadge(stage)}</td>
+          <td>${v}</td>
+          <td>${pv}</td>
+          <td>${pendingBadge}</td>
+          <td>${rollbackBadge}</td>
+          <td>${formatTime(meta.updatedAt)}</td>
+          <td>${meta.appliedBy || "-"}</td>
+          <td>
+            <div class="actions">
+              <button class="btn secondary" type="button" data-action="view" data-script="${encodeURIComponent(
+                item.scriptName || ""
+              )}" data-pv="${pv}">查看</button>
+              <button class="btn" type="button" data-action="promote-active" data-script="${encodeURIComponent(
+                item.scriptName || ""
+              )}" ${promoteDisabled}>发布全量</button>
+              <button class="btn secondary" type="button" data-action="promote-canary" data-script="${encodeURIComponent(
+                item.scriptName || ""
+              )}" ${promoteDisabled}>发布灰度</button>
+              <button class="btn secondary" type="button" data-action="rollback" data-script="${encodeURIComponent(
+                item.scriptName || ""
+              )}" ${rollbackDisabled}>回滚上个版本</button>
+            </div>
+          </td>
+        </tr>
+      `;
+    })
+    .join("");
+  if (!items.length) {
+    scriptTableBody.innerHTML = `<tr><td colspan="9" class="muted">暂无脚本数据</td></tr>`;
+  }
+}
+
+async function loadScriptsPage() {
+  try {
+    const result = await fetchWithAuth("/api/v1/admin/scripts");
+    const list = result.data?.list || [];
+    scriptsCache = list;
+    renderScriptCards(list);
+    renderScriptsTable(list);
+  } catch (e) {
+    if (e?.message === "unauthorized") {
+      clearToken();
+      overlay.style.display = "flex";
+      closeAdminEvents();
+      return;
+    }
+    showToast("error", "加载脚本列表失败", e?.message || "网络错误");
+  }
+}
+
+if (scriptTableBody) {
+  scriptTableBody.addEventListener("click", async (e) => {
+    const btn = e.target?.closest?.("button[data-action]");
+    if (!btn) return;
+    const action = btn.getAttribute("data-action");
+    const encoded = btn.getAttribute("data-script") || "";
+    const scriptName = decodeURIComponent(encoded);
+    const pv = Number(btn.getAttribute("data-pv") || 0);
+    if (action === "view") {
+      showScriptModal(scriptName, pv);
+      return;
+    }
+    if (action === "promote-active" || action === "promote-canary") {
+      const releaseStage = action === "promote-canary" ? "canary" : "active";
+      btn.disabled = true;
+      try {
+        const json = await postWithAuth("/api/v1/admin/promote_script", {
+          scriptName,
+          releaseStage
+        });
+        if (json.code === 200) {
+          showToast("info", "发布成功", `${scriptName} -> ${releaseStage}`);
+          await loadScriptsPage();
+        } else {
+          showToast("error", "发布失败", json.msg || "未知错误");
+        }
+      } catch (err) {
+        showToast("error", "发布失败", err?.message || "网络错误");
+      } finally {
+        btn.disabled = false;
+      }
+      return;
+    }
+    if (action === "rollback") {
+      btn.disabled = true;
+      try {
+        const json = await postWithAuth("/api/v1/admin/rollback_script", { scriptName });
+        if (json.code === 200) {
+          showToast("warning", "已回滚", `${scriptName} 已回滚到上个版本`);
+          await loadScriptsPage();
+        } else {
+          showToast("error", "回滚失败", json.msg || "未知错误");
+        }
+      } catch (err) {
+        showToast("error", "回滚失败", err?.message || "网络错误");
+      } finally {
+        btn.disabled = false;
+      }
+    }
+  });
 }
 
 function updateFilterOptions(data) {
@@ -685,7 +939,11 @@ loginBtn.addEventListener("click", async () => {
 });
 
 refreshBtn.addEventListener("click", async () => {
-  await refreshData();
+  if (isScriptsPageActive()) {
+    await loadScriptsPage();
+  } else {
+    await refreshData();
+  }
 });
 exportBtn.addEventListener("click", () => {
   exportCsv();

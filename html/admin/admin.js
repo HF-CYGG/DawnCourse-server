@@ -1,6 +1,9 @@
 const overlay = document.getElementById("loginOverlay");
 const loginBtn = document.getElementById("loginBtn");
 const loginHint = document.getElementById("loginHint");
+const loginUserInput = document.getElementById("loginUser");
+const loginPassInput = document.getElementById("loginPass");
+const toggleLoginPassBtn = document.getElementById("toggleLoginPass");
 const refreshBtn = document.getElementById("refreshBtn");
 const logoutBtn = document.getElementById("logoutBtn");
 const exportBtn = document.getElementById("exportBtn");
@@ -36,6 +39,50 @@ let scriptModalState = {
 const navItems = document.querySelectorAll(".nav-item");
 const pageSections = document.querySelectorAll(".page-section");
 const pageTitle = document.getElementById("pageTitle");
+
+function setLoginHint(text, type) {
+  if (!loginHint) return;
+  loginHint.textContent = text || "";
+  loginHint.classList.remove("error", "success");
+  if (type) loginHint.classList.add(type);
+}
+
+function setLoginLoading(loading) {
+  if (!loginBtn) return;
+  loginBtn.dataset.loading = loading ? "1" : "0";
+  loginBtn.disabled = Boolean(loading);
+}
+
+async function performLogin() {
+  setLoginHint("", "");
+  const username = (loginUserInput?.value || "").trim();
+  const password = (loginPassInput?.value || "").trim();
+  if (!username || !password) {
+    setLoginHint("请输入账号和密码", "error");
+    return;
+  }
+  setLoginLoading(true);
+  try {
+    const res = await fetch("/api/v1/admin/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password })
+    });
+    if (!res.ok) {
+      setLoginHint("账号或密码错误", "error");
+      return;
+    }
+    const result = await res.json();
+    setToken(result.data.token);
+    overlay.style.display = "none";
+    connectAdminEvents();
+    await refreshData();
+  } catch {
+    setLoginHint("网络异常，请稍后重试", "error");
+  } finally {
+    setLoginLoading(false);
+  }
+}
 
 function ensureToastContainer() {
   let container = document.querySelector(".toast-container");
@@ -1173,32 +1220,33 @@ async function checkSession() {
   } catch {
     overlay.style.display = "flex";
     closeAdminEvents();
+    requestAnimationFrame(() => {
+      if (loginUserInput) loginUserInput.focus();
+    });
   }
 }
 
-loginBtn.addEventListener("click", async () => {
-  loginHint.textContent = "";
-  const username = document.getElementById("loginUser").value.trim();
-  const password = document.getElementById("loginPass").value.trim();
-  if (!username || !password) {
-    loginHint.textContent = "请输入账号和密码";
-    return;
-  }
-  const res = await fetch("/api/v1/admin/login", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ username, password })
+loginBtn.addEventListener("click", performLogin);
+if (loginUserInput) {
+  loginUserInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") performLogin();
   });
-  if (!res.ok) {
-    loginHint.textContent = "账号或密码错误";
-    return;
-  }
-  const result = await res.json();
-  setToken(result.data.token);
-  overlay.style.display = "none";
-  connectAdminEvents();
-  await refreshData();
-});
+}
+if (loginPassInput) {
+  loginPassInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") performLogin();
+  });
+}
+if (toggleLoginPassBtn && loginPassInput) {
+  toggleLoginPassBtn.addEventListener("click", () => {
+    const nextType = loginPassInput.type === "password" ? "text" : "password";
+    loginPassInput.type = nextType;
+    const showing = nextType === "text";
+    toggleLoginPassBtn.textContent = showing ? "隐藏" : "显示";
+    toggleLoginPassBtn.setAttribute("aria-label", showing ? "隐藏密码" : "显示密码");
+    loginPassInput.focus();
+  });
+}
 
 refreshBtn.addEventListener("click", async () => {
   if (isScriptsPageActive()) {

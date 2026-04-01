@@ -282,16 +282,23 @@
     </div>
     <div class="login-overlay" id="loginOverlay">
       <div class="login-panel">
-        <h2>登录</h2>
+        <div class="login-brand">
+          <div class="login-title">Dawn Course</div>
+          <div class="login-subtitle">兜底解析监控后台</div>
+        </div>
+        <h2 class="login-heading">登录</h2>
         <div class="form-row">
-          <label class="muted">账号</label>
+          <label class="muted" for="loginUser">账号</label>
           <input id="loginUser" type="text" autocomplete="username" placeholder="请输入账号">
         </div>
         <div class="form-row">
-          <label class="muted">密码</label>
-          <input id="loginPass" type="password" autocomplete="current-password" placeholder="请输入密码">
+          <label class="muted" for="loginPass">密码</label>
+          <div class="input-group">
+            <input id="loginPass" type="password" autocomplete="current-password" placeholder="请输入密码">
+            <button class="icon-btn" id="toggleLoginPass" type="button" aria-label="显示密码">显示</button>
+          </div>
         </div>
-        <div class="actions">
+        <div class="actions login-actions">
           <button class="btn" id="loginBtn" type="button">登录</button>
           <span class="hint" id="loginHint"></span>
         </div>

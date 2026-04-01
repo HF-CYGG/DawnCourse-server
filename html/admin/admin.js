@@ -17,13 +17,21 @@ const scriptTableBody = document.querySelector("#scriptTable tbody");
 const scriptModal = document.getElementById("scriptModal");
 const scriptModalTitle = document.getElementById("scriptModalTitle");
 const scriptModalMeta = document.getElementById("scriptModalMeta");
+const scriptModalHistoryMeta = document.getElementById("scriptModalHistoryMeta");
+const scriptModalHistory = document.getElementById("scriptModalHistory");
 const scriptModalCode = document.getElementById("scriptModalCode");
 const scriptModalClose = document.getElementById("scriptModalClose");
 const scriptModalSource = document.getElementById("scriptModalSource");
 let currentData = null;
 let eventSource = null;
 let scriptsCache = null;
-let scriptModalState = { scriptName: "", rollbackTargetVersion: 0 };
+let scriptModalState = {
+  scriptName: "",
+  rollbackTargetVersion: 0,
+  selectedVersion: 0,
+  selectedHistoryKey: "",
+  currentMeta: null
+};
 
 const navItems = document.querySelectorAll(".nav-item");
 const pageSections = document.querySelectorAll(".page-section");
@@ -181,13 +189,19 @@ function stageBadge(stage) {
 function showScriptModal(scriptName, rollbackTargetVersion) {
   scriptModalState = {
     scriptName: (scriptName || "").toString(),
-    rollbackTargetVersion: Number(rollbackTargetVersion || 0)
+    rollbackTargetVersion: Number(rollbackTargetVersion || 0),
+    selectedVersion: 0,
+    selectedHistoryKey: "",
+    currentMeta: null
   };
   scriptModalTitle.textContent = scriptModalState.scriptName || "脚本";
   scriptModalMeta.textContent = "";
+  if (scriptModalHistoryMeta) scriptModalHistoryMeta.textContent = "";
+  if (scriptModalHistory) scriptModalHistory.innerHTML = "";
   scriptModalCode.textContent = "加载中...";
   scriptModalSource.value = "current";
   scriptModal.style.display = "flex";
+  loadScriptHistory();
   loadScriptModalContent();
 }
 
@@ -195,14 +209,25 @@ function closeScriptModal() {
   scriptModal.style.display = "none";
   scriptModalCode.textContent = "";
   scriptModalMeta.textContent = "";
-  scriptModalState = { scriptName: "", rollbackTargetVersion: 0 };
+  if (scriptModalHistoryMeta) scriptModalHistoryMeta.textContent = "";
+  if (scriptModalHistory) scriptModalHistory.innerHTML = "";
+  scriptModalState = {
+    scriptName: "",
+    rollbackTargetVersion: 0,
+    selectedVersion: 0,
+    selectedHistoryKey: "",
+    currentMeta: null
+  };
 }
 
 async function loadScriptModalContent() {
   const scriptName = scriptModalState.scriptName;
   if (!scriptName) return;
   const source = scriptModalSource.value || "current";
-  const version = source === "backup" ? scriptModalState.rollbackTargetVersion : 0;
+  const version =
+    source === "backup"
+      ? Number(scriptModalState.selectedVersion || scriptModalState.rollbackTargetVersion || 0)
+      : 0;
   const qs = new URLSearchParams();
   qs.set("scriptName", scriptName);
   qs.set("source", source);
@@ -211,6 +236,7 @@ async function loadScriptModalContent() {
     const result = await fetchWithAuth(`/api/v1/admin/script_content?${qs.toString()}`);
     const payload = result.data || {};
     const meta = payload.meta || {};
+    scriptModalState.currentMeta = meta || null;
     scriptModalMeta.textContent = `阶段 ${meta.releaseStage || "-"} | 版本 ${meta.version || 0} | 父版本 ${
       meta.parentVersion || 0
     } | 更新时间 ${formatTime(meta.updatedAt)} | 操作人 ${meta.appliedBy || "-"}`;
@@ -218,6 +244,116 @@ async function loadScriptModalContent() {
   } catch (e) {
     scriptModalCode.textContent = e?.message === "unauthorized" ? "未登录" : "加载失败";
   }
+}
+
+function historyTypeLabel(type) {
+  const t = (type || "").toString();
+  if (t === "auto_repair" || t === "apply") return "写入";
+  if (t === "pending") return "Pending";
+  if (t === "promote_active") return "发布全量";
+  if (t === "promote_canary") return "发布灰度";
+  if (t === "rollback_admin") return "回滚(人工)";
+  if (t === "rollback_auto") return "回滚(自动)";
+  if (t === "failure") return "失败";
+  if (t === "skipped") return "跳过";
+  return t || "事件";
+}
+
+function renderScriptHistory(list) {
+  if (!scriptModalHistory) return;
+  const items = Array.isArray(list) ? list : [];
+  if (scriptModalHistoryMeta) {
+    scriptModalHistoryMeta.textContent = `最近 ${items.length} 条`;
+  }
+  scriptModalHistory.innerHTML = items
+    .map((item) => {
+      const meta = item?.meta || {};
+      const ctx = item?.context || {};
+      const failure = item?.failure || null;
+      const titleLeft = `${historyTypeLabel(item?.type)} ${meta?.version ? `v${meta.version}` : ""}`.trim();
+      const titleRight = formatTime(item?.createdAt || meta?.updatedAt || 0);
+      const stage = meta?.releaseStage || item?.releaseStage || "";
+      const categories = Array.isArray(ctx?.issueCategories) ? ctx.issueCategories.filter(Boolean) : [];
+      const key = `${item?.type || ""}:${meta?.version || 0}:${item?.createdAt || 0}`;
+      const isActive = scriptModalState.selectedHistoryKey && scriptModalState.selectedHistoryKey === key;
+      const metaLines = [
+        stage ? `阶段：${stage}` : "",
+        meta?.parentVersion ? `父版本：v${meta.parentVersion}` : "",
+        item?.appliedBy ? `操作人：${item.appliedBy}` : "",
+        item?.schoolId ? `学校：${item.schoolId}` : "",
+        ctx?.mode ? `模式：${ctx.mode}` : "",
+        ctx?.clusterSize ? `聚类：${ctx.clusterSize}` : "",
+        categories.length ? `分类：${categories.join(",")}` : "",
+        ctx?.guidancePreview ? `指令：${ctx.guidancePreview}` : "",
+        failure ? `失败：${failure.failureType || ""} ${failure.reason || ""}`.trim() : ""
+      ].filter(Boolean);
+      const badge = stage ? stageBadge(stage) : "";
+      return `
+        <div class="history-item ${isActive ? "active" : ""}" data-key="${encodeURIComponent(
+          key
+        )}" data-type="${encodeURIComponent(item?.type || "")}" data-version="${Number(meta?.version || 0)}" data-stage="${encodeURIComponent(
+          stage
+        )}">
+          <div class="history-item-title">
+            <div>${badge} ${titleLeft}</div>
+            <div class="muted">${titleRight}</div>
+          </div>
+          <div class="history-item-meta">${metaLines.join("\n")}</div>
+        </div>
+      `;
+    })
+    .join("");
+  if (!items.length) {
+    scriptModalHistory.innerHTML = `<div class="muted">暂无历史事件</div>`;
+  }
+}
+
+async function loadScriptHistory() {
+  const scriptName = scriptModalState.scriptName;
+  if (!scriptName) return;
+  try {
+    const qs = new URLSearchParams();
+    qs.set("scriptName", scriptName);
+    qs.set("limit", "200");
+    const result = await fetchWithAuth(`/api/v1/admin/script_history?${qs.toString()}`);
+    const list = result.data?.list || [];
+    renderScriptHistory(list);
+  } catch (e) {
+    if (scriptModalHistory) {
+      scriptModalHistory.innerHTML = `<div class="muted">历史加载失败</div>`;
+    }
+  }
+}
+
+if (scriptModalHistory) {
+  scriptModalHistory.addEventListener("click", (e) => {
+    const item = e.target?.closest?.(".history-item");
+    if (!item) return;
+    const type = decodeURIComponent(item.getAttribute("data-type") || "");
+    const version = Number(item.getAttribute("data-version") || 0);
+    const key = decodeURIComponent(item.getAttribute("data-key") || "");
+    scriptModalState.selectedHistoryKey = key;
+    if (type === "pending") {
+      scriptModalSource.value = "pending";
+      scriptModalState.selectedVersion = 0;
+    } else {
+      const currentVersion = Number(scriptModalState.currentMeta?.version || 0);
+      if (version && currentVersion && version === currentVersion) {
+        scriptModalSource.value = "current";
+        scriptModalState.selectedVersion = 0;
+      } else if (version) {
+        scriptModalSource.value = "backup";
+        scriptModalState.selectedVersion = version;
+      } else {
+        scriptModalSource.value = "current";
+        scriptModalState.selectedVersion = 0;
+      }
+    }
+    const nodes = scriptModalHistory.querySelectorAll(".history-item");
+    nodes.forEach((node) => node.classList.remove("active"));
+    item.classList.add("active");
+    loadScriptModalContent();
+  });
 }
 
 if (scriptModalClose) {
@@ -638,6 +774,9 @@ function renderScriptsTable(list) {
       const stage = meta.releaseStage || "unknown";
       const v = Number(meta.version || 0);
       const pv = Number(meta.parentVersion || 0);
+      const failCount = Number(item.recentFailureCount || 0);
+      const failBadge =
+        failCount > 0 ? `<span class="badge danger" style="margin-left:8px">失败 ${failCount}</span>` : "";
       const pendingBadge = item.pendingAvailable
         ? `<span class="badge warning">可发布</span>`
         : stage === "pending"
@@ -653,7 +792,7 @@ function renderScriptsTable(list) {
       const rollbackDisabled = item.rollbackAvailable ? "" : "disabled";
       return `
         <tr>
-          <td>${item.scriptName || "-"}</td>
+          <td>${item.scriptName || "-"}${failBadge}</td>
           <td>${stageBadge(stage)}</td>
           <td>${v}</td>
           <td>${pv}</td>

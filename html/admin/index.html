@@ -266,8 +266,17 @@
             <button class="btn secondary" id="scriptModalClose" type="button">关闭</button>
           </div>
         </div>
-        <div class="modal-body">
-          <pre class="code-block" id="scriptModalCode"></pre>
+        <div class="modal-body modal-body-split">
+          <div class="modal-side">
+            <div class="modal-side-header">
+              <div class="section-title">版本事件</div>
+              <div class="meta" id="scriptModalHistoryMeta"></div>
+            </div>
+            <div class="history-list" id="scriptModalHistory"></div>
+          </div>
+          <div class="modal-main">
+            <pre class="code-block" id="scriptModalCode"></pre>
+          </div>
         </div>
       </div>
     </div>

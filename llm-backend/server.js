@@ -152,6 +152,7 @@ const offlineReplayDataset = parseOfflineReplayDataset(offlineReplayDatasetJson)
 const adminLogBufferLimit = Number(process.env.ADMIN_LOG_BUFFER_LIMIT || 300);
 const adminLogBuffer = [];
 const adminEventClients = new Set();
+const scriptHistoryLimit = Number(process.env.SCRIPT_HISTORY_LIMIT || 200);
 const nativeConsole = {
   log: console.log.bind(console),
   warn: console.warn.bind(console),
@@ -505,7 +506,8 @@ const server = http.createServer((req, res) => {
       previousMeta,
       forceRelease: true,
       releaseStage,
-      appliedBy: auth.username
+      appliedBy: auth.username,
+      actionType: releaseStage === "canary" ? "promote_canary" : "promote_active"
     });
     if (!result.ok) {
       return sendJson(res, 500, { code: 500, msg: result.reason || "发布失败" });
@@ -553,7 +555,8 @@ const server = http.createServer((req, res) => {
       previousMeta: currentMeta,
       forceRelease: true,
       releaseStage: "rollback",
-      appliedBy: auth.username
+      appliedBy: auth.username,
+      actionType: "rollback_admin"
     });
     if (!result.ok) {
       return sendJson(res, 500, { code: 500, msg: result.reason || "回滚失败" });
@@ -595,6 +598,21 @@ const server = http.createServer((req, res) => {
     }
     const meta = await getScriptMeta(scriptName);
     return sendJson(res, 200, { code: 200, data: { content, meta } });
+  }
+  if (req.method === "GET" && url.pathname === "/api/v1/admin/script_history") {
+    const auth = await requireAdminAuth(req);
+    if (!auth.ok) {
+      return sendJson(res, 401, { code: 401, msg: "未登录" });
+    }
+    const scriptName = (url.searchParams.get("scriptName") || url.searchParams.get("script_name") || "")
+      .toString()
+      .trim();
+    if (!scriptName) {
+      return sendJson(res, 400, { code: 400, msg: "缺少 scriptName" });
+    }
+    const limit = Math.max(1, Math.min(500, Number(url.searchParams.get("limit") || 200)));
+    const list = await getScriptHistory(scriptName, limit);
+    return sendJson(res, 200, { code: 200, data: { list } });
   }
   if (req.method === "GET" && url.pathname === "/api/v1/admin/config") {
     const auth = await requireAdminAuth(req);
@@ -967,6 +985,17 @@ async function processQueueCluster(schoolId, items, normalizedIssues, state, now
   if (!summary) return { state, applied: false };
   const patchGuidance = await generatePatchGuidance(summary, schoolId);
   const summaryHash = hashText(summary);
+  const issueCategories = Array.from(
+    new Set((normalizedIssues || []).map((item) => (item?.category || "").toString()).filter(Boolean))
+  );
+  const context = {
+    mode: "cluster",
+    clusterSize: Array.isArray(items) ? items.length : 0,
+    issueCategories,
+    summaryHash,
+    guidanceHash: patchGuidance ? hashText(patchGuidance) : "",
+    guidancePreview: (patchGuidance || "").toString().slice(0, 300)
+  };
   const shouldProcessIndividually =
     state.lastUpdatedAt > 0 && now - state.lastUpdatedAt <= reprocessWindowMs && summaryHash !== state.lastSummaryHash;
   if (shouldProcessIndividually) {
@@ -984,7 +1013,9 @@ async function processQueueCluster(schoolId, items, normalizedIssues, state, now
   await setSchoolPhase(schoolId, "APPLYING");
   const applyResult = await applyScriptUpdate(scriptName, generatedScript, previousScript, {
     schoolId,
-    previousMeta
+    previousMeta,
+    context,
+    actionType: "auto_repair"
   });
   if (applyResult.pending) {
     return { state, applied: false };
@@ -1033,9 +1064,19 @@ async function processIndividualSummaries(schoolId, queue) {
   const patchGuidance = await generatePatchGuidance(mergedSummary, schoolId);
   const generatedScript = await generateParserScript(mergedSummary, patchGuidance, previousScript, schoolId);
   if (!generatedScript) return;
+  const context = {
+    mode: "single",
+    clusterSize: Array.isArray(queue) ? queue.length : 0,
+    issueCategories: [],
+    summaryHash: hashText(mergedSummary),
+    guidanceHash: patchGuidance ? hashText(patchGuidance) : "",
+    guidancePreview: (patchGuidance || "").toString().slice(0, 300)
+  };
   const applyResult = await applyScriptUpdate(scriptName, generatedScript, previousScript, {
     schoolId,
-    previousMeta
+    previousMeta,
+    context,
+    actionType: "auto_repair"
   });
   if (applyResult.pending) return;
   if (!applyResult.ok) {
@@ -1773,10 +1814,22 @@ async function applyScriptUpdate(scriptName, content, previousContent, options =
       const meta = await buildScriptMeta(scriptName, content, {
         previousMeta: options.previousMeta,
         releaseStage: "active",
-        appliedBy: options.appliedBy
+        appliedBy: options.appliedBy,
+        context: options.context || null,
+        validate: { ok: true },
+        replay: { ok: true }
       });
       await writeScriptMeta(scriptName, meta);
     }
+    await pushScriptHistory(scriptName, {
+      type: "skipped",
+      appliedBy: options.appliedBy || "auto-repair",
+      schoolId: options.schoolId || "",
+      releaseStage: "active",
+      context: options.context || null,
+      validate: { ok: true },
+      replay: { ok: true }
+    });
     return { ok: true, skipped: true };
   }
   const releaseStage = decideReleaseStage(options.schoolId || "", options.forceRelease, options.releaseStage);
@@ -1785,9 +1838,23 @@ async function applyScriptUpdate(scriptName, content, previousContent, options =
     const meta = await buildScriptMeta(scriptName, content, {
       previousMeta: options.previousMeta,
       releaseStage,
-      appliedBy: options.appliedBy
+      appliedBy: options.appliedBy,
+      context: options.context || null,
+      validate: { ok: true },
+      replay: { ok: true }
     });
     await writeScriptMeta(scriptName, meta);
+    await pushScriptHistory(scriptName, {
+      type: "pending",
+      appliedBy: options.appliedBy || "auto-repair",
+      schoolId: options.schoolId || "",
+      releaseStage,
+      meta,
+      previousMeta: options.previousMeta || null,
+      context: options.context || null,
+      validate: { ok: true },
+      replay: { ok: true }
+    });
     return { ok: true, pending: true, releaseStage };
   }
   const fullPath = buildScriptPath(scriptName);
@@ -1802,9 +1869,23 @@ async function applyScriptUpdate(scriptName, content, previousContent, options =
     const meta = await buildScriptMeta(scriptName, content, {
       previousMeta: options.previousMeta,
       releaseStage,
-      appliedBy: options.appliedBy
+      appliedBy: options.appliedBy,
+      context: options.context || null,
+      validate: { ok: true },
+      replay: { ok: true }
     });
     await writeScriptMeta(scriptName, meta);
+    await pushScriptHistory(scriptName, {
+      type: options.actionType || "apply",
+      appliedBy: options.appliedBy || "auto-repair",
+      schoolId: options.schoolId || "",
+      releaseStage,
+      meta,
+      previousMeta: options.previousMeta || null,
+      context: options.context || null,
+      validate: { ok: true },
+      replay: { ok: true }
+    });
     return { ok: true };
   } catch (error) {
     if (previousContent) {
@@ -1855,6 +1936,9 @@ async function buildScriptMeta(scriptName, content, options = {}) {
   const version = (previousMeta?.version || 0) + 1;
   const sha256 = hashText(content);
   const { signature, alg } = signScript(content);
+  const ctx = options.context || null;
+  const validate = options.validate || null;
+  const replay = options.replay || null;
   return {
     scriptName,
     version,
@@ -1865,7 +1949,10 @@ async function buildScriptMeta(scriptName, content, options = {}) {
     alg,
     appliedBy: options.appliedBy || "auto-repair",
     releaseStage: options.releaseStage || "active",
-    updatedAt: Date.now()
+    updatedAt: Date.now(),
+    context: ctx,
+    validate,
+    replay
   };
 }
 
@@ -1982,7 +2069,8 @@ async function tryAutoRollback(scriptName) {
     previousMeta: meta,
     forceRelease: true,
     releaseStage: "rollback",
-    appliedBy: "auto-rollback"
+    appliedBy: "auto-rollback",
+    actionType: "rollback_auto"
   });
 }
 
@@ -2007,6 +2095,18 @@ async function recordScriptFailure(scriptName, reason, failureType, schoolId, op
   };
   await redisClient.lPush("script:failures", JSON.stringify(payload));
   await redisClient.lTrim("script:failures", 0, 200);
+  await pushScriptHistory(scriptName, {
+    type: "failure",
+    appliedBy: options.appliedBy || "system",
+    schoolId: schoolId || "",
+    releaseStage: options.stage || "",
+    failure: {
+      failureType: payload.failureType,
+      reason: payload.reason,
+      retryable: payload.retryable,
+      scriptVersion: payload.scriptVersion
+    }
+  });
   const failureKey = buildScriptFailureKey(scriptName);
   await redisClient.zAdd(failureKey, { score: now, value: `${now}:${payload.failureType}` });
   await redisClient.zRemRangeByScore(failureKey, 0, now - rollbackFailureWindowMs);
@@ -3009,6 +3109,33 @@ function buildAdminSessionKey(token) {
   return `admin:session:${token}`;
 }
 
+function buildScriptHistoryKey(scriptName) {
+  const safeName = sanitizeScriptName(scriptName);
+  return `script:history:${safeName}`;
+}
+
+async function pushScriptHistory(scriptName, entry) {
+  const safeName = sanitizeScriptName(scriptName);
+  if (!safeName) return;
+  const key = buildScriptHistoryKey(safeName);
+  const payload = {
+    ...entry,
+    scriptName: safeName,
+    createdAt: entry?.createdAt || Date.now()
+  };
+  const raw = JSON.stringify(payload);
+  await redisClient.lPush(key, raw);
+  await redisClient.lTrim(key, 0, Math.max(0, scriptHistoryLimit - 1));
+}
+
+async function getScriptHistory(scriptName, limit) {
+  const safeName = sanitizeScriptName(scriptName);
+  if (!safeName) return [];
+  const key = buildScriptHistoryKey(safeName);
+  const items = await redisClient.lRange(key, 0, Math.max(0, limit - 1));
+  return (items || []).map((raw) => safeJson(raw) || null).filter(Boolean);
+}
+
 async function listAdminScripts() {
   let entries = [];
   try {
@@ -3029,6 +3156,13 @@ async function listAdminScripts() {
       names.add(name);
     }
   }
+  const failures = await getScriptFailures(200);
+  const recentFailureCount = {};
+  for (const item of failures || []) {
+    const name = (item?.scriptName || "").toString();
+    if (!name) continue;
+    recentFailureCount[name] = (recentFailureCount[name] || 0) + 1;
+  }
   const list = await Promise.all(
     Array.from(names).map(async (scriptName) => {
       const meta = await getScriptMeta(scriptName);
@@ -3044,7 +3178,8 @@ async function listAdminScripts() {
         meta,
         pendingAvailable,
         rollbackAvailable,
-        rollbackTargetVersion
+        rollbackTargetVersion,
+        recentFailureCount: recentFailureCount[sanitizeScriptName(scriptName)] || 0
       };
     })
   );

@@ -124,6 +124,7 @@ const issueClusterSimilarity = Number(process.env.ISSUE_CLUSTER_SIMILARITY || 0.
 const adminSessionTtlMs = Number(process.env.ADMIN_SESSION_TTL_MS || 12 * 60 * 60 * 1000);
 // 管理后台静态页面本地调试根目录（为空则不启用静态页面服务）
 const adminWebRoot = (process.env.ADMIN_WEB_ROOT || "").trim();
+const adminStaticDir = adminWebRoot ? path.resolve(adminWebRoot, "admin") : "";
 const adminIndexPath = adminWebRoot
   ? path.resolve(adminWebRoot, "admin", "index.html")
   : "";
@@ -247,11 +248,15 @@ const server = http.createServer(async (req, res) => {
   if (
     adminWebRoot &&
     req.method === "GET" &&
-    (url.pathname === "/admin" ||
-      url.pathname === "/admin/" ||
-      url.pathname === "/admin/index.html")
+    url.pathname.startsWith("/admin")
   ) {
-    return sendHtmlFile(res, adminIndexPath);
+    if (url.pathname === "/admin") {
+      res.writeHead(302, { Location: "/admin/" });
+      res.end();
+      return;
+    }
+    const relPath = url.pathname === "/admin/" ? "index.html" : url.pathname.replace(/^\/admin\//, "");
+    return sendAdminStaticFile(res, relPath);
   }
   if (adminLocalMode && req.method === "GET" && url.pathname === "/") {
     res.writeHead(302, { Location: "/admin/" });
@@ -3364,6 +3369,40 @@ async function sendHtmlFile(res, filePath) {
     return sendText(res, 404, "admin html not found");
   }
   return sendHtml(res, 200, html);
+}
+
+function contentTypeByExt(ext) {
+  if (ext === ".html") return "text/html; charset=utf-8";
+  if (ext === ".css") return "text/css; charset=utf-8";
+  if (ext === ".js") return "application/javascript; charset=utf-8";
+  if (ext === ".json") return "application/json; charset=utf-8";
+  if (ext === ".svg") return "image/svg+xml; charset=utf-8";
+  if (ext === ".txt") return "text/plain; charset=utf-8";
+  if (ext === ".ico") return "image/x-icon";
+  if (ext === ".png") return "image/png";
+  if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
+  return "application/octet-stream";
+}
+
+async function sendAdminStaticFile(res, relPath) {
+  if (!adminStaticDir) {
+    return sendText(res, 404, "admin html not configured");
+  }
+  const normalizedRelPath = (relPath || "").replace(/^\/+/, "");
+  const filePath = path.resolve(adminStaticDir, normalizedRelPath || "index.html");
+  const relative = path.relative(adminStaticDir, filePath);
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
+    return sendText(res, 403, "Forbidden");
+  }
+  const content = await readTextIfExists(filePath);
+  if (content == null) {
+    return sendText(res, 404, "Not Found");
+  }
+  res.writeHead(200, {
+    "Content-Type": contentTypeByExt(path.extname(filePath).toLowerCase()),
+    "Cache-Control": "no-store"
+  });
+  res.end(content);
 }
 
 /**

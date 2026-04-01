@@ -326,7 +326,7 @@ function isScriptsPageActive() {
 function stageBadge(stage) {
   const value = (stage || "unknown").toString();
   if (value === "active") return `<span class="badge success">active</span>`;
-  if (value === "canary") return `<span class="badge warning">canary</span>`;
+  if (value === "canary") return `<span class="badge warning">gradual</span>`;
   if (value === "pending") return `<span class="badge danger">pending</span>`;
   if (value === "rollback") return `<span class="badge danger">rollback</span>`;
   return `<span class="badge">${value}</span>`;
@@ -397,7 +397,7 @@ function historyTypeLabel(type) {
   if (t === "auto_repair" || t === "apply") return "写入";
   if (t === "pending") return "Pending";
   if (t === "promote_active") return "发布全量";
-  if (t === "promote_canary") return "发布灰度";
+  if (t === "promote_canary") return "逐步推送";
   if (t === "rollback_admin") return "回滚(人工)";
   if (t === "rollback_auto") return "回滚(自动)";
   if (t === "failure") return "失败";
@@ -641,6 +641,8 @@ const systemTypeLabels = {
 };
 const failureTypeLabels = {
   validation: "校验失败",
+  replay: "离线回放失败",
+  submission_replay: "提交回放失败",
   write: "写入失败",
   rollback: "回滚失败",
   unknown: "未知"
@@ -918,7 +920,7 @@ function renderScriptCards(list) {
   const cards = [
     { title: "脚本总数", value: formatCount(items.length), sub: "scriptOutputDir 根目录" },
     { title: "Active", value: formatCount(countByStage.active), sub: "全量生效" },
-    { title: "Canary", value: formatCount(countByStage.canary), sub: "灰度生效" },
+    { title: "Gradual", value: formatCount(countByStage.canary), sub: "逐步推送" },
     { title: "Pending", value: formatCount(countByStage.pending), sub: `待发布（过期 ${formatCount(pendingMissing)}）` },
     { title: "回滚不可用", value: formatCount(rollbackMissing), sub: "父版本备份缺失/过期" }
   ];
@@ -978,9 +980,9 @@ function renderScriptsTable(list) {
               <button class="btn" type="button" data-action="promote-active" data-script="${encodeURIComponent(
                 item.scriptName || ""
               )}" ${promoteDisabled}>发布全量</button>
-              <button class="btn secondary" type="button" data-action="promote-canary" data-script="${encodeURIComponent(
+              <button class="btn secondary" type="button" data-action="promote-gradual" data-script="${encodeURIComponent(
                 item.scriptName || ""
-              )}" ${promoteDisabled}>发布灰度</button>
+              )}" ${promoteDisabled}>逐步推送</button>
               <button class="btn secondary" type="button" data-action="rollback" data-script="${encodeURIComponent(
                 item.scriptName || ""
               )}" ${rollbackDisabled}>回滚上个版本</button>
@@ -1013,6 +1015,30 @@ async function loadScriptsPage() {
   }
 }
 
+async function promoteWithDoubleConfirm(scriptName, pushMode) {
+  const modeLabel = pushMode === "canary" ? "逐步推送" : "全量推送";
+  const firstConfirm = window.confirm(`即将执行${modeLabel}：${scriptName}\n是否继续？`);
+  if (!firstConfirm) return { aborted: true };
+  const input = window.prompt(`请输入脚本名进行二次确认：${scriptName}`);
+  if ((input || "").trim() !== scriptName) {
+    showToast("warning", "已取消", "二次确认未通过");
+    return { aborted: true };
+  }
+  const precheck = await postWithAuth("/api/v1/admin/promote_script", {
+    scriptName,
+    pushMode
+  });
+  if (precheck.code !== 409 || !precheck.data?.confirmToken) {
+    return precheck;
+  }
+  return await postWithAuth("/api/v1/admin/promote_script", {
+    scriptName,
+    pushMode,
+    confirmPublish: true,
+    confirmToken: precheck.data.confirmToken
+  });
+}
+
 if (scriptTableBody) {
   scriptTableBody.addEventListener("click", async (e) => {
     const btn = e.target?.closest?.("button[data-action]");
@@ -1025,16 +1051,15 @@ if (scriptTableBody) {
       showScriptModal(scriptName, pv);
       return;
     }
-    if (action === "promote-active" || action === "promote-canary") {
-      const releaseStage = action === "promote-canary" ? "canary" : "active";
+    if (action === "promote-active" || action === "promote-gradual") {
+      const pushMode = action === "promote-gradual" ? "canary" : "active";
+      const modeLabel = pushMode === "canary" ? "逐步推送" : "全量推送";
       btn.disabled = true;
       try {
-        const json = await postWithAuth("/api/v1/admin/promote_script", {
-          scriptName,
-          releaseStage
-        });
+        const json = await promoteWithDoubleConfirm(scriptName, pushMode);
+        if (json?.aborted) return;
         if (json.code === 200) {
-          showToast("info", "发布成功", `${scriptName} -> ${releaseStage}`);
+          showToast("info", "发布成功", `${scriptName} -> ${modeLabel}`);
           await loadScriptsPage();
         } else {
           showToast("error", "发布失败", json.msg || "未知错误");

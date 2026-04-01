@@ -111,6 +111,8 @@ const offlineReplayDatasetJson = process.env.OFFLINE_REPLAY_DATASET_JSON || "";
 const offlineReplayRequired = process.env.OFFLINE_REPLAY_REQUIRED === "true";
 const canaryPercent = Number(process.env.CANARY_PERCENT || 0);
 const canarySchoolsRaw = process.env.CANARY_SCHOOLS || "";
+// 即时兜底解析最大重试次数
+const parseMaxAttempts = Math.max(1, Number(process.env.PARSE_MAX_ATTEMPTS || 3));
 const rollbackFailureWindowMs = Number(process.env.ROLLBACK_FAILURE_WINDOW_MS || 30 * 60 * 1000);
 const rollbackFailureThreshold = Number(process.env.ROLLBACK_FAILURE_THRESHOLD || 3);
 const backupTtlMs = Number(process.env.BACKUP_TTL_MS || 7 * 24 * 60 * 60 * 1000);
@@ -504,13 +506,28 @@ const server = http.createServer((req, res) => {
     }
     const body = safeJson(bodyText);
     const scriptName = (body?.scriptName || body?.script_name || "").toString();
-    const releaseStage = (body?.releaseStage || body?.release_stage || "active").toString();
+    const pushMode = (body?.pushMode || body?.push_mode || "").toString();
+    const releaseStageRaw = (body?.releaseStage || body?.release_stage || pushMode || "active").toString();
+    const releaseStage = normalizeReleaseStage(releaseStageRaw);
     if (!scriptName) {
       return sendJson(res, 400, { code: 400, msg: "缺少 scriptName" });
     }
     const pending = await loadPendingScript(scriptName);
     if (!pending) {
       return sendJson(res, 404, { code: 404, msg: "未找到待发布脚本" });
+    }
+    const confirmPublish = body?.confirmPublish === true || body?.confirm_publish === true;
+    const confirmToken = (body?.confirmToken || body?.confirm_token || "").toString();
+    const expectedToken = buildPublishConfirmToken(scriptName, releaseStage, pending);
+    if (!confirmPublish) {
+      return sendJson(res, 409, {
+        code: 409,
+        msg: "请二次确认后发布",
+        data: { confirmToken: expectedToken, releaseStage }
+      });
+    }
+    if (confirmToken !== expectedToken) {
+      return sendJson(res, 400, { code: 400, msg: "二次确认令牌无效，请刷新后重试" });
     }
     const previousContent = await readScript(scriptName);
     const previousMeta = await getScriptMeta(scriptName);
@@ -1031,6 +1048,21 @@ async function processQueueCluster(schoolId, items, normalizedIssues, state, now
   await setSchoolPhase(schoolId, "REPAIRING");
   const generatedScript = await generateParserScript(summary, patchGuidance, previousScript, schoolId);
   if (!generatedScript) return { state, applied: false };
+  const submissionReplay = runSubmissionReplay(generatedScript, items);
+  if (!submissionReplay.ok) {
+    await recordScriptFailure(
+      scriptName,
+      submissionReplay.reason || "提交回放失败",
+      "submission_replay",
+      schoolId,
+      {
+        stage: "REPAIRING",
+        retryable: true,
+        scriptVersion: previousMeta?.version || 0
+      }
+    );
+    return { state, failed: true };
+  }
   await setSchoolPhase(schoolId, "APPLYING");
   const applyResult = await applyScriptUpdate(scriptName, generatedScript, previousScript, {
     schoolId,
@@ -1085,6 +1117,21 @@ async function processIndividualSummaries(schoolId, queue) {
   const patchGuidance = await generatePatchGuidance(mergedSummary, schoolId);
   const generatedScript = await generateParserScript(mergedSummary, patchGuidance, previousScript, schoolId);
   if (!generatedScript) return;
+  const submissionReplay = runSubmissionReplay(generatedScript, queue);
+  if (!submissionReplay.ok) {
+    await recordScriptFailure(
+      scriptName,
+      submissionReplay.reason || "提交回放失败",
+      "submission_replay",
+      schoolId,
+      {
+        stage: "REPAIRING",
+        retryable: true,
+        scriptVersion: previousMeta?.version || 0
+      }
+    );
+    return;
+  }
   const context = {
     mode: "single",
     clusterSize: Array.isArray(queue) ? queue.length : 0,
@@ -1133,7 +1180,8 @@ async function processIndividualSummaries(schoolId, queue) {
  */
 async function runTask(taskId, content, schoolId) {
   const startTime = Date.now();
-  const resultText = await callProvider(content);
+  const parseResult = await callProvider(content);
+  const resultText = parseResult?.resultText || null;
   const latencyMs = Date.now() - startTime;
   const existing = await getTask(taskId);
   const createdAt = existing?.createdAt || Date.now();
@@ -1143,14 +1191,28 @@ async function runTask(taskId, content, schoolId) {
     schoolSystemType: existing?.schoolSystemType || "unknown"
   };
   if (!resultText) {
-    await saveTask(taskId, { ...baseTask, status: "FAILED", result: null, createdAt });
+    await saveTask(taskId, {
+      ...baseTask,
+      status: "FAILED",
+      result: null,
+      createdAt,
+      attempts: parseResult?.attempts || 0,
+      reason: parseResult?.reason || "模型输出不可解析"
+    });
     await recordMetric("parse_failed", latencyMs, parseCostPerCall);
     if (schoolId) {
       await recordSchoolMetric(schoolId, "parse_failed", latencyMs, parseCostPerCall);
     }
     return;
   }
-  await saveTask(taskId, { ...baseTask, status: "SUCCESS", result: resultText, createdAt });
+  await saveTask(taskId, {
+    ...baseTask,
+    status: "SUCCESS",
+    result: resultText,
+    createdAt,
+    attempts: parseResult?.attempts || 1,
+    strategy: parseResult?.strategy || "standard"
+  });
   if (isEmptyResult(resultText)) {
     await recordMetric("parse_empty", latencyMs, parseCostPerCall);
     if (schoolId) {
@@ -1170,31 +1232,88 @@ async function runTask(taskId, content, schoolId) {
  * @param content 已脱敏文本
  */
 async function callProvider(content) {
-  // 统一系统提示词，要求严格输出 JSON
-  const systemPrompt =
-    "你是课程表解析助手，只输出严格 JSON 数组，不要包含任何解释、Markdown、代码块。" +
-    "数组元素必须符合 ParsedCourse 结构：" +
-    "name,teacher,location,dayOfWeek,startSection,duration,startWeek,endWeek,weekType。" +
-    "所有字段必须齐全，整数必须是数字类型。";
-  const userPrompt =
-    "请从以下内容中提取课程信息，输出 JSON 数组，示例格式：" +
-    "[{\"name\":\"高等数学\",\"teacher\":\"李四\",\"location\":\"A-301\",\"dayOfWeek\":1," +
-    "\"startSection\":1,\"duration\":2,\"startWeek\":1,\"endWeek\":16,\"weekType\":0}]\n" +
-    `课表内容如下：\n${content}\n只输出 JSON 数组。`;
+  const strategies = ["standard", "strict", "repair"];
+  const maxAttempts = Math.min(parseMaxAttempts, strategies.length);
+  const failedReasons = [];
+  for (let i = 0; i < maxAttempts; i++) {
+    const strategy = strategies[i];
+    const attempt = await callProviderOnce(content, strategy);
+    if (attempt.resultText) {
+      return { resultText: attempt.resultText, attempts: i + 1, strategy };
+    }
+    failedReasons.push(attempt.reason || "unknown");
+  }
+  return {
+    resultText: null,
+    attempts: maxAttempts,
+    strategy: "failed",
+    reason: failedReasons.join(" | ")
+  };
+}
 
-  // Gemini 使用官方内容生成接口
+/**
+ * 调用模型执行单次兜底解析
+ * - standard：常规提取
+ * - strict：加强字段和类型约束
+ * - repair：要求先纠正坏格式再输出最终 JSON
+ */
+async function callProviderOnce(content, strategy) {
+  const promptSet = buildParsePrompts(content, strategy);
   const rawText =
     provider === "gemini"
-      ? await callGemini(systemPrompt, userPrompt, {
+      ? await callGemini(promptSet.systemPrompt, promptSet.userPrompt, {
           usageType: "summary",
           extra: summaryRequestExtra
         })
-      : await callOpenAICompatible(systemPrompt, userPrompt, {
+      : await callOpenAICompatible(promptSet.systemPrompt, promptSet.userPrompt, {
           usageType: "summary",
           extra: summaryRequestExtra,
           apiStyle: summaryApiStyleRaw
         });
-  return extractJsonArray(rawText?.text || "");
+  const extracted = extractJsonArray(rawText?.text || "");
+  if (!extracted) {
+    return { resultText: null, reason: `${strategy}: empty_or_invalid_json` };
+  }
+  return { resultText: extracted, reason: "" };
+}
+
+/**
+ * 构建即时兜底解析提示词
+ */
+function buildParsePrompts(content, strategy) {
+  const baseSystem =
+    "你是课程表解析助手，只输出严格 JSON 数组，不要包含任何解释、Markdown、代码块。" +
+    "数组元素必须符合 ParsedCourse 结构：" +
+    "name,teacher,location,dayOfWeek,startSection,duration,startWeek,endWeek,weekType。";
+  if (strategy === "strict") {
+    return {
+      systemPrompt:
+        baseSystem +
+        "必须进行字段类型纠正：dayOfWeek 限制 1-7，startSection/duration/startWeek/endWeek 必须是整数，weekType 必须是 0/1/2。",
+      userPrompt:
+        "请严格提取并纠正字段类型，仅输出 JSON 数组。" +
+        "若信息缺失，teacher/location 可为空字符串，其余核心字段必须可用。\n" +
+        `课表内容如下：\n${content}\n只输出 JSON 数组。`
+    };
+  }
+  if (strategy === "repair") {
+    return {
+      systemPrompt:
+        baseSystem +
+        "当原文混乱时，先在内部修复字段，再输出最终 JSON 数组。禁止输出中间过程，禁止输出非 JSON。",
+      userPrompt:
+        "请执行“修复后提取”：合并同一课程重复行、修正周次/节次格式、补全可推断字段，最后仅输出 JSON 数组。\n" +
+        `课表内容如下：\n${content}\n只输出 JSON 数组。`
+    };
+  }
+  return {
+    systemPrompt: baseSystem + "所有字段必须齐全，整数必须是数字类型。",
+    userPrompt:
+      "请从以下内容中提取课程信息，输出 JSON 数组，示例格式：" +
+      "[{\"name\":\"高等数学\",\"teacher\":\"李四\",\"location\":\"A-301\",\"dayOfWeek\":1," +
+      "\"startSection\":1,\"duration\":2,\"startWeek\":1,\"endWeek\":16,\"weekType\":0}]\n" +
+      `课表内容如下：\n${content}\n只输出 JSON 数组。`
+  };
 }
 
 /**
@@ -1719,13 +1838,36 @@ function shouldCanaryRelease(schoolId) {
 }
 
 /**
+ * 统一发布阶段枚举
+ */
+function normalizeReleaseStage(stage) {
+  const raw = (stage || "").toString().trim().toLowerCase();
+  if (!raw) return "active";
+  if (raw === "active" || raw === "full") return "active";
+  if (raw === "canary" || raw === "gradual" || raw === "staged") return "canary";
+  if (raw === "pending") return "pending";
+  if (raw === "rollback") return "rollback";
+  return "active";
+}
+
+/**
+ * 生成发布二次确认令牌
+ * 令牌绑定脚本名、目标阶段和 pending 内容摘要，避免误操作串用
+ */
+function buildPublishConfirmToken(scriptName, releaseStage, pendingContent) {
+  const contentHash = hashText((pendingContent || "").toString()).slice(0, 16);
+  return hashText(`${sanitizeScriptName(scriptName)}:${normalizeReleaseStage(releaseStage)}:${contentHash}`);
+}
+
+/**
  * 决定新修复脚本的发布阶段（全量/灰度/挂起）
  * - 如果明确指定或通过强制参数 (forceRelease)，直接全量发布
  * - 命中灰度名单或哈希桶 (canaryPercent)，进入 canary 阶段
  * - 否则进入 pending 阶段，等待人工确认或自动晋升
  */
 function decideReleaseStage(schoolId, forceRelease, explicitStage) {
-  if (explicitStage) return explicitStage;
+  const normalizedExplicit = normalizeReleaseStage(explicitStage);
+  if (explicitStage) return normalizedExplicit;
   if (forceRelease) return "active";
   if (canaryPercent <= 0 && canarySchoolSet.size === 0) return "active";
   return shouldCanaryRelease(schoolId) ? "canary" : "pending";
@@ -1781,12 +1923,9 @@ async function runOfflineReplay(scriptContent) {
   }
   for (const sample of offlineReplayDataset) {
     const output = executeScriptWithContent(scriptContent, sample.content);
-    if (output == null) {
+    const parsed = parseScriptExecutionOutput(output);
+    if (parsed == null) {
       return { ok: false, reason: "离线回放执行失败" };
-    }
-    const parsed = typeof output === "string" ? safeJson(output) : output;
-    if (!Array.isArray(parsed)) {
-      return { ok: false, reason: "离线回放输出非数组" };
     }
     if (sample.expectEmpty && parsed.length > 0) {
       return { ok: false, reason: "离线回放期望为空" };
@@ -1803,6 +1942,49 @@ async function runOfflineReplay(scriptContent) {
     }
   }
   return { ok: true };
+}
+
+/**
+ * 使用当前批次提交数据进行回放验证
+ * 自动修复后先验证“本次真实提交”可解析，再进入正式校验和发布决策
+ */
+function runSubmissionReplay(scriptContent, submissions) {
+  const samples = (Array.isArray(submissions) ? submissions : [])
+    .filter((item) => item && typeof item.content === "string" && item.content.trim().length > 0)
+    .slice(0, 12);
+  if (!samples.length) {
+    return { ok: false, reason: "提交回放样本为空" };
+  }
+  let nonEmptyCount = 0;
+  for (const sample of samples) {
+    const parsed = parseScriptExecutionOutput(executeScriptWithContent(scriptContent, sample.content));
+    if (parsed == null) {
+      return { ok: false, reason: "提交回放执行失败" };
+    }
+    if (parsed.length > 0) {
+      nonEmptyCount += 1;
+      const first = parsed[0] || {};
+      const required = ["name", "dayOfWeek", "startSection", "duration", "startWeek", "endWeek", "weekType"];
+      const missing = required.filter((field) => first[field] == null || first[field] === "");
+      if (missing.length > 0) {
+        return { ok: false, reason: "提交回放缺少关键字段" };
+      }
+    }
+  }
+  if (nonEmptyCount <= 0) {
+    return { ok: false, reason: "提交回放结果均为空" };
+  }
+  return { ok: true };
+}
+
+/**
+ * 解析脚本执行结果为课程数组
+ */
+function parseScriptExecutionOutput(output) {
+  if (output == null) return null;
+  const parsed = typeof output === "string" ? safeJson(output) : output;
+  if (!Array.isArray(parsed)) return null;
+  return parsed;
 }
 
 /**
@@ -3421,14 +3603,76 @@ function extractJsonArray(text) {
   const arrayText = sliceJson(text, "[", "]");
   if (arrayText) {
     const parsed = safeJson(arrayText);
-    if (Array.isArray(parsed)) return JSON.stringify(parsed);
+    if (Array.isArray(parsed)) {
+      const normalized = normalizeParsedCourses(parsed);
+      if (normalized.ok) return JSON.stringify(normalized.courses);
+    }
   }
   const objectText = sliceJson(text, "{", "}");
   if (objectText) {
     const parsed = safeJson(objectText);
-    if (parsed && Array.isArray(parsed.courses)) return JSON.stringify(parsed.courses);
+    if (parsed && Array.isArray(parsed.courses)) {
+      const normalized = normalizeParsedCourses(parsed.courses);
+      if (normalized.ok) return JSON.stringify(normalized.courses);
+    }
   }
   return null;
+}
+
+/**
+ * 标准化模型输出课程数组，确保端侧可直接消费
+ */
+function normalizeParsedCourses(courses) {
+  if (!Array.isArray(courses)) return { ok: false, reason: "输出不是数组" };
+  if (courses.length === 0) return { ok: true, courses: [] };
+  const normalized = [];
+  for (const item of courses) {
+    const row = normalizeParsedCourseItem(item);
+    if (row) normalized.push(row);
+  }
+  if (normalized.length === 0) {
+    return { ok: false, reason: "课程字段无效" };
+  }
+  return { ok: true, courses: normalized };
+}
+
+/**
+ * 标准化单条课程结构
+ */
+function normalizeParsedCourseItem(item) {
+  if (!item || typeof item !== "object") return null;
+  const name = (item.name || "").toString().trim();
+  const dayOfWeek = toInt(item.dayOfWeek);
+  const startSection = toInt(item.startSection);
+  const duration = toInt(item.duration);
+  const startWeek = toInt(item.startWeek);
+  const endWeek = toInt(item.endWeek);
+  const weekType = toInt(item.weekType);
+  if (!name) return null;
+  if (dayOfWeek < 1 || dayOfWeek > 7) return null;
+  if (startSection < 1 || duration < 1) return null;
+  if (startWeek < 1 || endWeek < startWeek) return null;
+  if (![0, 1, 2].includes(weekType)) return null;
+  return {
+    name,
+    teacher: (item.teacher || "").toString().trim(),
+    location: (item.location || "").toString().trim(),
+    dayOfWeek,
+    startSection,
+    duration,
+    startWeek,
+    endWeek,
+    weekType
+  };
+}
+
+/**
+ * 安全转整数，失败时返回 -1
+ */
+function toInt(value) {
+  if (typeof value === "number" && Number.isFinite(value)) return Math.trunc(value);
+  const parsed = Number.parseInt((value || "").toString().trim(), 10);
+  return Number.isFinite(parsed) ? parsed : -1;
 }
 
 /**

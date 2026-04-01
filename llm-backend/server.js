@@ -728,6 +728,10 @@ const server = http.createServer((req, res) => {
     if (!userConsent) {
       return sendJson(res, 400, { code: 400, msg: "需要用户明确同意后才能上传" });
     }
+    // Redis 是队列、幂等、速率限制与指标统计的基础依赖；未连接时直接阻断，避免请求半路报错
+    if (!redisReady) {
+      return sendJson(res, 503, { code: 503, msg: "服务端 Redis 未连接，请稍后再试" });
+    }
     // 未配置密钥时阻断请求
     if (!apiKey && provider !== "gemini") {
       return sendJson(res, 500, { code: 500, msg: "服务端未配置 API Key" });
@@ -735,14 +739,16 @@ const server = http.createServer((req, res) => {
     if (!apiKey && provider === "gemini") {
       return sendJson(res, 500, { code: 500, msg: "服务端未配置 Gemini API Key" });
     }
-    const schoolId = await resolveSchoolIdByName(schoolIdInput, schoolNameInput);
-    const schoolName = schoolNameInput || "";
+    const safeContent = sanitizeContent(content);
+    const inferredSchoolName =
+      schoolNameInput || extractSchoolNameFromContent(content) || extractSchoolNameFromContent(safeContent) || "";
+    const schoolId = await resolveSchoolIdByName(schoolIdInput, inferredSchoolName);
+    const schoolName = inferredSchoolName || "";
     const clientIp = getClientIp(req);
     const rateAllowed = await checkRateLimit(clientIp, schoolId);
     if (!rateAllowed) {
       return sendJson(res, 429, { code: 429, msg: "请求过于频繁" });
     }
-    const safeContent = sanitizeContent(content);
     const contentHash = hashText(safeContent);
     const scriptHash = scriptName ? hashText(await readScript(scriptName)) : "";
     const idempotentKey = buildIdempotentKey({
@@ -2311,6 +2317,17 @@ async function getMetricsSnapshot() {
     "script_failed"
   ];
   const result = {};
+  if (!redisReady) {
+    for (const type of types) {
+      result[type] = {
+        count: 0,
+        latencyMsAvg: 0,
+        costTotal: 0,
+        lastUpdatedAt: 0
+      };
+    }
+    return result;
+  }
   for (const type of types) {
     const key = buildMetricKey(type);
     const data = await redisClient.hGetAll(key);
@@ -2328,6 +2345,7 @@ async function getMetricsSnapshot() {
 }
 
 async function getSchoolMetricsSnapshot() {
+  if (!redisReady) return {};
   const ids = await redisClient.sMembers("school:metrics:ids");
   const result = {};
   for (const schoolId of ids) {
@@ -2456,6 +2474,59 @@ async function buildAdminDashboardData() {
           usageUrl: "",
           costUrl: "",
           error: "local_mode"
+        }
+      }
+    };
+  }
+  if (!redisReady) {
+    const [metrics, usageSummary, usageScript] = await Promise.all([
+      getMetricsSnapshot(),
+      getUsageSnapshot("summary"),
+      getUsageSnapshot("script")
+    ]);
+    const metricUpdatedAtList = Object.values(metrics || {}).map((item) => item?.lastUpdatedAt || 0);
+    const latestMetricsAt = Math.max(0, ...metricUpdatedAtList);
+    return {
+      serverStartedAt,
+      metrics: metrics || {},
+      schoolMetrics: {},
+      schoolQueues: {},
+      failures: [],
+      metricsFile: schoolMetricsFile,
+      schoolCount: 0,
+      totalQueueLength: 0,
+      failureCount: 0,
+      latestMetricsAt,
+      schoolInfoById: {},
+      failureTypeStats: {},
+      modelUsage: {
+        summary: usageSummary || {
+          provider: summaryProvider,
+          model: summaryModel,
+          inputTokens: 0,
+          outputTokens: 0,
+          tokenTotal: 0,
+          costTotal: 0,
+          currency: "",
+          updatedAt: 0,
+          window: null,
+          usageUrl: "",
+          costUrl: "",
+          error: "redis_unavailable"
+        },
+        script: usageScript || {
+          provider: scriptProvider,
+          model: scriptModel,
+          inputTokens: 0,
+          outputTokens: 0,
+          tokenTotal: 0,
+          costTotal: 0,
+          currency: "",
+          updatedAt: 0,
+          window: null,
+          usageUrl: "",
+          costUrl: "",
+          error: "redis_unavailable"
         }
       }
     };
@@ -2892,6 +2963,33 @@ function resolveSchoolSystemType(content, input) {
   return detectSchoolSystemType(content);
 }
 
+function extractSchoolNameFromContent(content) {
+  const raw = (content || "").toString();
+  if (!raw) return "";
+  const titleMatch = raw.match(/<title[^>]*>([^<]{2,120})<\/title>/i);
+  if (titleMatch?.[1]) {
+    const fromTitle = extractSchoolNameFromText(titleMatch[1]);
+    if (fromTitle) return fromTitle;
+  }
+  const roughText = raw.replace(/<[^>]+>/g, " ");
+  return extractSchoolNameFromText(roughText);
+}
+
+function extractSchoolNameFromText(text) {
+  const value = (text || "").toString().replace(/\s+/g, "");
+  if (!value) return "";
+  const patterns = [
+    /(?:学校|school)[：:\-]?\s*([^\s<]{2,40}(?:高等专科学校|职业技术学院|职业学院|技术学院|科技学院|师范大学|师范学院|医学院|中医药大学|外国语大学|外语学院|信息工程学院|信息工程大学|交通大学|工业大学|科技大学|财经大学|农业大学|理工大学|大学|学院))/i,
+    /([\u4e00-\u9fa5]{2,40}(?:高等专科学校|职业技术学院|职业学院|技术学院|科技学院|师范大学|师范学院|医学院|中医药大学|外国语大学|外语学院|信息工程学院|信息工程大学|交通大学|工业大学|科技大学|财经大学|农业大学|理工大学|大学|学院))/
+  ];
+  for (const pattern of patterns) {
+    const match = value.match(pattern);
+    const candidate = (match?.[1] || "").toString().trim();
+    if (candidate) return candidate;
+  }
+  return "";
+}
+
 function normalizeSchoolNameKey(value) {
   // 归一化学校名称：去噪、去括号、去标点、统一小写
   let text = (value || "").toString().trim();
@@ -2936,6 +3034,17 @@ function normalizeSchoolNameKey(value) {
   }
   // 优先返回裁剪后的核心名称，避免过度归一化导致信息丢失
   return trimmed || text;
+}
+
+function normalizeSchoolNameFull(value) {
+  // 归一化学校名称（保留后缀）：用于生成稳定且不易冲突的 schoolId
+  // 注意：只做去噪与格式统一，不做“大学/学院”等后缀裁剪，避免不同学校被错误合并
+  let text = (value || "").toString().trim();
+  if (!text) return "";
+  text = text.replace(/（[^）]{0,40}）/g, "");
+  text = text.replace(/\([^)]{0,40}\)/g, "");
+  text = text.replace(/[\s·•・.,，。;；:：'"“”‘’/\\\-\[\]【】<>《》、|_]+/g, "");
+  return text.toLowerCase();
 }
 
 function buildNameBigrams(text) {
@@ -3024,10 +3133,16 @@ function resolveBestSchoolName(existingName, incomingName) {
 
 async function saveSchoolAlias(schoolId, schoolName) {
   // 用归一化名称写入别名映射，统一归类入口
+  if (!redisReady) return;
   if (!schoolId || !schoolName) return;
-  const normalized = normalizeSchoolNameKey(schoolName);
-  if (!normalized) return;
-  await redisClient.hSet("school:alias", normalized, schoolId);
+  const normalizedFull = normalizeSchoolNameFull(schoolName);
+  const normalizedTrimmed = normalizeSchoolNameKey(schoolName);
+  if (normalizedFull) {
+    await redisClient.hSet("school:alias", normalizedFull, schoolId);
+  }
+  if (normalizedTrimmed && normalizedTrimmed !== normalizedFull) {
+    await redisClient.hSet("school:alias", normalizedTrimmed, schoolId);
+  }
 }
 
 /**
@@ -3042,21 +3157,36 @@ async function resolveSchoolIdByName(schoolIdInput, schoolNameInput) {
     await saveSchoolAlias(rawId, schoolNameInput);
     return rawId;
   }
-  // schoolId 缺失时使用学校名归一化结果
-  const normalized = normalizeSchoolNameKey(schoolNameInput);
-  if (!normalized) return "";
-  // 先走精确别名命中
-  const existing = await redisClient.hGet("school:alias", normalized);
-  if (existing) return existing;
+  // Redis 不可用时只做本地归一化兜底，避免阻塞主流程
+  if (!redisReady) {
+    return normalizeSchoolNameFull(schoolNameInput);
+  }
+  // schoolId 缺失时使用“保留后缀”的归一化名称作为主键，避免不同学校被合并
+  const normalizedFull = normalizeSchoolNameFull(schoolNameInput);
+  if (!normalizedFull) return "";
+  const normalizedTrimmed = normalizeSchoolNameKey(schoolNameInput);
+  // 先走精确别名命中（优先 full，其次 trimmed）
+  const existingFull = await redisClient.hGet("school:alias", normalizedFull);
+  if (existingFull) return existingFull;
+  if (normalizedTrimmed && normalizedTrimmed !== normalizedFull) {
+    const existingTrim = await redisClient.hGet("school:alias", normalizedTrimmed);
+    if (existingTrim) return existingTrim;
+  }
   // 再走模糊匹配命中，成功后写回别名
-  const fuzzyMatched = await resolveSchoolIdByFuzzyName(normalized);
+  const fuzzyMatched = await resolveSchoolIdByFuzzyName(normalizedFull);
   if (fuzzyMatched) {
-    await redisClient.hSet("school:alias", normalized, fuzzyMatched);
+    await redisClient.hSet("school:alias", normalizedFull, fuzzyMatched);
+    if (normalizedTrimmed && normalizedTrimmed !== normalizedFull) {
+      await redisClient.hSet("school:alias", normalizedTrimmed, fuzzyMatched);
+    }
     return fuzzyMatched;
   }
-  // 兜底：将归一化名称自身作为 schoolId
-  await redisClient.hSet("school:alias", normalized, normalized);
-  return normalized;
+  // 兜底：将归一化名称自身作为 schoolId，并写入别名，确保后续可稳定命中
+  await redisClient.hSet("school:alias", normalizedFull, normalizedFull);
+  if (normalizedTrimmed && normalizedTrimmed !== normalizedFull) {
+    await redisClient.hSet("school:alias", normalizedTrimmed, normalizedFull);
+  }
+  return normalizedFull;
 }
 
 async function saveSchoolInfo(schoolId, schoolName, schoolSystemType) {
@@ -3682,11 +3812,18 @@ async function fetchModelUsage(config) {
 
 async function updateModelUsage(type, config) {
   const snapshot = await fetchModelUsage(config);
-  await redisClient.set(buildUsageKey(type), JSON.stringify(snapshot));
+  if (redisReady) {
+    await redisClient.set(buildUsageKey(type), JSON.stringify(snapshot));
+  }
   return snapshot;
 }
 
 async function getUsageSnapshot(type) {
+  if (!redisReady) {
+    const local = await getLocalUsageSnapshot(type);
+    if (local) return { ...local, error: "local_only" };
+    return null;
+  }
   const raw = await redisClient.get(buildUsageKey(type));
   const snapshot = raw ? safeJson(raw) : null;
   if (!snapshot) {

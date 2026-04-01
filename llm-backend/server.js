@@ -1510,8 +1510,20 @@ async function generateParserScript(summary, patchGuidance, previousScript, scho
  */
 function resolveScriptName(schoolId, queue) {
   const withName = queue.find((item) => item.scriptName);
-  if (withName?.scriptName) return withName.scriptName;
-  return `${schoolId}.js`;
+  if (withName?.scriptName) return sanitizeScriptName(withName.scriptName);
+  const systemTypeRaw = (queue.find((item) => item.schoolSystemType)?.schoolSystemType || "").toString();
+  const normalizedSystemType =
+    normalizeSchoolSystemType(systemTypeRaw) || detectSchoolSystemType((queue?.[0]?.content || "").toString());
+  const mapped =
+    normalizedSystemType === "zhengfang"
+      ? "zhengfang.js"
+      : normalizedSystemType === "qiangzhi"
+        ? "qiangzhi.js"
+        : normalizedSystemType === "kingosoft"
+          ? "kingosoft.js"
+          : "";
+  if (mapped) return sanitizeScriptName(mapped);
+  return sanitizeScriptName(`${schoolId}.js`);
 }
 
 /**

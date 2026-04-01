@@ -15,28 +15,31 @@ const maxContentLength = Number(process.env.MAX_CONTENT_LENGTH || 1000000);
 const taskTtlMs = Number(process.env.TASK_TTL_MS || 1800000);
 // 请求幂等键缓存时间，避免短时间重复入队
 const idempotentTtlMs = Number(process.env.IDEMPOTENT_TTL_MS || 10 * 60 * 1000);
+// 模型名称别名映射表（JSON 格式），例如将 "glm5" 映射为 "glm-5"
+let modelAliasJson = (process.env.LLM_MODEL_ALIAS_JSON || "").trim();
+let modelAliasMap = safeJson(modelAliasJson) || {};
 // 低成本总结模型配置（模型 1）
-const summaryProviderRaw = (process.env.LLM_SUMMARY_PROVIDER || "gpt").toLowerCase();
-const summaryApiKey = process.env.LLM_SUMMARY_API_KEY || "";
-const summaryModelRaw =
+let summaryProviderRaw = (process.env.LLM_SUMMARY_PROVIDER || "gpt").toLowerCase();
+let summaryApiKey = process.env.LLM_SUMMARY_API_KEY || "";
+let summaryModelRaw =
   process.env.LLM_SUMMARY_MODEL ||
   defaultSummaryModel(summaryProviderRaw === "auto" ? "gpt" : summaryProviderRaw);
-const summaryModel = resolveModelName(summaryModelRaw);
-const summaryProvider = normalizeProvider(summaryProviderRaw, summaryModel);
-const summaryBaseUrl = process.env.LLM_SUMMARY_BASE_URL || defaultBaseUrl(summaryProvider);
+let summaryModel = resolveModelName(summaryModelRaw);
+let summaryProvider = normalizeProvider(summaryProviderRaw, summaryModel);
+let summaryBaseUrl = process.env.LLM_SUMMARY_BASE_URL || defaultBaseUrl(summaryProvider);
 // 高成本脚本修复模型配置（模型 2）
-const scriptProviderRaw = (process.env.LLM_SCRIPT_PROVIDER || "gpt").toLowerCase();
-const scriptApiKey = process.env.LLM_SCRIPT_API_KEY || "";
-const scriptModelRaw =
+let scriptProviderRaw = (process.env.LLM_SCRIPT_PROVIDER || "gpt").toLowerCase();
+let scriptApiKey = process.env.LLM_SCRIPT_API_KEY || "";
+let scriptModelRaw =
   process.env.LLM_SCRIPT_MODEL ||
   defaultScriptModel(scriptProviderRaw === "auto" ? "gpt" : scriptProviderRaw);
-const scriptModel = resolveModelName(scriptModelRaw);
-const scriptProvider = normalizeProvider(scriptProviderRaw, scriptModel);
-const scriptBaseUrl = process.env.LLM_SCRIPT_BASE_URL || defaultBaseUrl(scriptProvider);
-const provider = summaryProvider;
-const apiKey = summaryApiKey;
-const model = summaryModel;
-const baseUrl = summaryBaseUrl;
+let scriptModel = resolveModelName(scriptModelRaw);
+let scriptProvider = normalizeProvider(scriptProviderRaw, scriptModel);
+let scriptBaseUrl = process.env.LLM_SCRIPT_BASE_URL || defaultBaseUrl(scriptProvider);
+let provider = summaryProvider;
+let apiKey = summaryApiKey;
+let model = summaryModel;
+let baseUrl = summaryBaseUrl;
 const redisUrl = process.env.REDIS_URL || "redis://redis:6379";
 // 脚本输出目录
 const scriptOutputDir = process.env.SCRIPT_OUTPUT_DIR || "/shared/parsers";
@@ -84,24 +87,21 @@ const summaryOutputCostPerMTokens = Number(process.env.LLM_SUMMARY_OUTPUT_COST_P
 const scriptInputCostPerMTokens = Number(process.env.LLM_SCRIPT_INPUT_COST_PER_MTOKEN || 0);
 const scriptOutputCostPerMTokens = Number(process.env.LLM_SCRIPT_OUTPUT_COST_PER_MTOKEN || 0);
 // 模型调用的额外请求体参数（JSON 格式），可用于配置如 response_format, tools 等平台专有参数
-const summaryRequestExtraJson = (process.env.LLM_SUMMARY_REQUEST_EXTRA_JSON || "").trim();
-const scriptRequestExtraJson = (process.env.LLM_SCRIPT_REQUEST_EXTRA_JSON || "").trim();
-const summaryRequestExtra = safeJson(summaryRequestExtraJson) || null;
-const scriptRequestExtra = safeJson(scriptRequestExtraJson) || null;
+let summaryRequestExtraJson = (process.env.LLM_SUMMARY_REQUEST_EXTRA_JSON || "").trim();
+let scriptRequestExtraJson = (process.env.LLM_SCRIPT_REQUEST_EXTRA_JSON || "").trim();
+let summaryRequestExtra = safeJson(summaryRequestExtraJson) || null;
+let scriptRequestExtra = safeJson(scriptRequestExtraJson) || null;
 // 强制指定 API 风格（chat 或 responses），留空则自动推断（例如 GPT-5 默认 responses）
-const summaryApiStyleRaw = (process.env.LLM_SUMMARY_API_STYLE || "").trim().toLowerCase();
-const scriptApiStyleRaw = (process.env.LLM_SCRIPT_API_STYLE || "").trim().toLowerCase();
-// 模型名称别名映射表（JSON 格式），例如将 "glm5" 映射为 "glm-5"
-const modelAliasJson = (process.env.LLM_MODEL_ALIAS_JSON || "").trim();
-const modelAliasMap = safeJson(modelAliasJson) || {};
+let summaryApiStyleRaw = (process.env.LLM_SUMMARY_API_STYLE || "").trim().toLowerCase();
+let scriptApiStyleRaw = (process.env.LLM_SCRIPT_API_STYLE || "").trim().toLowerCase();
 // 用量统计功能开关与查询配置
-const usageEnabled = process.env.LLM_USAGE_ENABLED !== "false";
-const usageLookbackDays = Number(process.env.LLM_USAGE_LOOKBACK_DAYS || 1);
-const usageRefreshMs = Number(process.env.LLM_USAGE_REFRESH_MINUTES || 30) * 60 * 1000;
-const summaryUsageUrl = (process.env.LLM_SUMMARY_USAGE_URL || "").trim();
-const scriptUsageUrl = (process.env.LLM_SCRIPT_USAGE_URL || "").trim();
-const summaryCostUrl = (process.env.LLM_SUMMARY_COST_URL || "").trim();
-const scriptCostUrl = (process.env.LLM_SCRIPT_COST_URL || "").trim();
+let usageEnabled = process.env.LLM_USAGE_ENABLED !== "false";
+let usageLookbackDays = Number(process.env.LLM_USAGE_LOOKBACK_DAYS || 1);
+let usageRefreshMs = Number(process.env.LLM_USAGE_REFRESH_MINUTES || 30) * 60 * 1000;
+let summaryUsageUrl = (process.env.LLM_SUMMARY_USAGE_URL || "").trim();
+let scriptUsageUrl = (process.env.LLM_SCRIPT_USAGE_URL || "").trim();
+let summaryCostUrl = (process.env.LLM_SUMMARY_COST_URL || "").trim();
+let scriptCostUrl = (process.env.LLM_SCRIPT_COST_URL || "").trim();
 const scriptSignKey = process.env.SCRIPT_SIGN_KEY || "";
 const scriptSignPrivateKey = process.env.SCRIPT_SIGN_PRIVATE_KEY || "";
 const schoolMetricsFile =
@@ -149,6 +149,66 @@ const canarySchoolSet = parseCommaSet(canarySchoolsRaw);
 const offlineReplayDataset = parseOfflineReplayDataset(offlineReplayDatasetJson);
 
 // ---------------------------------------------------------------------------
+// 动态配置管理
+// ---------------------------------------------------------------------------
+
+function applyDynamicConfig(conf) {
+  if (!conf) return;
+
+  if (conf.modelAliasJson !== undefined) {
+    modelAliasJson = conf.modelAliasJson;
+    modelAliasMap = safeJson(modelAliasJson) || {};
+  }
+
+  if (conf.summaryProviderRaw !== undefined) summaryProviderRaw = conf.summaryProviderRaw;
+  if (conf.summaryApiKey !== undefined) summaryApiKey = conf.summaryApiKey;
+  if (conf.summaryModelRaw !== undefined) summaryModelRaw = conf.summaryModelRaw;
+  if (conf.summaryBaseUrl !== undefined) summaryBaseUrl = conf.summaryBaseUrl;
+  if (conf.summaryRequestExtraJson !== undefined) summaryRequestExtraJson = conf.summaryRequestExtraJson;
+  if (conf.summaryApiStyleRaw !== undefined) summaryApiStyleRaw = conf.summaryApiStyleRaw;
+
+  summaryModel = resolveModelName(summaryModelRaw || defaultSummaryModel(summaryProviderRaw === "auto" ? "gpt" : summaryProviderRaw));
+  summaryProvider = normalizeProvider(summaryProviderRaw, summaryModel);
+  summaryBaseUrl = summaryBaseUrl || defaultBaseUrl(summaryProvider);
+  summaryRequestExtra = safeJson(summaryRequestExtraJson) || null;
+
+  if (conf.scriptProviderRaw !== undefined) scriptProviderRaw = conf.scriptProviderRaw;
+  if (conf.scriptApiKey !== undefined) scriptApiKey = conf.scriptApiKey;
+  if (conf.scriptModelRaw !== undefined) scriptModelRaw = conf.scriptModelRaw;
+  if (conf.scriptBaseUrl !== undefined) scriptBaseUrl = conf.scriptBaseUrl;
+  if (conf.scriptRequestExtraJson !== undefined) scriptRequestExtraJson = conf.scriptRequestExtraJson;
+  if (conf.scriptApiStyleRaw !== undefined) scriptApiStyleRaw = conf.scriptApiStyleRaw;
+
+  scriptModel = resolveModelName(scriptModelRaw || defaultScriptModel(scriptProviderRaw === "auto" ? "gpt" : scriptProviderRaw));
+  scriptProvider = normalizeProvider(scriptProviderRaw, scriptModel);
+  scriptBaseUrl = scriptBaseUrl || defaultBaseUrl(scriptProvider);
+  scriptRequestExtra = safeJson(scriptRequestExtraJson) || null;
+
+  provider = summaryProvider;
+  apiKey = summaryApiKey;
+  model = summaryModel;
+  baseUrl = summaryBaseUrl;
+
+  if (conf.usageEnabled !== undefined) usageEnabled = conf.usageEnabled;
+  if (conf.summaryUsageUrl !== undefined) summaryUsageUrl = conf.summaryUsageUrl;
+  if (conf.scriptUsageUrl !== undefined) scriptUsageUrl = conf.scriptUsageUrl;
+  if (conf.summaryCostUrl !== undefined) summaryCostUrl = conf.summaryCostUrl;
+  if (conf.scriptCostUrl !== undefined) scriptCostUrl = conf.scriptCostUrl;
+}
+
+async function loadDynamicConfig() {
+  if (adminLocalMode) return;
+  try {
+    const raw = await redisClient.get("admin:llm_config");
+    if (raw) {
+      applyDynamicConfig(safeJson(raw));
+    }
+  } catch (e) {
+    console.error("loadDynamicConfig error:", e);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 初始化与全局变量
 // ---------------------------------------------------------------------------
 const redisClient = createClient({ url: redisUrl });
@@ -157,6 +217,7 @@ redisClient.on("error", (error) => {
 });
 if (!adminLocalMode) {
   await redisClient.connect();
+  await loadDynamicConfig();
 }
 // 初始化管理后台账号密码，仅首次启动生成一次
 const adminCredentialInfo = await initAdminCredentials();
@@ -375,6 +436,69 @@ const server = http.createServer(async (req, res) => {
     const meta = await getScriptMeta(scriptName);
     return sendJson(res, 200, { code: 200, data: { meta } });
   }
+  if (req.method === "GET" && url.pathname === "/api/v1/admin/config") {
+    if (!auth) return sendJson(res, 401, { code: 401, msg: "未登录" });
+    const config = {
+      modelAliasJson,
+      summaryProviderRaw,
+      summaryApiKey,
+      summaryModelRaw,
+      summaryBaseUrl,
+      summaryRequestExtraJson,
+      summaryApiStyleRaw,
+      scriptProviderRaw,
+      scriptApiKey,
+      scriptModelRaw,
+      scriptBaseUrl,
+      scriptRequestExtraJson,
+      scriptApiStyleRaw,
+      usageEnabled,
+      summaryUsageUrl,
+      scriptUsageUrl,
+      summaryCostUrl,
+      scriptCostUrl
+    };
+    return sendJson(res, 200, { code: 200, data: config });
+  }
+  if (req.method === "POST" && url.pathname === "/api/v1/admin/config") {
+    if (!auth) return sendJson(res, 401, { code: 401, msg: "未登录" });
+    if (adminLocalMode) {
+      return sendJson(res, 400, { code: 400, msg: "本地调试模式不支持修改配置" });
+    }
+    const bodyText = await readBody(req, maxContentLength);
+    if (!bodyText) return sendJson(res, 400, { code: 400, msg: "无效请求体" });
+    const conf = safeJson(bodyText);
+    if (!conf) return sendJson(res, 400, { code: 400, msg: "无效 JSON" });
+
+    // Validate if necessary (e.g., alias json format)
+    if (conf.modelAliasJson) {
+      const parsed = safeJson(conf.modelAliasJson);
+      if (!parsed || typeof parsed !== "object") {
+        return sendJson(res, 400, { code: 400, msg: "别名映射格式必须为有效的 JSON 对象" });
+      }
+    }
+    if (conf.summaryRequestExtraJson) {
+      const parsed = safeJson(conf.summaryRequestExtraJson);
+      if (!parsed || typeof parsed !== "object") {
+        return sendJson(res, 400, { code: 400, msg: "扩展参数格式必须为有效的 JSON 对象" });
+      }
+    }
+    if (conf.scriptRequestExtraJson) {
+      const parsed = safeJson(conf.scriptRequestExtraJson);
+      if (!parsed || typeof parsed !== "object") {
+        return sendJson(res, 400, { code: 400, msg: "扩展参数格式必须为有效的 JSON 对象" });
+      }
+    }
+
+    try {
+      await redisClient.set("admin:llm_config", JSON.stringify(conf));
+      applyDynamicConfig(conf);
+      return sendJson(res, 200, { code: 200, msg: "保存成功" });
+    } catch (e) {
+      return sendJson(res, 500, { code: 500, msg: "保存失败: " + e.message });
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // [核心接口] 提交解析任务
   // 1. 拦截重复提交（幂等性）

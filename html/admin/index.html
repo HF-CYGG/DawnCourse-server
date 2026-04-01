@@ -29,6 +29,83 @@
         font-family: "Inter", "PingFang SC", "Microsoft YaHei", sans-serif;
         background: var(--bg);
         color: var(--text);
+        overflow: hidden; /* App wrapper handles scroll */
+      }
+      .app-wrapper {
+        display: flex;
+        height: 100vh;
+        width: 100vw;
+      }
+      /* 侧边栏 */
+      .sidebar {
+        width: 240px;
+        background: var(--panel-2);
+        border-right: 1px solid var(--border);
+        display: flex;
+        flex-direction: column;
+        flex-shrink: 0;
+      }
+      .sidebar-header {
+        padding: 24px 28px;
+        border-bottom: 1px solid var(--border);
+        display: flex;
+        align-items: center;
+      }
+      .sidebar-header h1 {
+        font-size: 18px;
+        margin: 0;
+        color: var(--text);
+      }
+      .sidebar-nav {
+        flex: 1;
+        padding: 16px 0;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        overflow-y: auto;
+      }
+      .nav-item {
+        padding: 12px 28px;
+        color: var(--muted);
+        cursor: pointer;
+        transition: all 0.2s;
+        font-size: 14px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+      .nav-item:hover {
+        background: rgba(91, 157, 255, 0.08);
+        color: var(--text);
+      }
+      .nav-item.active {
+        background: rgba(91, 157, 255, 0.15);
+        color: var(--accent);
+        border-right: 3px solid var(--accent);
+      }
+      .sidebar-footer {
+        padding: 24px 28px;
+        border-top: 1px solid var(--border);
+      }
+      /* 主内容区 */
+      .main-content {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        overflow-y: auto;
+        background: var(--bg);
+      }
+      /* 页面分段显示 */
+      .page-section {
+        display: none;
+      }
+      .page-section.active {
+        display: block;
+        animation: fadeIn 0.3s ease;
+      }
+      @keyframes fadeIn {
+        from { opacity: 0; transform: translateY(5px); }
+        to { opacity: 1; transform: translateY(0); }
       }
       /* 顶部栏 */
       header {
@@ -39,7 +116,7 @@
         justify-content: space-between;
         background: linear-gradient(135deg, #171a21 0%, #11141a 100%);
       }
-      header h1 {
+      header h2 {
         font-size: 20px;
         margin: 0;
       }
@@ -248,84 +325,322 @@
           grid-template-columns: 1fr;
         }
       }
+      /* 配置表单 */
+      .config-form {
+        display: grid;
+        gap: 24px;
+        max-width: 800px;
+      }
+      .config-group {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 24px;
+      }
+      .config-group h3 {
+        margin: 0 0 16px 0;
+        font-size: 16px;
+        color: var(--accent);
+        border-bottom: 1px solid var(--border);
+        padding-bottom: 12px;
+      }
+      .config-row {
+        display: grid;
+        grid-template-columns: 180px 1fr;
+        gap: 16px;
+        align-items: center;
+        margin-bottom: 16px;
+      }
+      .config-row:last-child {
+        margin-bottom: 0;
+      }
+      .config-row label {
+        font-size: 13px;
+        color: var(--muted);
+        text-align: right;
+      }
+      .config-row input, .config-row select, .config-row textarea {
+        background: #10141c;
+        border: 1px solid var(--border);
+        color: var(--text);
+        padding: 10px 12px;
+        border-radius: 8px;
+        font-family: inherit;
+        font-size: 13px;
+        width: 100%;
+      }
+      .config-row textarea {
+        resize: vertical;
+        min-height: 60px;
+      }
+      .config-actions {
+        display: flex;
+        justify-content: flex-end;
+        gap: 12px;
+        margin-top: 12px;
+      }
+      .switch {
+        position: relative;
+        display: inline-block;
+        width: 44px;
+        height: 24px;
+      }
+      .switch input { 
+        opacity: 0;
+        width: 0;
+        height: 0;
+      }
+      .slider {
+        position: absolute;
+        cursor: pointer;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background-color: var(--border);
+        transition: .3s;
+        border-radius: 24px;
+      }
+      .slider:before {
+        position: absolute;
+        content: "";
+        height: 18px;
+        width: 18px;
+        left: 3px;
+        bottom: 3px;
+        background-color: var(--muted);
+        transition: .3s;
+        border-radius: 50%;
+      }
+      input:checked + .slider {
+        background-color: rgba(91, 157, 255, 0.4);
+      }
+      input:checked + .slider:before {
+        transform: translateX(20px);
+        background-color: var(--accent);
+      }
     </style>
   </head>
   <body>
-    <!-- 头部状态栏 -->
-    <header>
-      <div>
-        <h1>兜底解析服务控制台</h1>
-        <div class="meta" id="headerMeta">等待数据…</div>
+    <div class="app-wrapper">
+      <aside class="sidebar">
+        <div class="sidebar-header">
+          <h1>Dawn Course 解析监控</h1>
+        </div>
+        <nav class="sidebar-nav">
+          <div class="nav-item active" data-target="page-dashboard">
+            概览与监控
+          </div>
+          <div class="nav-item" data-target="page-config">
+            模型配置
+          </div>
+        </nav>
+        <div class="sidebar-footer">
+          <button class="btn secondary" id="logoutBtn" type="button" style="width: 100%;">退出登录</button>
+        </div>
+      </aside>
+
+      <div class="main-content">
+        <header>
+          <div>
+            <h2 id="pageTitle">概览与监控</h2>
+            <div class="meta" id="headerMeta">等待数据…</div>
+          </div>
+          <div class="actions">
+            <button class="btn secondary" id="refreshBtn" type="button">刷新数据</button>
+          </div>
+        </header>
+
+        <main class="container">
+          <!-- 概览与监控页面 -->
+          <div id="page-dashboard" class="page-section active">
+            <!-- 顶部汇总卡片 -->
+            <section style="margin-bottom: 24px;">
+              <div class="grid cards" id="summaryCards"></div>
+            </section>
+            <section class="filter-bar" style="margin-bottom: 24px;">
+              <div class="filters">
+                <div class="filter">
+                  <label>学校筛选</label>
+                  <select id="filterSchool"></select>
+                </div>
+                <div class="filter">
+                  <label>教务类型</label>
+                  <select id="filterSystemType"></select>
+                </div>
+                <div class="filter">
+                  <label>失败类型</label>
+                  <select id="filterFailureType"></select>
+                </div>
+              </div>
+              <div class="actions">
+                <button class="btn secondary" id="exportBtn" type="button">导出统计</button>
+              </div>
+            </section>
+            <!-- 学校维度统计与失败记录 -->
+            <section class="split">
+              <div>
+                <h3 class="section-title">学校维度统计</h3>
+                <table class="table" id="schoolTable">
+                  <thead>
+                    <tr>
+                      <th>学校</th>
+                      <th>名称</th>
+                      <th>教务系统</th>
+                      <th>队列</th>
+                      <th>成功率</th>
+                      <th>解析</th>
+                      <th>总结</th>
+                      <th>脚本</th>
+                      <th>费用</th>
+                      <th>最近更新</th>
+                    </tr>
+                  </thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+              <div>
+                <h3 class="section-title">最近失败</h3>
+                <div class="failure-summary" id="failureSummary"></div>
+                <table class="table" id="failureTable">
+                  <thead>
+                    <tr>
+                      <th>学校</th>
+                      <th>脚本</th>
+                      <th>类型</th>
+                      <th>原因</th>
+                      <th>时间</th>
+                    </tr>
+                  </thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+            </section>
+          </div>
+
+          <!-- 模型配置页面 -->
+          <div id="page-config" class="page-section">
+            <div class="config-form">
+              <div class="config-group">
+                <h3>模型 1：总结与解析（低成本）</h3>
+                <div class="config-row">
+                  <label>供应商 (Provider)</label>
+                  <select id="conf_summaryProviderRaw">
+                    <option value="auto">自动推断 (auto)</option>
+                    <option value="gpt">OpenAI (gpt)</option>
+                    <option value="gemini">Gemini (gemini)</option>
+                    <option value="glm">智谱 (glm)</option>
+                    <option value="deepseek">DeepSeek (deepseek)</option>
+                    <option value="qwen">通义千问 (qwen)</option>
+                  </select>
+                </div>
+                <div class="config-row">
+                  <label>模型名称</label>
+                  <input type="text" id="conf_summaryModelRaw" placeholder="如: gpt-4o-mini, gemini-1.5-flash">
+                </div>
+                <div class="config-row">
+                  <label>API Key</label>
+                  <input type="password" id="conf_summaryApiKey" placeholder="输入密钥">
+                </div>
+                <div class="config-row">
+                  <label>Base URL</label>
+                  <input type="text" id="conf_summaryBaseUrl" placeholder="为空则使用默认">
+                </div>
+                <div class="config-row">
+                  <label>API 风格</label>
+                  <select id="conf_summaryApiStyleRaw">
+                    <option value="">自动推断</option>
+                    <option value="chat">Chat Completions</option>
+                    <option value="responses">Responses API</option>
+                  </select>
+                </div>
+                <div class="config-row">
+                  <label>扩展请求体 (JSON)</label>
+                  <textarea id="conf_summaryRequestExtraJson" placeholder='如: {"response_format": {"type": "json_object"}}'></textarea>
+                </div>
+              </div>
+
+              <div class="config-group">
+                <h3>模型 2：脚本修复（高成本）</h3>
+                <div class="config-row">
+                  <label>供应商 (Provider)</label>
+                  <select id="conf_scriptProviderRaw">
+                    <option value="auto">自动推断 (auto)</option>
+                    <option value="gpt">OpenAI (gpt)</option>
+                    <option value="gemini">Gemini (gemini)</option>
+                    <option value="glm">智谱 (glm)</option>
+                    <option value="deepseek">DeepSeek (deepseek)</option>
+                    <option value="qwen">通义千问 (qwen)</option>
+                  </select>
+                </div>
+                <div class="config-row">
+                  <label>模型名称</label>
+                  <input type="text" id="conf_scriptModelRaw" placeholder="如: gpt-4o, gemini-1.5-pro">
+                </div>
+                <div class="config-row">
+                  <label>API Key</label>
+                  <input type="password" id="conf_scriptApiKey" placeholder="输入密钥">
+                </div>
+                <div class="config-row">
+                  <label>Base URL</label>
+                  <input type="text" id="conf_scriptBaseUrl" placeholder="为空则使用默认">
+                </div>
+                <div class="config-row">
+                  <label>API 风格</label>
+                  <select id="conf_scriptApiStyleRaw">
+                    <option value="">自动推断</option>
+                    <option value="chat">Chat Completions</option>
+                    <option value="responses">Responses API</option>
+                  </select>
+                </div>
+                <div class="config-row">
+                  <label>扩展请求体 (JSON)</label>
+                  <textarea id="conf_scriptRequestExtraJson" placeholder='如: {"response_format": {"type": "json_object"}}'></textarea>
+                </div>
+              </div>
+
+              <div class="config-group">
+                <h3>模型深度适配与统计配置</h3>
+                <div class="config-row">
+                  <label>别名映射 (JSON)</label>
+                  <textarea id="conf_modelAliasJson" placeholder='如: {"glm5 5.1": "glm-5-1"}'></textarea>
+                </div>
+                <div class="config-row">
+                  <label>开启用量统计</label>
+                  <div>
+                    <label class="switch">
+                      <input type="checkbox" id="conf_usageEnabled">
+                      <span class="slider"></span>
+                    </label>
+                  </div>
+                </div>
+                <div class="config-row">
+                  <label>模型 1 Token 查询接口</label>
+                  <input type="text" id="conf_summaryUsageUrl" placeholder="可选自定义 URL 模板">
+                </div>
+                <div class="config-row">
+                  <label>模型 1 费用查询接口</label>
+                  <input type="text" id="conf_summaryCostUrl" placeholder="可选自定义 URL 模板">
+                </div>
+                <div class="config-row">
+                  <label>模型 2 Token 查询接口</label>
+                  <input type="text" id="conf_scriptUsageUrl" placeholder="可选自定义 URL 模板">
+                </div>
+                <div class="config-row">
+                  <label>模型 2 费用查询接口</label>
+                  <input type="text" id="conf_scriptCostUrl" placeholder="可选自定义 URL 模板">
+                </div>
+              </div>
+              
+              <div class="config-actions">
+                <button class="btn" id="saveConfigBtn" type="button">保存配置</button>
+              </div>
+            </div>
+          </div>
+
+        </main>
       </div>
-      <div class="actions">
-        <button class="btn secondary" id="refreshBtn" type="button">刷新</button>
-        <button class="btn secondary" id="logoutBtn" type="button">退出</button>
-      </div>
-    </header>
-    <main class="container">
-      <!-- 顶部汇总卡片 -->
-      <section>
-        <div class="grid cards" id="summaryCards"></div>
-      </section>
-      <section class="filter-bar">
-        <div class="filters">
-          <div class="filter">
-            <label>学校筛选</label>
-            <select id="filterSchool"></select>
-          </div>
-          <div class="filter">
-            <label>教务类型</label>
-            <select id="filterSystemType"></select>
-          </div>
-          <div class="filter">
-            <label>失败类型</label>
-            <select id="filterFailureType"></select>
-          </div>
-        </div>
-        <div class="actions">
-          <button class="btn secondary" id="exportBtn" type="button">导出统计</button>
-        </div>
-      </section>
-      <!-- 学校维度统计与失败记录 -->
-      <section class="split">
-        <div>
-          <h2 class="section-title">学校维度统计</h2>
-          <table class="table" id="schoolTable">
-            <thead>
-              <tr>
-                <th>学校</th>
-                <th>名称</th>
-                <th>教务系统</th>
-                <th>队列</th>
-                <th>成功率</th>
-                <th>解析</th>
-                <th>总结</th>
-                <th>脚本</th>
-                <th>费用</th>
-                <th>最近更新</th>
-              </tr>
-            </thead>
-            <tbody></tbody>
-          </table>
-        </div>
-        <div>
-          <h2 class="section-title">最近失败</h2>
-          <div class="failure-summary" id="failureSummary"></div>
-          <table class="table" id="failureTable">
-            <thead>
-              <tr>
-                <th>学校</th>
-                <th>脚本</th>
-                <th>类型</th>
-                <th>原因</th>
-                <th>时间</th>
-              </tr>
-            </thead>
-            <tbody></tbody>
-          </table>
-        </div>
-      </section>
-    </main>
+    </div>
     <!-- 登录遮罩层 -->
     <div class="login-overlay" id="loginOverlay">
       <div class="login-panel">
@@ -361,6 +676,121 @@
       const failureTableBody = document.querySelector("#failureTable tbody");
       const headerMeta = document.getElementById("headerMeta");
       let currentData = null;
+
+      // 导航切换逻辑
+      const navItems = document.querySelectorAll('.nav-item');
+      const pageSections = document.querySelectorAll('.page-section');
+      const pageTitle = document.getElementById('pageTitle');
+      
+      navItems.forEach(item => {
+        item.addEventListener('click', () => {
+          const target = item.getAttribute('data-target');
+          navItems.forEach(nav => nav.classList.remove('active'));
+          item.classList.add('active');
+          pageTitle.textContent = item.textContent.trim();
+          
+          pageSections.forEach(page => {
+            if (page.id === target) {
+              page.classList.add('active');
+              if (target === 'page-config') loadConfig();
+            } else {
+              page.classList.remove('active');
+            }
+          });
+        });
+      });
+
+      // 配置管理逻辑
+      async function loadConfig() {
+        try {
+          const res = await fetch("/api/v1/admin/config", {
+            headers: { Authorization: `Bearer ${getToken()}` }
+          });
+          if (res.status === 401) {
+            clearToken();
+            overlay.style.display = "flex";
+            return;
+          }
+          const json = await res.json();
+          if (json.code === 200) {
+            const conf = json.data;
+            document.getElementById("conf_summaryProviderRaw").value = conf.summaryProviderRaw || "auto";
+            document.getElementById("conf_summaryModelRaw").value = conf.summaryModelRaw || "";
+            document.getElementById("conf_summaryApiKey").value = conf.summaryApiKey || "";
+            document.getElementById("conf_summaryBaseUrl").value = conf.summaryBaseUrl || "";
+            document.getElementById("conf_summaryApiStyleRaw").value = conf.summaryApiStyleRaw || "";
+            document.getElementById("conf_summaryRequestExtraJson").value = conf.summaryRequestExtraJson || "";
+
+            document.getElementById("conf_scriptProviderRaw").value = conf.scriptProviderRaw || "auto";
+            document.getElementById("conf_scriptModelRaw").value = conf.scriptModelRaw || "";
+            document.getElementById("conf_scriptApiKey").value = conf.scriptApiKey || "";
+            document.getElementById("conf_scriptBaseUrl").value = conf.scriptBaseUrl || "";
+            document.getElementById("conf_scriptApiStyleRaw").value = conf.scriptApiStyleRaw || "";
+            document.getElementById("conf_scriptRequestExtraJson").value = conf.scriptRequestExtraJson || "";
+
+            document.getElementById("conf_modelAliasJson").value = conf.modelAliasJson || "";
+            document.getElementById("conf_usageEnabled").checked = conf.usageEnabled;
+            document.getElementById("conf_summaryUsageUrl").value = conf.summaryUsageUrl || "";
+            document.getElementById("conf_summaryCostUrl").value = conf.summaryCostUrl || "";
+            document.getElementById("conf_scriptUsageUrl").value = conf.scriptUsageUrl || "";
+            document.getElementById("conf_scriptCostUrl").value = conf.scriptCostUrl || "";
+          }
+        } catch (e) {
+          console.error("Failed to load config", e);
+        }
+      }
+
+      document.getElementById("saveConfigBtn").addEventListener("click", async () => {
+        const conf = {
+          summaryProviderRaw: document.getElementById("conf_summaryProviderRaw").value,
+          summaryModelRaw: document.getElementById("conf_summaryModelRaw").value,
+          summaryApiKey: document.getElementById("conf_summaryApiKey").value,
+          summaryBaseUrl: document.getElementById("conf_summaryBaseUrl").value,
+          summaryApiStyleRaw: document.getElementById("conf_summaryApiStyleRaw").value,
+          summaryRequestExtraJson: document.getElementById("conf_summaryRequestExtraJson").value,
+
+          scriptProviderRaw: document.getElementById("conf_scriptProviderRaw").value,
+          scriptModelRaw: document.getElementById("conf_scriptModelRaw").value,
+          scriptApiKey: document.getElementById("conf_scriptApiKey").value,
+          scriptBaseUrl: document.getElementById("conf_scriptBaseUrl").value,
+          scriptApiStyleRaw: document.getElementById("conf_scriptApiStyleRaw").value,
+          scriptRequestExtraJson: document.getElementById("conf_scriptRequestExtraJson").value,
+
+          modelAliasJson: document.getElementById("conf_modelAliasJson").value,
+          usageEnabled: document.getElementById("conf_usageEnabled").checked,
+          summaryUsageUrl: document.getElementById("conf_summaryUsageUrl").value,
+          summaryCostUrl: document.getElementById("conf_summaryCostUrl").value,
+          scriptUsageUrl: document.getElementById("conf_scriptUsageUrl").value,
+          scriptCostUrl: document.getElementById("conf_scriptCostUrl").value
+        };
+
+        const btn = document.getElementById("saveConfigBtn");
+        const originalText = btn.textContent;
+        btn.textContent = "保存中...";
+        btn.disabled = true;
+
+        try {
+          const res = await fetch("/api/v1/admin/config", {
+            method: "POST",
+            headers: { 
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${getToken()}` 
+            },
+            body: JSON.stringify(conf)
+          });
+          const json = await res.json();
+          if (json.code === 200) {
+            alert("配置保存成功");
+          } else {
+            alert(json.msg || "保存失败");
+          }
+        } catch (e) {
+          alert("网络错误");
+        } finally {
+          btn.textContent = originalText;
+          btn.disabled = false;
+        }
+      });
 
       const systemTypeLabels = {
         zhengfang: "正方",

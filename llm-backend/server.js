@@ -149,6 +149,67 @@ let usageRefreshTimer = null;
 const canarySchoolSet = parseCommaSet(canarySchoolsRaw);
 const offlineReplayDataset = parseOfflineReplayDataset(offlineReplayDatasetJson);
 
+const adminLogBufferLimit = Number(process.env.ADMIN_LOG_BUFFER_LIMIT || 300);
+const adminLogBuffer = [];
+const adminEventClients = new Set();
+const nativeConsole = {
+  log: console.log.bind(console),
+  warn: console.warn.bind(console),
+  error: console.error.bind(console)
+};
+
+function safeToLogString(value) {
+  if (value == null) return "";
+  if (typeof value === "string") return value;
+  if (value instanceof Error) return value.stack || value.message || String(value);
+  if (typeof value === "object") {
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return String(value);
+    }
+  }
+  return String(value);
+}
+
+function pushAdminLog(level, message, extra = {}) {
+  const entry = {
+    id: crypto.randomUUID(),
+    level: level || "info",
+    message: (message || "").toString(),
+    extra: extra || {},
+    createdAt: Date.now()
+  };
+  adminLogBuffer.push(entry);
+  if (adminLogBuffer.length > adminLogBufferLimit) {
+    adminLogBuffer.splice(0, adminLogBuffer.length - adminLogBufferLimit);
+  }
+  const payload = `event: log\ndata: ${JSON.stringify(entry)}\n\n`;
+  for (const client of adminEventClients) {
+    try {
+      if (client.res.writableEnded) continue;
+      client.res.write(payload);
+    } catch {}
+  }
+  return entry;
+}
+
+console.error = (...args) => {
+  nativeConsole.error(...args);
+  pushAdminLog("error", args.map(safeToLogString).join(" "), { source: "server", type: "console" });
+};
+console.warn = (...args) => {
+  nativeConsole.warn(...args);
+  pushAdminLog("warning", args.map(safeToLogString).join(" "), { source: "server", type: "console" });
+};
+
+process.on("unhandledRejection", (reason) => {
+  pushAdminLog("error", safeToLogString(reason), { source: "server", type: "unhandledRejection" });
+});
+process.on("uncaughtException", (error) => {
+  pushAdminLog("error", safeToLogString(error), { source: "server", type: "uncaughtException" });
+});
+
 // ---------------------------------------------------------------------------
 // 动态配置管理
 // ---------------------------------------------------------------------------
@@ -236,7 +297,8 @@ if (usageEnabled && !adminLocalMode) {
 // HTTP 服务入口
 // 提供客户端任务提交、状态轮询，以及管理后台的各种 API
 // ---------------------------------------------------------------------------
-const server = http.createServer(async (req, res) => {
+const server = http.createServer((req, res) => {
+  (async () => {
   const url = new URL(req.url || "/", "http://localhost");
   // 健康检查接口
   if (req.method === "GET" && url.pathname === "/health") {
@@ -344,6 +406,64 @@ const server = http.createServer(async (req, res) => {
     }
     return sendJson(res, 200, { code: 200, data: { username: auth.username } });
   }
+  if (req.method === "GET" && url.pathname === "/api/v1/admin/events") {
+    const token = (url.searchParams.get("token") || "").trim();
+    const auth = await requireAdminAuthByToken(token);
+    if (!auth.ok) {
+      return sendJson(res, 401, { code: 401, msg: "未登录" });
+    }
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-store",
+      Connection: "keep-alive"
+    });
+    res.write(`event: hello\ndata: ${JSON.stringify({ ok: true, username: auth.username })}\n\n`);
+    const snapshot = adminLogBuffer.slice(-Math.min(50, adminLogBuffer.length));
+    for (const item of snapshot) {
+      res.write(`event: log\ndata: ${JSON.stringify(item)}\n\n`);
+    }
+    const client = { res };
+    adminEventClients.add(client);
+    const pingTimer = setInterval(() => {
+      try {
+        if (!res.writableEnded) res.write("event: ping\ndata: {}\n\n");
+      } catch {}
+    }, 25000);
+    req.on("close", () => {
+      clearInterval(pingTimer);
+      adminEventClients.delete(client);
+    });
+    return;
+  }
+  if (req.method === "GET" && url.pathname === "/api/v1/admin/logs") {
+    const auth = await requireAdminAuth(req);
+    if (!auth.ok) {
+      return sendJson(res, 401, { code: 401, msg: "未登录" });
+    }
+    const limit = Math.max(1, Math.min(500, Number(url.searchParams.get("limit") || 200)));
+    const list = adminLogBuffer.slice(-limit);
+    return sendJson(res, 200, { code: 200, data: { list } });
+  }
+  if (req.method === "POST" && url.pathname === "/api/v1/admin/client_error") {
+    const auth = await requireAdminAuth(req);
+    if (!auth.ok) {
+      return sendJson(res, 401, { code: 401, msg: "未登录" });
+    }
+    const bodyText = await readBody(req, maxContentLength);
+    if (bodyText == null) {
+      return sendJson(res, 413, { code: 413, msg: "请求体过大" });
+    }
+    const body = safeJson(bodyText) || {};
+    pushAdminLog("error", (body.message || "client error").toString(), {
+      source: "client",
+      username: auth.username,
+      stack: (body.stack || "").toString(),
+      url: (body.url || "").toString(),
+      userAgent: (body.userAgent || "").toString(),
+      extra: body.extra || null
+    });
+    return sendJson(res, 200, { code: 200, msg: "ok" });
+  }
   // ---------------------------------------------------------------------------
   // [管理后台接口] 聚合数据
   // 供管理面板使用，返回包含核心统计指标和失败列表的综合数据
@@ -442,7 +562,10 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, 200, { code: 200, data: { meta } });
   }
   if (req.method === "GET" && url.pathname === "/api/v1/admin/config") {
-    if (!auth) return sendJson(res, 401, { code: 401, msg: "未登录" });
+    const auth = await requireAdminAuth(req);
+    if (!auth.ok) {
+      return sendJson(res, 401, { code: 401, msg: "未登录" });
+    }
     const config = {
       modelAliasJson,
       summaryProviderRaw,
@@ -466,7 +589,10 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, 200, { code: 200, data: config });
   }
   if (req.method === "POST" && url.pathname === "/api/v1/admin/config") {
-    if (!auth) return sendJson(res, 401, { code: 401, msg: "未登录" });
+    const auth = await requireAdminAuth(req);
+    if (!auth.ok) {
+      return sendJson(res, 401, { code: 401, msg: "未登录" });
+    }
     if (adminLocalMode) {
       return sendJson(res, 400, { code: 400, msg: "本地调试模式不支持修改配置" });
     }
@@ -637,6 +763,18 @@ const server = http.createServer(async (req, res) => {
     });
   }
   return sendJson(res, 404, { code: 404, msg: "Not Found" });
+  })().catch((error) => {
+    pushAdminLog("error", safeToLogString(error), {
+      source: "server",
+      type: "requestUnhandled",
+      path: req?.url || ""
+    });
+    try {
+      if (!res.headersSent && !res.writableEnded) {
+        return sendJson(res, 500, { code: 500, msg: "Internal Server Error" });
+      }
+    } catch {}
+  });
 });
 
 // 启动服务
@@ -2286,6 +2424,23 @@ async function requireAdminAuth(req) {
   const username = await redisClient.get(buildAdminSessionKey(token));
   if (!username) return { ok: false };
   return { ok: true, username, token };
+}
+
+async function requireAdminAuthByToken(token) {
+  const normalized = (token || "").trim();
+  if (!normalized) return { ok: false };
+  if (adminLocalMode) {
+    const session = adminLocalSessions.get(normalized);
+    if (!session) return { ok: false };
+    if (session.expiresAt <= Date.now()) {
+      adminLocalSessions.delete(normalized);
+      return { ok: false };
+    }
+    return { ok: true, username: session.username, token: normalized };
+  }
+  const username = await redisClient.get(buildAdminSessionKey(normalized));
+  if (!username) return { ok: false };
+  return { ok: true, username, token: normalized };
 }
 
 /**

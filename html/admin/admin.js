@@ -13,10 +13,127 @@ const schoolTableBody = document.querySelector("#schoolTable tbody");
 const failureTableBody = document.querySelector("#failureTable tbody");
 const headerMeta = document.getElementById("headerMeta");
 let currentData = null;
+let eventSource = null;
 
 const navItems = document.querySelectorAll(".nav-item");
 const pageSections = document.querySelectorAll(".page-section");
 const pageTitle = document.getElementById("pageTitle");
+
+function ensureToastContainer() {
+  let container = document.querySelector(".toast-container");
+  if (container) return container;
+  container = document.createElement("div");
+  container.className = "toast-container";
+  document.body.appendChild(container);
+  return container;
+}
+
+function showToast(level, title, message) {
+  const container = ensureToastContainer();
+  const toast = document.createElement("div");
+  toast.className = `toast ${level || ""}`.trim();
+  const safeTitle = (title || "提示").toString();
+  const safeMessage = (message || "").toString();
+  toast.innerHTML = `
+    <div class="toast-title">
+      <span>${safeTitle}</span>
+      <button class="toast-close" type="button">关闭</button>
+    </div>
+    <div class="toast-message">${safeMessage}</div>
+  `;
+  const closeBtn = toast.querySelector(".toast-close");
+  closeBtn.addEventListener("click", () => {
+    toast.remove();
+  });
+  container.appendChild(toast);
+  setTimeout(() => {
+    toast.remove();
+  }, level === "error" ? 15000 : 8000);
+}
+
+function closeAdminEvents() {
+  if (!eventSource) return;
+  try {
+    eventSource.close();
+  } catch {}
+  eventSource = null;
+}
+
+function connectAdminEvents() {
+  const token = getToken();
+  if (!token) return;
+  closeAdminEvents();
+  eventSource = new EventSource(`/api/v1/admin/events?token=${encodeURIComponent(token)}`);
+  eventSource.addEventListener("log", (event) => {
+    try {
+      const entry = JSON.parse(event.data || "{}");
+      const level = (entry.level || "").toString();
+      const message = (entry.message || "").toString();
+      if (level === "error") {
+        showToast("error", "服务端错误", message);
+      } else if (level === "warning") {
+        showToast("warning", "服务端告警", message);
+      }
+    } catch (e) {
+      console.error("Failed to parse event log", e);
+    }
+  });
+  eventSource.addEventListener("hello", () => {});
+  eventSource.addEventListener("ping", () => {});
+  eventSource.onerror = () => {
+    showToast("warning", "事件流断开", "将自动重连，若持续失败请检查服务端日志");
+  };
+}
+
+async function reportClientError(payload) {
+  const token = getToken();
+  if (!token) return;
+  try {
+    await fetch("/api/v1/admin/client_error", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`
+      },
+      body: JSON.stringify(payload || {})
+    });
+  } catch {}
+}
+
+window.addEventListener("error", (event) => {
+  try {
+    const message = (event?.message || "Unknown error").toString();
+    const stack = (event?.error?.stack || "").toString();
+    showToast("error", "前端错误", message);
+    reportClientError({
+      message,
+      stack,
+      url: location.href,
+      userAgent: navigator.userAgent,
+      extra: {
+        filename: event?.filename || "",
+        lineno: event?.lineno || 0,
+        colno: event?.colno || 0
+      }
+    });
+  } catch {}
+});
+
+window.addEventListener("unhandledrejection", (event) => {
+  try {
+    const reason = event?.reason;
+    const message = reason instanceof Error ? reason.message : `${reason || "Unhandled rejection"}`;
+    const stack = reason instanceof Error ? reason.stack : "";
+    showToast("error", "前端未处理异常", message);
+    reportClientError({
+      message,
+      stack,
+      url: location.href,
+      userAgent: navigator.userAgent,
+      extra: { type: "unhandledrejection" }
+    });
+  } catch {}
+});
 
 navItems.forEach((item) => {
   item.addEventListener("click", () => {
@@ -74,6 +191,7 @@ async function loadConfig() {
     }
   } catch (e) {
     console.error("Failed to load config", e);
+    showToast("error", "加载配置失败", e?.message || "网络错误");
   }
 }
 
@@ -117,12 +235,12 @@ document.getElementById("saveConfigBtn").addEventListener("click", async () => {
     });
     const json = await res.json();
     if (json.code === 200) {
-      alert("配置保存成功");
+      showToast("info", "配置已保存", "保存成功");
     } else {
-      alert(json.msg || "保存失败");
+      showToast("error", "保存失败", json.msg || "保存失败");
     }
   } catch (e) {
-    alert("网络错误");
+    showToast("error", "网络错误", "无法连接到服务端");
   } finally {
     btn.textContent = originalText;
     btn.disabled = false;
@@ -534,9 +652,11 @@ async function checkSession() {
   try {
     await fetchWithAuth("/api/v1/admin/session");
     overlay.style.display = "none";
+    connectAdminEvents();
     await refreshData();
   } catch {
     overlay.style.display = "flex";
+    closeAdminEvents();
   }
 }
 
@@ -560,6 +680,7 @@ loginBtn.addEventListener("click", async () => {
   const result = await res.json();
   setToken(result.data.token);
   overlay.style.display = "none";
+  connectAdminEvents();
   await refreshData();
 });
 
@@ -584,6 +705,7 @@ logoutBtn.addEventListener("click", async () => {
     await fetchWithAuth("/api/v1/admin/logout");
   } catch {}
   clearToken();
+  closeAdminEvents();
   overlay.style.display = "flex";
 });
 

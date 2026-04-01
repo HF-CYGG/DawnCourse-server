@@ -5,7 +5,7 @@ services:
     build: .
     ports:
       - "10000:80"
-    restart: ${RESTART_POLICY:-always}
+    restart: ${RESTART_POLICY:-no}
     volumes:
       - parsers-data:/shared/parsers
     depends_on:
@@ -52,12 +52,12 @@ services:
       ADMIN_SESSION_TTL_MS: 43200000
     volumes:
       - parsers-data:/shared/parsers
-    restart: ${RESTART_POLICY:-always}
+    restart: ${RESTART_POLICY:-no}
     depends_on:
       - redis
   redis:
     image: redis:7-alpine
-    restart: ${RESTART_POLICY:-always}
+    restart: ${RESTART_POLICY:-no}
     volumes:
       - redis-data:/data
 

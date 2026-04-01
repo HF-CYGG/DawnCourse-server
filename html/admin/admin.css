@@ -317,7 +317,8 @@ header .meta {
 .config-form {
   display: grid;
   gap: 24px;
-  max-width: 800px;
+  width: 100%;
+  max-width: none;
 }
 .config-group {
   background: var(--panel);

@@ -98,6 +98,48 @@ function dismissToast(toast, container) {
   );
 }
 
+function defaultBaseUrl(providerRaw) {
+  const p = (providerRaw || "").toString().trim().toLowerCase();
+  if (p === "deepseek") return "https://api.deepseek.com";
+  if (p === "qwen") return "https://dashscope.aliyuncs.com/compatible-mode";
+  if (p === "glm") return "https://open.bigmodel.cn/api/paas/v4";
+  if (p === "gemini") return "https://generativelanguage.googleapis.com/v1beta";
+  return "https://api.openai.com";
+}
+
+function setupProviderBaseUrlAuto(providerId, baseUrlId) {
+  const providerEl = document.getElementById(providerId);
+  const baseUrlEl = document.getElementById(baseUrlId);
+  if (!providerEl || !baseUrlEl) return;
+
+  baseUrlEl.addEventListener("input", () => {
+    baseUrlEl.dataset.autoManaged = "0";
+  });
+
+  providerEl.addEventListener("change", () => {
+    const nextProvider = providerEl.value;
+    const prevProvider = providerEl.dataset.prevValue || nextProvider;
+    const prevDefault = defaultBaseUrl(prevProvider);
+    const nextDefault = defaultBaseUrl(nextProvider);
+    const current = (baseUrlEl.value || "").toString().trim();
+    const lastDefault = (baseUrlEl.dataset.lastDefault || "").toString().trim();
+
+    const shouldAutoUpdate =
+      baseUrlEl.dataset.autoManaged === "1" ||
+      current === "" ||
+      current === prevDefault ||
+      (lastDefault && current === lastDefault);
+
+    if (shouldAutoUpdate) {
+      baseUrlEl.value = nextDefault;
+      baseUrlEl.dataset.autoManaged = "1";
+      baseUrlEl.dataset.lastDefault = nextDefault;
+    }
+
+    providerEl.dataset.prevValue = nextProvider;
+  });
+}
+
 function showToast(level, title, message) {
   const container = ensureToastContainer();
   const toast = document.createElement("div");
@@ -460,12 +502,36 @@ async function loadConfig() {
       document.getElementById("conf_summaryCostUrl").value = conf.summaryCostUrl || "";
       document.getElementById("conf_scriptUsageUrl").value = conf.scriptUsageUrl || "";
       document.getElementById("conf_scriptCostUrl").value = conf.scriptCostUrl || "";
+
+      const summaryProviderEl = document.getElementById("conf_summaryProviderRaw");
+      const summaryBaseUrlEl = document.getElementById("conf_summaryBaseUrl");
+      if (summaryProviderEl && summaryBaseUrlEl) {
+        const p = summaryProviderEl.value;
+        const d = defaultBaseUrl(p);
+        const current = (summaryBaseUrlEl.value || "").toString().trim();
+        summaryProviderEl.dataset.prevValue = p;
+        summaryBaseUrlEl.dataset.lastDefault = d;
+        summaryBaseUrlEl.dataset.autoManaged = current === "" || current === d ? "1" : "0";
+      }
+      const scriptProviderEl = document.getElementById("conf_scriptProviderRaw");
+      const scriptBaseUrlEl = document.getElementById("conf_scriptBaseUrl");
+      if (scriptProviderEl && scriptBaseUrlEl) {
+        const p = scriptProviderEl.value;
+        const d = defaultBaseUrl(p);
+        const current = (scriptBaseUrlEl.value || "").toString().trim();
+        scriptProviderEl.dataset.prevValue = p;
+        scriptBaseUrlEl.dataset.lastDefault = d;
+        scriptBaseUrlEl.dataset.autoManaged = current === "" || current === d ? "1" : "0";
+      }
     }
   } catch (e) {
     console.error("Failed to load config", e);
     showToast("error", "加载配置失败", e?.message || "网络错误");
   }
 }
+
+setupProviderBaseUrlAuto("conf_summaryProviderRaw", "conf_summaryBaseUrl");
+setupProviderBaseUrlAuto("conf_scriptProviderRaw", "conf_scriptBaseUrl");
 
 document.getElementById("saveConfigBtn").addEventListener("click", async () => {
   const conf = {

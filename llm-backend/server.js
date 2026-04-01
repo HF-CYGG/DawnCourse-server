@@ -276,12 +276,20 @@ async function loadDynamicConfig() {
 // 初始化与全局变量
 // ---------------------------------------------------------------------------
 const redisClient = createClient({ url: redisUrl });
+let redisReady = false;
 redisClient.on("error", (error) => {
   console.error("redis error:", error);
 });
-if (!adminLocalMode) {
-  await redisClient.connect();
-  await loadDynamicConfig();
+try {
+  const redisUrlRaw = (process.env.REDIS_URL || "").trim();
+  const shouldConnectRedis = !adminLocalMode || Boolean(redisUrlRaw);
+  if (shouldConnectRedis) {
+    await redisClient.connect();
+    redisReady = true;
+    await loadDynamicConfig();
+  }
+} catch (e) {
+  console.error("redis connect error:", e);
 }
 // 初始化管理后台账号密码，仅首次启动生成一次
 const adminCredentialInfo = await initAdminCredentials();
@@ -487,6 +495,9 @@ const server = http.createServer((req, res) => {
     if (!auth.ok) {
       return sendJson(res, 401, { code: 401, msg: "未登录" });
     }
+    if (!redisReady) {
+      return sendJson(res, 503, { code: 503, msg: "Redis 未连接，无法发布 pending 脚本" });
+    }
     const bodyText = await readBody(req, maxContentLength);
     if (bodyText == null) {
       return sendJson(res, 413, { code: 413, msg: "请求体过大" });
@@ -528,6 +539,9 @@ const server = http.createServer((req, res) => {
     const auth = await requireAdminAuth(req);
     if (!auth.ok) {
       return sendJson(res, 401, { code: 401, msg: "未登录" });
+    }
+    if (!redisReady) {
+      return sendJson(res, 503, { code: 503, msg: "Redis 未连接，无法从备份回滚" });
     }
     const bodyText = await readBody(req, maxContentLength);
     if (bodyText == null) {
@@ -1705,14 +1719,17 @@ function buildPendingScriptKey(scriptName) {
 }
 
 async function savePendingScript(scriptName, content) {
+  if (!redisReady) return;
   await redisClient.set(buildPendingScriptKey(scriptName), content, { PX: backupTtlMs });
 }
 
 async function loadPendingScript(scriptName) {
+  if (!redisReady) return "";
   return await redisClient.get(buildPendingScriptKey(scriptName));
 }
 
 async function clearPendingScript(scriptName) {
+  if (!redisReady) return;
   await redisClient.del(buildPendingScriptKey(scriptName));
 }
 
@@ -1722,12 +1739,14 @@ function buildScriptBackupKey(scriptName, version) {
 }
 
 async function saveScriptBackup(scriptName, version, content) {
+  if (!redisReady) return;
   if (!content) return;
   const key = buildScriptBackupKey(scriptName, version);
   await redisClient.set(key, content, { PX: backupTtlMs });
 }
 
 async function loadScriptBackup(scriptName, version) {
+  if (!redisReady) return "";
   if (!version) return "";
   const key = buildScriptBackupKey(scriptName, version);
   return (await redisClient.get(key)) || "";
@@ -1965,12 +1984,16 @@ async function buildScriptMeta(scriptName, content, options = {}) {
  */
 async function getScriptMeta(scriptName) {
   const metaKey = buildScriptMetaKey(scriptName);
-  const cached = await redisClient.get(metaKey);
-  if (cached) return safeJson(cached);
+  if (redisReady) {
+    const cached = await redisClient.get(metaKey);
+    if (cached) return safeJson(cached);
+  }
   const metaPath = buildScriptMetaPath(scriptName);
   const raw = await readTextIfExists(metaPath);
   if (raw) {
-    await redisClient.set(metaKey, raw);
+    if (redisReady) {
+      await redisClient.set(metaKey, raw);
+    }
     return safeJson(raw);
   }
   const legacyMeta = await readLegacyMeta(scriptName);
@@ -2009,10 +2032,11 @@ async function writeScriptMeta(scriptName, meta) {
   const metaPath = buildScriptMetaPath(scriptName);
   await fs.mkdir(path.dirname(metaPath), { recursive: true });
   const raw = JSON.stringify(meta);
-  await Promise.all([
-    redisClient.set(metaKey, raw),
-    fs.writeFile(metaPath, raw, "utf-8")
-  ]);
+  if (redisReady) {
+    await Promise.all([redisClient.set(metaKey, raw), fs.writeFile(metaPath, raw, "utf-8")]);
+  } else {
+    await fs.writeFile(metaPath, raw, "utf-8");
+  }
 }
 
 async function writeBackupScript(scriptName, content) {
@@ -2046,6 +2070,7 @@ function buildScriptFailureKey(scriptName) {
  * 检测某个脚本最近的失败次数是否达到阈值，判定是否需要触发自动回滚
  */
 async function shouldAutoRollback(scriptName) {
+  if (!redisReady) return false;
   const key = buildScriptFailureKey(scriptName);
   const now = Date.now();
   await redisClient.zRemRangeByScore(key, 0, now - rollbackFailureWindowMs);
@@ -2058,6 +2083,7 @@ async function shouldAutoRollback(scriptName) {
  * 依赖于元数据中记录的 parentVersion 链路和备份文件
  */
 async function tryAutoRollback(scriptName) {
+  if (!redisReady) return;
   const shouldRollback = await shouldAutoRollback(scriptName);
   if (!shouldRollback) return;
   const meta = await getScriptMeta(scriptName);
@@ -2083,6 +2109,7 @@ async function tryAutoRollback(scriptName) {
  * @param {string} failureType 失败分类 (validation, replay, run 等)
  */
 async function recordScriptFailure(scriptName, reason, failureType, schoolId, options = {}) {
+  if (!redisReady) return;
   const now = Date.now();
   const payload = {
     scriptName: sanitizeScriptName(scriptName),
@@ -2598,6 +2625,7 @@ function randomString(length) {
 }
 
 async function getScriptFailures(limit) {
+  if (!redisReady) return [];
   const safeLimit = Math.min(Math.max(limit, 1), 200);
   const items = await redisClient.lRange("script:failures", 0, safeLimit - 1);
   return items.map((item) => safeJson(item)).filter(Boolean);
@@ -3116,6 +3144,7 @@ function buildScriptHistoryKey(scriptName) {
 }
 
 async function pushScriptHistory(scriptName, entry) {
+  if (!redisReady) return;
   const safeName = sanitizeScriptName(scriptName);
   if (!safeName) return;
   const key = buildScriptHistoryKey(safeName);
@@ -3130,6 +3159,7 @@ async function pushScriptHistory(scriptName, entry) {
 }
 
 async function getScriptHistory(scriptName, limit) {
+  if (!redisReady) return [];
   const safeName = sanitizeScriptName(scriptName);
   if (!safeName) return [];
   const key = buildScriptHistoryKey(safeName);

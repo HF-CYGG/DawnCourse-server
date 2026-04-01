@@ -46,6 +46,58 @@ function ensureToastContainer() {
   return container;
 }
 
+function captureToastRects(container, ignoreElement) {
+  const map = new Map();
+  const children = Array.from(container.children);
+  for (const el of children) {
+    if (ignoreElement && el === ignoreElement) continue;
+    map.set(el, el.getBoundingClientRect());
+  }
+  return map;
+}
+
+function animateToastReflow(container, beforeRects) {
+  const children = Array.from(container.children);
+  for (const el of children) {
+    const first = beforeRects.get(el);
+    if (!first) continue;
+    const last = el.getBoundingClientRect();
+    const dy = first.top - last.top;
+    if (!dy) continue;
+    el.style.setProperty("--ty", `${dy}px`);
+  }
+  container.getBoundingClientRect();
+  for (const el of children) {
+    if (!beforeRects.has(el)) continue;
+    el.style.setProperty("--ty", "0px");
+  }
+}
+
+function dismissToast(toast, container) {
+  if (!toast || !toast.isConnected) return;
+  if (toast.dataset.dismissing === "1") return;
+  toast.dataset.dismissing = "1";
+  toast.classList.add("leaving");
+  const cleanup = () => {
+    if (!toast.isConnected) return;
+    const beforeRects = captureToastRects(container, toast);
+    toast.remove();
+    requestAnimationFrame(() => {
+      animateToastReflow(container, beforeRects);
+    });
+  };
+  const timer = setTimeout(cleanup, 400);
+  toast.addEventListener(
+    "transitionend",
+    (e) => {
+      if (e.target !== toast) return;
+      clearTimeout(timer);
+      cleanup();
+    },
+    { once: true }
+  );
+}
+
 function showToast(level, title, message) {
   const container = ensureToastContainer();
   const toast = document.createElement("div");
@@ -61,11 +113,16 @@ function showToast(level, title, message) {
   `;
   const closeBtn = toast.querySelector(".toast-close");
   closeBtn.addEventListener("click", () => {
-    toast.remove();
+    dismissToast(toast, container);
   });
-  container.appendChild(toast);
+  const beforeRects = captureToastRects(container);
+  container.prepend(toast);
+  animateToastReflow(container, beforeRects);
+  requestAnimationFrame(() => {
+    toast.classList.add("show");
+  });
   setTimeout(() => {
-    toast.remove();
+    dismissToast(toast, container);
   }, level === "error" ? 15000 : 8000);
 }
 

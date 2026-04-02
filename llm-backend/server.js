@@ -116,6 +116,7 @@ const parseMaxAttempts = Math.max(1, Number(process.env.PARSE_MAX_ATTEMPTS || 3)
 const rollbackFailureWindowMs = Number(process.env.ROLLBACK_FAILURE_WINDOW_MS || 30 * 60 * 1000);
 const rollbackFailureThreshold = Number(process.env.ROLLBACK_FAILURE_THRESHOLD || 3);
 const backupTtlMs = Number(process.env.BACKUP_TTL_MS || 7 * 24 * 60 * 60 * 1000);
+const pendingParseRetryMs = Number(process.env.PENDING_PARSE_RETRY_MS || 15000);
 const backpressurePendingThreshold = Number(process.env.BACKPRESSURE_PENDING_THRESHOLD || 20);
 const backpressureMergeWindowMs = Number(
   process.env.BACKPRESSURE_MERGE_WINDOW_MS || Math.max(mergeWindowMs, 20 * 60 * 1000)
@@ -149,6 +150,7 @@ let schoolAliasCache = {
 let adminLocalCredentials = null;
 const adminLocalSessions = new Map();
 let usageRefreshTimer = null;
+let pendingParseTimer = null;
 const canarySchoolSet = parseCommaSet(canarySchoolsRaw);
 const offlineReplayDataset = parseOfflineReplayDataset(offlineReplayDatasetJson);
 
@@ -156,6 +158,8 @@ const adminLogBufferLimit = Number(process.env.ADMIN_LOG_BUFFER_LIMIT || 300);
 const adminLogBuffer = [];
 const adminEventClients = new Set();
 const scriptHistoryLimit = Number(process.env.SCRIPT_HISTORY_LIMIT || 200);
+const scriptBackupDir = process.env.SCRIPT_BACKUP_DIR || path.join(scriptOutputDir, "backup_versions");
+const scriptFeedbackErrorLimit = Number(process.env.SCRIPT_FEEDBACK_ERROR_LIMIT || 300);
 const nativeConsole = {
   log: console.log.bind(console),
   warn: console.warn.bind(console),
@@ -304,6 +308,9 @@ await ensureStorageLayout();
 if (usageEnabled && !adminLocalMode) {
   scheduleUsageRefresh();
 }
+if (redisReady) {
+  schedulePendingParseProcessing();
+}
 
 // ---------------------------------------------------------------------------
 // HTTP 服务入口
@@ -371,6 +378,31 @@ const server = http.createServer((req, res) => {
       return sendJson(res, 404, { code: 404, msg: "meta 不存在" });
     }
     return sendJson(res, 200, { code: 200, data: meta });
+  }
+  if (req.method === "POST" && url.pathname === "/api/v1/script_feedback") {
+    const bodyText = await readBody(req, maxContentLength);
+    if (bodyText == null) {
+      return sendJson(res, 413, { code: 413, msg: "请求体过大" });
+    }
+    const body = safeJson(bodyText) || {};
+    const scriptName = (body?.scriptName || body?.script_name || "").toString();
+    const scriptVersion = Number(body?.scriptVersion || body?.script_version || 0);
+    const success = body?.success === true;
+    const category = (body?.category || "").toString();
+    const errorMessage = (body?.errorMessage || body?.error_message || "").toString();
+    const sourceUrl = (body?.sourceUrl || body?.source_url || "").toString();
+    if (!scriptName) {
+      return sendJson(res, 400, { code: 400, msg: "缺少 scriptName" });
+    }
+    await recordScriptParseFeedback({
+      scriptName,
+      scriptVersion,
+      success,
+      category,
+      errorMessage,
+      sourceUrl
+    });
+    return sendJson(res, 200, { code: 200, msg: "ok" });
   }
   if (req.method === "GET" && url.pathname === "/metrics") {
     const text = await buildPrometheusMetrics();
@@ -709,6 +741,7 @@ const server = http.createServer((req, res) => {
     try {
       await redisClient.set("admin:llm_config", JSON.stringify(conf));
       applyDynamicConfig(conf);
+      schedulePendingParseProcessing();
       return sendJson(res, 200, { code: 200, msg: "保存成功" });
     } catch (e) {
       return sendJson(res, 500, { code: 500, msg: "保存失败: " + e.message });
@@ -734,6 +767,7 @@ const server = http.createServer((req, res) => {
     const schoolIdInput = (body?.schoolId || body?.school_id || "").toString();
     const schoolNameInput = (body?.schoolName || body?.school_name || "").toString();
     const schoolSystemTypeInput = (body?.schoolSystemType || body?.systemType || "").toString();
+    const sourceUrl = (body?.sourceUrl || body?.source_url || "").toString().trim();
     const scriptName = (body?.scriptName || body?.script_name || "").toString();
     const clientVersion = (body?.clientVersion || body?.client_version || "").toString();
     const userConsent = body?.userConsent === true || body?.consent === true;
@@ -748,13 +782,6 @@ const server = http.createServer((req, res) => {
     // Redis 是队列、幂等、速率限制与指标统计的基础依赖；未连接时直接阻断，避免请求半路报错
     if (!redisReady) {
       return sendJson(res, 503, { code: 503, msg: "服务端 Redis 未连接，请稍后再试" });
-    }
-    // 未配置密钥时阻断请求
-    if (!apiKey && provider !== "gemini") {
-      return sendJson(res, 500, { code: 500, msg: "服务端未配置 API Key" });
-    }
-    if (!apiKey && provider === "gemini") {
-      return sendJson(res, 500, { code: 500, msg: "服务端未配置 Gemini API Key" });
     }
     const safeContent = sanitizeContent(content);
     const inferredSchoolName =
@@ -790,8 +817,9 @@ const server = http.createServer((req, res) => {
       }
     }
     const schoolSystemType = resolveSchoolSystemType(safeContent, schoolSystemTypeInput);
+    const candidateUrls = extractCandidateUrls(content, safeContent, sourceUrl);
     if (schoolId) {
-      await saveSchoolInfo(schoolId, schoolName, schoolSystemType);
+      await saveSchoolInfo(schoolId, schoolName, schoolSystemType, candidateUrls);
     }
     // 生成任务并进入异步处理
     const taskId = crypto.randomUUID();
@@ -801,28 +829,44 @@ const server = http.createServer((req, res) => {
       createdAt: Date.now(),
       schoolId,
       schoolName,
-      schoolSystemType
+      schoolSystemType,
+      sourceUrl
     });
-    runTask(taskId, safeContent, schoolId).catch(async () => {
-      await saveTask(taskId, {
-        status: "FAILED",
-        result: null,
-        createdAt: Date.now(),
+    if (isParseProviderReady()) {
+      runTask(taskId, safeContent, schoolId).catch(async () => {
+        await saveTask(taskId, {
+          status: "FAILED",
+          result: null,
+          createdAt: Date.now(),
+          schoolId,
+          schoolName,
+          schoolSystemType,
+          sourceUrl
+        });
+      });
+    } else {
+      await enqueuePendingParseTask({
+        taskId,
+        content: safeContent,
         schoolId,
         schoolName,
-        schoolSystemType
+        schoolSystemType,
+        sourceUrl
       });
-    });
+      schedulePendingParseProcessing();
+    }
     if (schoolId) {
       await enqueueSchoolSubmission(schoolId, safeContent, scriptName, {
         schoolName,
-        schoolSystemType
+        schoolSystemType,
+        sourceUrl,
+        candidateUrls
       });
     }
     await redisClient.set(idempotentKey, taskId, { PX: idempotentTtlMs });
     return sendJson(res, 200, {
       code: 200,
-      msg: "ok",
+      msg: isParseProviderReady() ? "ok" : "accepted_pending_model_key",
       taskId,
       schoolId,
       schoolName,
@@ -892,7 +936,9 @@ async function enqueueSchoolSubmission(schoolId, content, scriptName, schoolInfo
     createdAt: now,
     hash: contentHash,
     schoolName: schoolInfo?.schoolName || "",
-    schoolSystemType: schoolInfo?.schoolSystemType || "unknown"
+    schoolSystemType: schoolInfo?.schoolSystemType || "unknown",
+    sourceUrl: schoolInfo?.sourceUrl || "",
+    candidateUrls: Array.isArray(schoolInfo?.candidateUrls) ? schoolInfo.candidateUrls.slice(0, 12) : []
   };
   const queueKey = buildQueueKey(schoolId);
   try {
@@ -906,6 +952,59 @@ async function enqueueSchoolSubmission(schoolId, content, scriptName, schoolInfo
     console.error("enqueue error:", error);
   }
   scheduleSchoolProcessing(schoolId);
+}
+
+function isParseProviderReady() {
+  if (provider === "gemini") {
+    return Boolean(apiKey);
+  }
+  return Boolean(apiKey);
+}
+
+function buildPendingParseKey() {
+  return "parse:pending";
+}
+
+async function enqueuePendingParseTask(payload) {
+  if (!redisReady) return;
+  await redisClient.rPush(buildPendingParseKey(), JSON.stringify(payload || {}));
+  await redisClient.lTrim(buildPendingParseKey(), -1000, -1);
+}
+
+function schedulePendingParseProcessing() {
+  if (!redisReady) return;
+  if (pendingParseTimer) return;
+  const run = async () => {
+    if (!isParseProviderReady()) return;
+    let processed = 0;
+    while (processed < 20) {
+      const raw = await redisClient.lPop(buildPendingParseKey());
+      if (!raw) break;
+      const item = safeJson(raw) || {};
+      const taskId = (item?.taskId || "").toString();
+      const content = (item?.content || "").toString();
+      const schoolId = (item?.schoolId || "").toString();
+      if (!taskId || !content) {
+        processed += 1;
+        continue;
+      }
+      await runTask(taskId, content, schoolId).catch(async () => {
+        const existing = (await getTask(taskId)) || {};
+        await saveTask(taskId, {
+          ...existing,
+          status: "FAILED",
+          result: null,
+          reason: "pending_parse_run_failed",
+          createdAt: existing.createdAt || Date.now()
+        });
+      });
+      processed += 1;
+    }
+  };
+  pendingParseTimer = setInterval(() => {
+    run().catch(() => {});
+  }, pendingParseRetryMs);
+  run().catch(() => {});
 }
 
 /**
@@ -1749,6 +1848,7 @@ async function findLegacyMetaPath(scriptName, legacyScriptPath) {
  */
 async function ensureStorageLayout() {
   await fs.mkdir(scriptOutputDir, { recursive: true });
+  await fs.mkdir(scriptBackupDir, { recursive: true });
   await fs.mkdir(path.dirname(schoolMetricsFile), { recursive: true });
 }
 
@@ -1899,17 +1999,22 @@ function buildScriptBackupKey(scriptName, version) {
 }
 
 async function saveScriptBackup(scriptName, version, content) {
-  if (!redisReady) return;
   if (!content) return;
-  const key = buildScriptBackupKey(scriptName, version);
-  await redisClient.set(key, content, { PX: backupTtlMs });
+  if (redisReady) {
+    const key = buildScriptBackupKey(scriptName, version);
+    await redisClient.set(key, content, { PX: backupTtlMs });
+  }
+  await writeBackupScript(scriptName, version, content);
 }
 
 async function loadScriptBackup(scriptName, version) {
-  if (!redisReady) return "";
   if (!version) return "";
-  const key = buildScriptBackupKey(scriptName, version);
-  return (await redisClient.get(key)) || "";
+  if (redisReady) {
+    const key = buildScriptBackupKey(scriptName, version);
+    const cached = (await redisClient.get(key)) || "";
+    if (cached) return cached;
+  }
+  return await readBackupScript(scriptName, version);
 }
 
 /**
@@ -2082,7 +2187,6 @@ async function applyScriptUpdate(scriptName, content, previousContent, options =
     if (previousContent) {
       const previousVersion = options.previousMeta?.version || 0;
       await saveScriptBackup(scriptName, previousVersion, previousContent);
-      await writeBackupScript(scriptName, previousContent);
     }
     await fs.writeFile(fullPath, content, "utf-8");
     const meta = await buildScriptMeta(scriptName, content, {
@@ -2238,13 +2342,22 @@ async function writeScriptMeta(scriptName, meta) {
   }
 }
 
-async function writeBackupScript(scriptName, content) {
+async function writeBackupScript(scriptName, version, content) {
   const baseName = sanitizeScriptName(scriptName).replace(/\.js$/i, "");
-  const backupName = `${baseName}.bak.${Date.now()}.js`;
-  const fullPath = path.join(scriptOutputDir, backupName);
+  const resolvedVersion = Number(version || 0);
+  const backupName = resolvedVersion > 0 ? `${baseName}.v${resolvedVersion}.js` : `${baseName}.v0.js`;
+  const fullPath = path.join(scriptBackupDir, backupName);
   await fs.mkdir(path.dirname(fullPath), { recursive: true });
   await fs.writeFile(fullPath, content, "utf-8");
   return fullPath;
+}
+
+async function readBackupScript(scriptName, version) {
+  const baseName = sanitizeScriptName(scriptName).replace(/\.js$/i, "");
+  const resolvedVersion = Number(version || 0);
+  if (resolvedVersion <= 0) return "";
+  const fullPath = path.join(scriptBackupDir, `${baseName}.v${resolvedVersion}.js`);
+  return (await readTextIfExists(fullPath)) || "";
 }
 
 function signScript(content) {
@@ -2340,6 +2453,86 @@ async function recordScriptFailure(scriptName, reason, failureType, schoolId, op
   if (options.autoRollbackEligible !== false) {
     await tryAutoRollback(scriptName);
   }
+}
+
+function buildScriptFeedbackKey(scriptName, scriptVersion) {
+  const safeScriptName = sanitizeScriptName(scriptName);
+  const version = Number(scriptVersion || 0);
+  return `script:feedback:${safeScriptName}:v${version}`;
+}
+
+function buildScriptFeedbackErrorListKey(scriptName) {
+  const safeScriptName = sanitizeScriptName(scriptName);
+  return `script:feedback:errors:${safeScriptName}`;
+}
+
+async function recordScriptParseFeedback(payload) {
+  if (!redisReady) return;
+  const scriptName = sanitizeScriptName(payload?.scriptName || "");
+  if (!scriptName) return;
+  const scriptVersion = Number(payload?.scriptVersion || 0);
+  const success = payload?.success === true;
+  const category = (payload?.category || "").toString();
+  const errorMessage = (payload?.errorMessage || "").toString();
+  const sourceUrl = (payload?.sourceUrl || "").toString();
+  const now = Date.now();
+  const key = buildScriptFeedbackKey(scriptName, scriptVersion);
+  await redisClient.sAdd("script:feedback:scripts", scriptName);
+  await redisClient.hSet(key, {
+    scriptName,
+    scriptVersion,
+    category,
+    updatedAt: now,
+    lastSourceUrl: sourceUrl
+  });
+  await redisClient.hIncrBy(key, success ? "successCount" : "failureCount", 1);
+  if (!success && errorMessage) {
+    const errorPayload = JSON.stringify({
+      scriptName,
+      scriptVersion,
+      category,
+      errorMessage,
+      sourceUrl,
+      createdAt: now
+    });
+    const errorKey = buildScriptFeedbackErrorListKey(scriptName);
+    await redisClient.lPush(errorKey, errorPayload);
+    await redisClient.lTrim(errorKey, 0, Math.max(0, scriptFeedbackErrorLimit - 1));
+  }
+}
+
+async function getScriptFeedbackSummary() {
+  if (!redisReady) return {};
+  const scripts = await redisClient.sMembers("script:feedback:scripts");
+  const summary = {};
+  for (const scriptNameRaw of scripts) {
+    const scriptName = sanitizeScriptName(scriptNameRaw);
+    const keys = await redisClient.keys(`script:feedback:${scriptName}:v*`);
+    const versions = [];
+    for (const key of keys) {
+      const item = await redisClient.hGetAll(key);
+      const successCount = Number(item.successCount || 0);
+      const failureCount = Number(item.failureCount || 0);
+      versions.push({
+        scriptVersion: Number(item.scriptVersion || 0),
+        category: item.category || "",
+        successCount,
+        failureCount,
+        totalCount: successCount + failureCount,
+        successRate:
+          successCount + failureCount > 0
+            ? Number((successCount / (successCount + failureCount)).toFixed(4))
+            : 0,
+        lastSourceUrl: item.lastSourceUrl || "",
+        updatedAt: Number(item.updatedAt || 0)
+      });
+    }
+    versions.sort((a, b) => b.scriptVersion - a.scriptVersion);
+    if (versions.length) {
+      summary[scriptName] = versions;
+    }
+  }
+  return summary;
 }
 
 async function recordMetric(type, latencyMs, cost) {
@@ -2627,6 +2820,7 @@ async function buildAdminDashboardData() {
       latestMetricsAt: 0,
       schoolInfoById: {},
       failureTypeStats: {},
+      scriptParseFeedback: {},
       modelUsage: {
         summary: {
           provider: summaryProvider,
@@ -2680,6 +2874,7 @@ async function buildAdminDashboardData() {
       latestMetricsAt,
       schoolInfoById: {},
       failureTypeStats: {},
+      scriptParseFeedback: {},
       modelUsage: {
         summary: usageSummary || {
           provider: summaryProvider,
@@ -2712,7 +2907,7 @@ async function buildAdminDashboardData() {
       }
     };
   }
-  const [metrics, schoolMetrics, failures, schoolIds, schoolInfoById, usageSummary, usageScript] =
+  const [metrics, schoolMetrics, failures, schoolIds, schoolInfoById, usageSummary, usageScript, scriptParseFeedback] =
     await Promise.all([
       getMetricsSnapshot(),
       getSchoolMetricsSnapshot(),
@@ -2720,7 +2915,8 @@ async function buildAdminDashboardData() {
       getKnownSchoolIds(),
       getSchoolInfoMap(),
       getUsageSnapshot("summary"),
-      getUsageSnapshot("script")
+      getUsageSnapshot("script"),
+      getScriptFeedbackSummary()
     ]);
   const schoolQueues = {};
   let totalQueueLength = 0;
@@ -2750,6 +2946,7 @@ async function buildAdminDashboardData() {
     latestMetricsAt,
     schoolInfoById,
     failureTypeStats,
+    scriptParseFeedback,
     modelUsage: {
       summary: usageSummary,
       script: usageScript
@@ -3156,6 +3353,43 @@ function extractSchoolNameFromContent(content) {
   return extractSchoolNameFromText(roughText);
 }
 
+function extractCandidateUrls(rawContent, sanitizedContent, sourceUrl) {
+  const text = `${rawContent || ""}\n${sanitizedContent || ""}\n${sourceUrl || ""}`;
+  const urlRegex = /https?:\/\/[^\s"'<>]+/gi;
+  const matches = text.match(urlRegex) || [];
+  const list = [];
+  if (sourceUrl) {
+    list.push(sourceUrl);
+  }
+  for (const item of matches) {
+    const value = (item || "").trim();
+    if (!value) continue;
+    list.push(value);
+  }
+  return mergeDistinctUrls([], list).slice(0, 12);
+}
+
+function mergeDistinctUrls(existing, incoming) {
+  const map = new Map();
+  for (const raw of [...(existing || []), ...(incoming || [])]) {
+    const text = (raw || "").toString().trim();
+    if (!text) continue;
+    let parsed = null;
+    try {
+      parsed = new URL(text);
+    } catch {
+      continue;
+    }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") continue;
+    parsed.hash = "";
+    const key = parsed.toString();
+    if (!map.has(key)) {
+      map.set(key, key);
+    }
+  }
+  return Array.from(map.values());
+}
+
 function extractSchoolNameFromText(text) {
   const value = (text || "").toString().replace(/\s+/g, "");
   if (!value) return "";
@@ -3370,17 +3604,21 @@ async function resolveSchoolIdByName(schoolIdInput, schoolNameInput) {
   return normalizedFull;
 }
 
-async function saveSchoolInfo(schoolId, schoolName, schoolSystemType) {
+async function saveSchoolInfo(schoolId, schoolName, schoolSystemType, urls = []) {
   // 维护学校基础信息，便于面板展示与统计
   if (!schoolId) return;
   const key = "school:info";
   const existingRaw = await redisClient.hGet(key, schoolId);
   const existing = existingRaw ? safeJson(existingRaw) : null;
   const resolvedSchoolName = resolveBestSchoolName(existing?.schoolName, schoolName);
+  const mergedUrls = mergeDistinctUrls(existing?.urls, urls).slice(0, 20);
+  const primaryUrl = mergedUrls[0] || "";
   const payload = {
     schoolId,
     schoolName: resolvedSchoolName,
     schoolSystemType: schoolSystemType || existing?.schoolSystemType || "unknown",
+    primaryUrl,
+    urls: mergedUrls,
     updatedAt: Date.now()
   };
   await redisClient.hSet(key, schoolId, JSON.stringify(payload));
@@ -3397,6 +3635,8 @@ async function getSchoolInfoMap() {
       schoolId,
       schoolName: info.schoolName || "",
       schoolSystemType: normalizeSchoolSystemType(info.schoolSystemType) || "unknown",
+      primaryUrl: info.primaryUrl || "",
+      urls: Array.isArray(info.urls) ? info.urls : [],
       updatedAt: Number(info.updatedAt || 0)
     };
   }

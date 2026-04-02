@@ -823,16 +823,18 @@ const server = http.createServer((req, res) => {
     }
     // 生成任务并进入异步处理
     const taskId = crypto.randomUUID();
+    const parseProviderReady = isParseProviderReady();
     await saveTask(taskId, {
-      status: "PROCESSING",
+      status: parseProviderReady ? "PROCESSING" : "PENDING",
       result: null,
       createdAt: Date.now(),
+      pendingReason: parseProviderReady ? "" : "provider_not_ready",
       schoolId,
       schoolName,
       schoolSystemType,
       sourceUrl
     });
-    if (isParseProviderReady()) {
+    if (parseProviderReady) {
       runTask(taskId, safeContent, schoolId).catch(async () => {
         await saveTask(taskId, {
           status: "FAILED",
@@ -866,11 +868,12 @@ const server = http.createServer((req, res) => {
     await redisClient.set(idempotentKey, taskId, { PX: idempotentTtlMs });
     return sendJson(res, 200, {
       code: 200,
-      msg: isParseProviderReady() ? "ok" : "accepted_pending_model_key",
+      msg: parseProviderReady ? "ok" : "accepted_pending_model_key",
       taskId,
       schoolId,
       schoolName,
-      schoolSystemType
+      schoolSystemType,
+      parseProviderReady
     });
   }
   // ---------------------------------------------------------------------------
@@ -891,6 +894,10 @@ const server = http.createServer((req, res) => {
       data: {
         status: task.status,
         result: task.result,
+        pendingReason: task.pendingReason || "",
+        queuedAt: Number(task.createdAt || 0),
+        startedAt: Number(task.startedAt || 0),
+        completedAt: Number(task.completedAt || 0),
         schoolId: task.schoolId || "",
         schoolName: task.schoolName || "",
         schoolSystemType: task.schoolSystemType || "unknown"
@@ -988,6 +995,14 @@ function schedulePendingParseProcessing() {
         processed += 1;
         continue;
       }
+      const existing = (await getTask(taskId)) || {};
+      await saveTask(taskId, {
+        ...existing,
+        status: "PROCESSING",
+        pendingReason: "",
+        startedAt: Date.now(),
+        createdAt: existing.createdAt || Date.now()
+      });
       await runTask(taskId, content, schoolId).catch(async () => {
         const existing = (await getTask(taskId)) || {};
         await saveTask(taskId, {
@@ -1284,10 +1299,14 @@ async function runTask(taskId, content, schoolId) {
   const latencyMs = Date.now() - startTime;
   const existing = await getTask(taskId);
   const createdAt = existing?.createdAt || Date.now();
+  const startedAt = existing?.startedAt || Date.now();
   const baseTask = {
     schoolId: existing?.schoolId || schoolId || "",
     schoolName: existing?.schoolName || "",
-    schoolSystemType: existing?.schoolSystemType || "unknown"
+    schoolSystemType: existing?.schoolSystemType || "unknown",
+    sourceUrl: existing?.sourceUrl || "",
+    startedAt,
+    pendingReason: ""
   };
   if (!resultText) {
     await saveTask(taskId, {
@@ -1295,6 +1314,7 @@ async function runTask(taskId, content, schoolId) {
       status: "FAILED",
       result: null,
       createdAt,
+      completedAt: Date.now(),
       attempts: parseResult?.attempts || 0,
       reason: parseResult?.reason || "模型输出不可解析"
     });
@@ -1309,6 +1329,7 @@ async function runTask(taskId, content, schoolId) {
     status: "SUCCESS",
     result: resultText,
     createdAt,
+    completedAt: Date.now(),
     attempts: parseResult?.attempts || 1,
     strategy: parseResult?.strategy || "standard"
   });
@@ -2466,6 +2487,11 @@ function buildScriptFeedbackErrorListKey(scriptName) {
   return `script:feedback:errors:${safeScriptName}`;
 }
 
+function buildScriptFeedbackVersionSetKey(scriptName) {
+  const safeScriptName = sanitizeScriptName(scriptName);
+  return `script:feedback:versions:${safeScriptName}`;
+}
+
 async function recordScriptParseFeedback(payload) {
   if (!redisReady) return;
   const scriptName = sanitizeScriptName(payload?.scriptName || "");
@@ -2477,7 +2503,10 @@ async function recordScriptParseFeedback(payload) {
   const sourceUrl = (payload?.sourceUrl || "").toString();
   const now = Date.now();
   const key = buildScriptFeedbackKey(scriptName, scriptVersion);
+  const versionSetKey = buildScriptFeedbackVersionSetKey(scriptName);
   await redisClient.sAdd("script:feedback:scripts", scriptName);
+  await redisClient.sAdd(versionSetKey, scriptVersion.toString());
+  await redisClient.expire(versionSetKey, Math.ceil(backupTtlMs / 1000));
   await redisClient.hSet(key, {
     scriptName,
     scriptVersion,
@@ -2507,10 +2536,14 @@ async function getScriptFeedbackSummary() {
   const summary = {};
   for (const scriptNameRaw of scripts) {
     const scriptName = sanitizeScriptName(scriptNameRaw);
-    const keys = await redisClient.keys(`script:feedback:${scriptName}:v*`);
     const versions = [];
-    for (const key of keys) {
+    const versionValues = await redisClient.sMembers(buildScriptFeedbackVersionSetKey(scriptName));
+    for (const versionRaw of versionValues) {
+      const version = Number(versionRaw || 0);
+      if (!Number.isFinite(version) || version < 0) continue;
+      const key = buildScriptFeedbackKey(scriptName, version);
       const item = await redisClient.hGetAll(key);
+      if (!item || Object.keys(item).length === 0) continue;
       const successCount = Number(item.successCount || 0);
       const failureCount = Number(item.failureCount || 0);
       versions.push({
@@ -2816,6 +2849,8 @@ async function buildAdminDashboardData() {
       metricsFile: "",
       schoolCount: 0,
       totalQueueLength: 0,
+      parsePendingQueueLength: 0,
+      parseProviderReady: false,
       failureCount: 0,
       latestMetricsAt: 0,
       schoolInfoById: {},
@@ -2870,6 +2905,8 @@ async function buildAdminDashboardData() {
       metricsFile: schoolMetricsFile,
       schoolCount: 0,
       totalQueueLength: 0,
+      parsePendingQueueLength: 0,
+      parseProviderReady: false,
       failureCount: 0,
       latestMetricsAt,
       schoolInfoById: {},
@@ -2920,6 +2957,7 @@ async function buildAdminDashboardData() {
     ]);
   const schoolQueues = {};
   let totalQueueLength = 0;
+  const parsePendingQueueLength = await redisClient.lLen(buildPendingParseKey());
   for (const schoolId of schoolIds) {
     const queueLength = await redisClient.lLen(buildQueueKey(schoolId));
     schoolQueues[schoolId] = queueLength;
@@ -2942,6 +2980,8 @@ async function buildAdminDashboardData() {
     metricsFile: schoolMetricsFile,
     schoolCount: schoolIds.length,
     totalQueueLength,
+    parsePendingQueueLength,
+    parseProviderReady: isParseProviderReady(),
     failureCount: failures.length,
     latestMetricsAt,
     schoolInfoById,

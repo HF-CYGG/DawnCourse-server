@@ -40,6 +40,8 @@ const runtimeLogContent = document.getElementById("runtimeLogContent");
 let currentData = null;
 let eventSource = null;
 let scriptsCache = null;
+const eventToastSeenMap = new Map();
+let lastEventStreamWarnAt = 0;
 let runtimeLogSnapshot = {
   source: "all",
   lines: [],
@@ -240,6 +242,25 @@ function closeAdminEvents() {
   eventSource = null;
 }
 
+function shouldToastEventLog(entry) {
+  const level = (entry?.level || "").toString();
+  if (level !== "error" && level !== "warning") return false;
+  const source = (entry?.detail?.source || "").toString();
+  if (source === "admin-api") return false;
+  const message = (entry?.message || "").toString();
+  const key = `${entry?.time || ""}|${level}|${source}|${message}`;
+  const now = Date.now();
+  const expireAt = eventToastSeenMap.get(key) || 0;
+  if (expireAt > now) return false;
+  eventToastSeenMap.set(key, now + 5 * 60 * 1000);
+  if (eventToastSeenMap.size > 200) {
+    for (const [k, v] of eventToastSeenMap.entries()) {
+      if (v <= now) eventToastSeenMap.delete(k);
+    }
+  }
+  return true;
+}
+
 function connectAdminEvents() {
   const token = getToken();
   if (!token) return;
@@ -250,6 +271,7 @@ function connectAdminEvents() {
       const entry = JSON.parse(event.data || "{}");
       const level = (entry.level || "").toString();
       const message = (entry.message || "").toString();
+      if (!shouldToastEventLog(entry)) return;
       if (level === "error") {
         showToast("error", "服务端错误", message);
       } else if (level === "warning") {
@@ -262,6 +284,9 @@ function connectAdminEvents() {
   eventSource.addEventListener("hello", () => {});
   eventSource.addEventListener("ping", () => {});
   eventSource.onerror = () => {
+    const now = Date.now();
+    if (now - lastEventStreamWarnAt < 15000) return;
+    lastEventStreamWarnAt = now;
     showToast("warning", "事件流断开", "将自动重连，若持续失败请检查服务端日志");
   };
 }

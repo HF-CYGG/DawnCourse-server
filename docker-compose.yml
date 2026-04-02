@@ -11,11 +11,14 @@ services:
     volumes:
       - parsers-data:/shared/parsers
       - parsers-data:/var/log/nginx
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./html:/usr/share/nginx/html:ro
+      - ./version.json:/usr/share/nginx/html/version.json:ro
     command:
       [
         "/bin/sh",
         "-c",
-        "mkdir -p /shared/parsers /var/log/nginx && touch /shared/parsers/llm-backend.log /var/log/nginx/nginx_access.log /var/log/nginx/nginx_error.log && echo '[log-bridge] app-server bridge started'; tail -n +1 -F /shared/parsers/llm-backend.log /var/log/nginx/nginx_access.log /var/log/nginx/nginx_error.log & exec nginx -g 'daemon off;'"
+        "mkdir -p /shared/parsers /var/log/nginx && touch /shared/parsers/llm-backend.log /var/log/nginx/nginx_access.log /var/log/nginx/nginx_error.log && echo '[log-bridge] app-server bridge started'; nginx -t; tail -n +1 -F /shared/parsers/llm-backend.log /var/log/nginx/nginx_access.log /var/log/nginx/nginx_error.log & exec nginx -g 'daemon off;'"
       ]
     depends_on:
       llm-backend:

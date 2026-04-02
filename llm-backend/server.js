@@ -313,12 +313,13 @@ try {
 } catch (e) {
   console.error("redis connect error:", e);
 }
-// 初始化管理后台账号密码，仅首次启动生成一次
-const adminCredentialInfo = await initAdminCredentials();
-if (adminCredentialInfo) {
-  console.log(
-    `admin credentials: username=${adminCredentialInfo.username} password=${adminCredentialInfo.password}`
-  );
+// 初始化管理后台账号密码，并在每次启动输出当前用户名（不输出密码）
+await initAdminCredentials();
+const adminCredentials = await getAdminCredentials();
+if (adminCredentials?.username) {
+  console.log(`admin username: ${adminCredentials.username}`);
+} else {
+  console.warn("admin username unavailable");
 }
 await ensureStorageLayout();
 if (usageEnabled && !adminLocalMode) {

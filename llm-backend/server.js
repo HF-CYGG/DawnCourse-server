@@ -162,11 +162,13 @@ const adminEventClients = new Set();
 const scriptHistoryLimit = Number(process.env.SCRIPT_HISTORY_LIMIT || 200);
 const scriptBackupDir = process.env.SCRIPT_BACKUP_DIR || path.join(scriptOutputDir, "backup_versions");
 const scriptFeedbackErrorLimit = Number(process.env.SCRIPT_FEEDBACK_ERROR_LIMIT || 300);
+const backendMirrorLogFile = (process.env.BACKEND_MIRROR_LOG_FILE || "").trim();
 const nativeConsole = {
   log: console.log.bind(console),
   warn: console.warn.bind(console),
   error: console.error.bind(console)
 };
+let mirrorLogWriteQueue = Promise.resolve();
 
 function safeToLogString(value) {
   if (value == null) return "";
@@ -204,12 +206,24 @@ function pushAdminLog(level, message, extra = {}) {
   return entry;
 }
 
+function appendMirrorLog(level, args) {
+  if (!backendMirrorLogFile) return;
+  const line = `[${new Date().toISOString()}] [${level}] ${args.map(safeToLogString).join(" ")}\n`;
+  mirrorLogWriteQueue = mirrorLogWriteQueue.then(() => fs.appendFile(backendMirrorLogFile, line)).catch(() => {});
+}
+
+console.log = (...args) => {
+  nativeConsole.log(...args);
+  appendMirrorLog("INFO", args);
+};
 console.error = (...args) => {
   nativeConsole.error(...args);
+  appendMirrorLog("ERROR", args);
   pushAdminLog("error", args.map(safeToLogString).join(" "), { source: "server", type: "console" });
 };
 console.warn = (...args) => {
   nativeConsole.warn(...args);
+  appendMirrorLog("WARN", args);
   pushAdminLog("warning", args.map(safeToLogString).join(" "), { source: "server", type: "console" });
 };
 

@@ -8,6 +8,12 @@ services:
     restart: ${RESTART_POLICY:-no}
     volumes:
       - parsers-data:/shared/parsers
+    command:
+      [
+        "/bin/sh",
+        "-lc",
+        "touch /shared/parsers/llm-backend.log && tail -n 0 -F /shared/parsers/llm-backend.log & exec nginx -g 'daemon off;'"
+      ]
     depends_on:
       llm-backend:
         condition: service_healthy
@@ -58,6 +64,7 @@ services:
       SCHOOL_METRICS_FILE: /shared/parsers/metrics/school_metrics.txt
       METRICS_FLUSH_MS: 5000
       ADMIN_SESSION_TTL_MS: 43200000
+      BACKEND_MIRROR_LOG_FILE: /shared/parsers/llm-backend.log
     volumes:
       - parsers-data:/shared/parsers
     restart: ${RESTART_POLICY:-no}

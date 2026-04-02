@@ -12,7 +12,7 @@ services:
       [
         "/bin/sh",
         "-lc",
-        "touch /shared/parsers/llm-backend.log && tail -n 0 -F /shared/parsers/llm-backend.log & exec nginx -g 'daemon off;'"
+        "touch /shared/parsers/llm-backend.log && tail -n +1 -F /shared/parsers/llm-backend.log & exec nginx -g 'daemon off;'"
       ]
     depends_on:
       llm-backend:

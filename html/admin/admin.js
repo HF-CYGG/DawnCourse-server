@@ -33,11 +33,18 @@ const userStats = document.getElementById("userStats");
 const runtimeLogSource = document.getElementById("runtimeLogSource");
 const runtimeLogLimit = document.getElementById("runtimeLogLimit");
 const runtimeLogRefreshBtn = document.getElementById("runtimeLogRefreshBtn");
+const runtimeLogDownloadBtn = document.getElementById("runtimeLogDownloadBtn");
+const runtimeLogAutoScroll = document.getElementById("runtimeLogAutoScroll");
 const runtimeLogMeta = document.getElementById("runtimeLogMeta");
 const runtimeLogContent = document.getElementById("runtimeLogContent");
 let currentData = null;
 let eventSource = null;
 let scriptsCache = null;
+let runtimeLogSnapshot = {
+  source: "all",
+  lines: [],
+  loadedAt: 0
+};
 let scriptModalState = {
   scriptName: "",
   rollbackTargetVersion: 0,
@@ -914,6 +921,17 @@ function escapeHtml(value) {
     .replace(/'/g, "&#39;");
 }
 
+function askOperationConfirm(title, detail, emphasizeText) {
+  const headline = (title || "").trim();
+  const message = (detail || "").trim();
+  const emphasize = (emphasizeText || "").trim();
+  if (!emphasize) {
+    return window.confirm(`${headline}\n${message}`.trim());
+  }
+  const typed = window.prompt(`${headline}\n${message}\n请输入 ${emphasize} 以确认：`, "");
+  return (typed || "").trim() === emphasize;
+}
+
 function renderUsersTable(list) {
   if (!userTableBody) return;
   const items = Array.isArray(list) ? list : [];
@@ -926,7 +944,7 @@ function renderUsersTable(list) {
     `;
   }
   if (!items.length) {
-    userTableBody.innerHTML = `<tr><td colspan="6" class="muted">暂无用户</td></tr>`;
+    userTableBody.innerHTML = `<tr><td colspan="7" class="muted">暂无用户</td></tr>`;
     return;
   }
   userTableBody.innerHTML = items
@@ -958,6 +976,11 @@ function renderUsersTable(list) {
             )}">修改密码</button>
           </div>
         </td>
+        <td>
+          <button class="btn danger" type="button" data-action="delete-user" data-username="${encodeURIComponent(
+            username
+          )}">删除账号</button>
+        </td>
       </tr>
       `;
     })
@@ -984,6 +1007,15 @@ async function createUser() {
   const password = (newUserPasswordInput?.value || "").trim();
   if (!username || !password) {
     showToast("warning", "参数不足", "请输入账号和密码");
+    return;
+  }
+  const confirmed = askOperationConfirm(
+    "确认新增账号",
+    `将创建账号：${username}`,
+    "确认新增"
+  );
+  if (!confirmed) {
+    showToast("warning", "已取消", "未执行新增操作");
     return;
   }
   const result = await postWithAuth("/api/v1/admin/users", { username, password });
@@ -1020,7 +1052,15 @@ async function loadRuntimeLogs() {
         files.backend || "-"
       } | nginx_access 文件：${files.nginx_access || "-"} | nginx_error 文件：${files.nginx_error || "-"}${missingText}`;
     }
+    runtimeLogSnapshot = {
+      source,
+      lines,
+      loadedAt: Date.now()
+    };
     runtimeLogContent.textContent = lines.length ? lines.join("\n") : "暂无日志";
+    if (runtimeLogAutoScroll?.checked) {
+      runtimeLogContent.scrollTop = runtimeLogContent.scrollHeight;
+    }
   } catch (e) {
     if (e?.message === "unauthorized") {
       clearToken();
@@ -1473,6 +1513,15 @@ if (userTableBody) {
           showToast("warning", "参数不足", "请输入新账号名");
           return;
         }
+        const confirmed = askOperationConfirm(
+          "确认修改账号名",
+          `将账号 ${username} 修改为 ${newUsername}`,
+          "确认改名"
+        );
+        if (!confirmed) {
+          showToast("warning", "已取消", "未执行改名操作");
+          return;
+        }
         const result = await postWithAuth("/api/v1/admin/users/rename", { oldUsername: username, newUsername });
         if (result.code !== 200) {
           showToast("error", "修改失败", result.msg || "未知错误");
@@ -1491,6 +1540,15 @@ if (userTableBody) {
           showToast("warning", "参数不足", "请输入新密码");
           return;
         }
+        const confirmed = askOperationConfirm(
+          "确认重置密码",
+          `将更新账号 ${username} 的登录密码`,
+          "确认改密"
+        );
+        if (!confirmed) {
+          showToast("warning", "已取消", "未执行改密操作");
+          return;
+        }
         const result = await postWithAuth("/api/v1/admin/users/password", { username, newPassword });
         if (result.code !== 200) {
           showToast("error", "修改失败", result.msg || "未知错误");
@@ -1498,6 +1556,25 @@ if (userTableBody) {
         }
         if (input) input.value = "";
         showToast("info", "修改成功", `账号 ${username} 密码已更新`);
+        await loadUsersPage();
+        return;
+      }
+      if (action === "delete-user") {
+        const confirmed = askOperationConfirm(
+          "确认删除账号",
+          `将删除账号 ${username}，其登录会话会被立即失效`,
+          "确认删除"
+        );
+        if (!confirmed) {
+          showToast("warning", "已取消", "未执行删除操作");
+          return;
+        }
+        const result = await postWithAuth("/api/v1/admin/users/delete", { username });
+        if (result.code !== 200) {
+          showToast("error", "删除失败", result.msg || "未知错误");
+          return;
+        }
+        showToast("info", "删除成功", `账号 ${username} 已删除`);
         await loadUsersPage();
       }
     } catch (err) {
@@ -1514,6 +1591,31 @@ if (userTableBody) {
 if (runtimeLogRefreshBtn) {
   runtimeLogRefreshBtn.addEventListener("click", async () => {
     await loadRuntimeLogs();
+  });
+}
+if (runtimeLogDownloadBtn) {
+  runtimeLogDownloadBtn.addEventListener("click", async () => {
+    if (!runtimeLogSnapshot.lines.length) {
+      await loadRuntimeLogs();
+    }
+    const lines = runtimeLogSnapshot.lines;
+    if (!lines.length) {
+      showToast("warning", "暂无可下载日志", "请先刷新日志");
+      return;
+    }
+    const source = runtimeLogSnapshot.source || "all";
+    const timestamp = new Date(runtimeLogSnapshot.loadedAt || Date.now()).toISOString().replace(/[:.]/g, "-");
+    const text = lines.join("\n");
+    const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `runtime-${source}-${timestamp}.log`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+    showToast("info", "下载开始", `已导出 ${lines.length} 行日志`);
   });
 }
 if (runtimeLogSource) {

@@ -216,6 +216,25 @@ header .meta {
   border: 1px solid var(--border);
   color: var(--text);
 }
+.btn.danger {
+  background: rgba(255, 107, 107, 0.9);
+  color: #fff;
+}
+.btn.danger:hover {
+  background: rgba(255, 107, 107, 1);
+}
+.checkbox-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+  user-select: none;
+}
+.checkbox-inline input {
+  width: 14px;
+  height: 14px;
+}
 .full-width {
   width: 100%;
 }
@@ -789,6 +808,7 @@ input:checked + .slider:before {
 }
 .user-table .actions {
   gap: 8px;
+  flex-wrap: wrap;
 }
 .user-table .btn {
   min-width: 84px;

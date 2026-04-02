@@ -581,6 +581,34 @@ const server = http.createServer((req, res) => {
     });
     return sendJson(res, 200, { code: 200, msg: "ok" });
   }
+  if (req.method === "POST" && url.pathname === "/api/v1/admin/users/delete") {
+    const auth = await requireAdminAuth(req);
+    if (!auth.ok) {
+      return sendJson(res, 401, { code: 401, msg: "未登录" });
+    }
+    const bodyText = await readBody(req, maxContentLength);
+    if (bodyText == null) {
+      return sendJson(res, 413, { code: 413, msg: "请求体过大" });
+    }
+    const body = safeJson(bodyText) || {};
+    const username = (body.username || "").toString().trim();
+    if (!username) {
+      return sendJson(res, 400, { code: 400, msg: "账号不能为空" });
+    }
+    if (username === auth.username) {
+      return sendJson(res, 400, { code: 400, msg: "不允许删除当前登录账号" });
+    }
+    const result = await deleteAdminUser(username);
+    if (!result.ok) {
+      return sendJson(res, result.code || 400, { code: result.code || 400, msg: result.msg || "删除失败" });
+    }
+    pushAdminLog("warning", "删除管理账号", {
+      source: "admin-api",
+      operator: auth.username,
+      username
+    });
+    return sendJson(res, 200, { code: 200, msg: "ok" });
+  }
   if (req.method === "GET" && url.pathname === "/api/v1/admin/runtime_logs") {
     const auth = await requireAdminAuth(req);
     if (!auth.ok) {
@@ -3288,6 +3316,22 @@ async function updateAdminUserPassword(usernameInput, passwordInput) {
   return { ok: true };
 }
 
+async function deleteAdminUser(usernameInput) {
+  const username = normalizeAdminUsername(usernameInput);
+  if (!username) return { ok: false, code: 400, msg: "账号不能为空" };
+  const users = await getAdminUsers();
+  if (users.length <= 1) {
+    return { ok: false, code: 400, msg: "至少保留一个账号" };
+  }
+  const nextUsers = users.filter((item) => item.username !== username);
+  if (nextUsers.length === users.length) {
+    return { ok: false, code: 404, msg: "账号不存在" };
+  }
+  await saveAdminUsers(nextUsers);
+  await revokeAdminSessionsByUsername(username);
+  return { ok: true };
+}
+
 async function touchAdminUserLogin(usernameInput) {
   const username = normalizeAdminUsername(usernameInput);
   if (!username) return;
@@ -3318,6 +3362,26 @@ async function remapAdminSessions(oldUsername, newUsername) {
       } else {
         await redisClient.set(key, newUsername);
       }
+    }
+  }
+}
+
+async function revokeAdminSessionsByUsername(usernameInput) {
+  const username = normalizeAdminUsername(usernameInput);
+  if (!username) return;
+  if (adminLocalMode) {
+    for (const [token, session] of adminLocalSessions.entries()) {
+      if (session?.username === username) {
+        adminLocalSessions.delete(token);
+      }
+    }
+    return;
+  }
+  const keys = await redisClient.keys(buildAdminSessionKey("*"));
+  for (const key of keys) {
+    const value = await redisClient.get(key);
+    if (value === username) {
+      await redisClient.del(key);
     }
   }
 }

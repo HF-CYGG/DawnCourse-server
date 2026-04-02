@@ -279,6 +279,7 @@
                     <th>最近登录</th>
                     <th>改账号名</th>
                     <th>改密码</th>
+                    <th>删除</th>
                   </tr>
                 </thead>
                 <tbody></tbody>
@@ -305,6 +306,11 @@
                 </div>
               </div>
               <div class="actions">
+                <label class="checkbox-inline">
+                  <input id="runtimeLogAutoScroll" type="checkbox" checked>
+                  自动滚动到最新
+                </label>
+                <button class="btn secondary" id="runtimeLogDownloadBtn" type="button">下载日志</button>
                 <button class="btn secondary" id="runtimeLogRefreshBtn" type="button">刷新日志</button>
               </div>
             </section>

@@ -1,5 +1,5 @@
 import http from "node:http";
-import { URL } from "node:url";
+import { URL, fileURLToPath } from "node:url";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -126,11 +126,13 @@ const issueClusterSimilarity = Number(process.env.ISSUE_CLUSTER_SIMILARITY || 0.
 // 管理后台会话有效期（默认 12 小时）
 const adminSessionTtlMs = Number(process.env.ADMIN_SESSION_TTL_MS || 12 * 60 * 60 * 1000);
 const adminLocalMode = process.env.ADMIN_LOCAL_MODE === "true";
+const currentFilePath = fileURLToPath(import.meta.url);
+const currentDirPath = path.dirname(currentFilePath);
 // 管理后台静态页面本地调试根目录
 // - ADMIN_WEB_ROOT：显式指定 server/html 的上级目录（内部会拼接 /admin）
 // - 未指定时：若开启 ADMIN_LOCAL_MODE，则默认使用仓库自带的 server/html，便于本地直接访问 /admin/
 const adminWebRootRaw = (process.env.ADMIN_WEB_ROOT || "").trim();
-const adminWebRoot = adminWebRootRaw || (adminLocalMode ? path.resolve(__dirname, "..", "html") : "");
+const adminWebRoot = adminWebRootRaw || (adminLocalMode ? path.resolve(currentDirPath, "..", "html") : "");
 const adminStaticDir = adminWebRoot ? path.resolve(adminWebRoot, "admin") : "";
 const adminIndexPath = adminWebRoot ? path.resolve(adminWebRoot, "admin", "index.html") : "";
 // 服务启动时间戳，用于面板展示启动时长
@@ -836,10 +838,13 @@ const server = http.createServer((req, res) => {
     });
     if (parseProviderReady) {
       runTask(taskId, safeContent, schoolId).catch(async () => {
+        const existing = (await getTask(taskId)) || {};
         await saveTask(taskId, {
+          ...existing,
           status: "FAILED",
           result: null,
-          createdAt: Date.now(),
+          createdAt: existing.createdAt || Date.now(),
+          completedAt: Date.now(),
           schoolId,
           schoolName,
           schoolSystemType,
@@ -2958,8 +2963,15 @@ async function buildAdminDashboardData() {
   const schoolQueues = {};
   let totalQueueLength = 0;
   const parsePendingQueueLength = await redisClient.lLen(buildPendingParseKey());
-  for (const schoolId of schoolIds) {
-    const queueLength = await redisClient.lLen(buildQueueKey(schoolId));
+  const queueLengths = await Promise.all(
+    schoolIds.map(async (schoolId) => {
+      const queueLength = await redisClient.lLen(buildQueueKey(schoolId));
+      return { schoolId, queueLength };
+    })
+  );
+  for (const item of queueLengths) {
+    const schoolId = item.schoolId;
+    const queueLength = item.queueLength;
     schoolQueues[schoolId] = queueLength;
     totalQueueLength += queueLength;
   }

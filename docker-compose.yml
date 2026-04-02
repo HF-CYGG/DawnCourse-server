@@ -28,6 +28,9 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+    networks:
+      dawn-net:
+        ipv4_address: 172.31.250.2
   llm-backend:
     # LLM 异步解析服务
     build: ./llm-backend
@@ -84,6 +87,9 @@ services:
       timeout: 5s
       retries: 8
       start_period: 20s
+    networks:
+      dawn-net:
+        ipv4_address: 172.31.250.3
   redis:
     image: redis:7-alpine
     restart: ${RESTART_POLICY:-no}
@@ -95,7 +101,17 @@ services:
       timeout: 5s
       retries: 10
       start_period: 5s
+    networks:
+      dawn-net:
+        ipv4_address: 172.31.250.4
 
 volumes:
   redis-data:
   parsers-data:
+
+networks:
+  dawn-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.250.0/24

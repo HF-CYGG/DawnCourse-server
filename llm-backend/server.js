@@ -149,7 +149,7 @@ let schoolAliasCache = {
   updatedAt: 0,
   map: new Map()
 };
-let adminLocalCredentials = null;
+const adminLocalUsers = new Map();
 const adminLocalSessions = new Map();
 let usageRefreshTimer = null;
 let pendingParseTimer = null;
@@ -163,6 +163,9 @@ const scriptHistoryLimit = Number(process.env.SCRIPT_HISTORY_LIMIT || 200);
 const scriptBackupDir = process.env.SCRIPT_BACKUP_DIR || path.join(scriptOutputDir, "backup_versions");
 const scriptFeedbackErrorLimit = Number(process.env.SCRIPT_FEEDBACK_ERROR_LIMIT || 300);
 const backendMirrorLogFile = (process.env.BACKEND_MIRROR_LOG_FILE || "").trim();
+const nginxAccessLogFile = (process.env.NGINX_ACCESS_LOG_FILE || "/shared/parsers/nginx_access.log").trim();
+const nginxErrorLogFile = (process.env.NGINX_ERROR_LOG_FILE || "/shared/parsers/nginx_error.log").trim();
+const runtimeLogReadBytes = Math.max(32 * 1024, Number(process.env.RUNTIME_LOG_READ_BYTES || 512 * 1024));
 const nativeConsole = {
   log: console.log.bind(console),
   warn: console.warn.bind(console),
@@ -313,11 +316,10 @@ try {
 } catch (e) {
   console.error("redis connect error:", e);
 }
-// 初始化管理后台账号密码，并在每次启动输出用户名与密码
-const adminCredentialInfo = await initAdminCredentials();
-if (adminCredentialInfo?.username && adminCredentialInfo?.password) {
+const adminBootstrapInfo = await initAdminUserStore();
+if (adminBootstrapInfo?.username && adminBootstrapInfo?.password) {
   console.log(
-    `admin credentials: username=${adminCredentialInfo.username} password=${adminCredentialInfo.password}`
+    `admin credentials: username=${adminBootstrapInfo.username} password=${adminBootstrapInfo.password}`
   );
 } else {
   console.warn("admin credentials unavailable");
@@ -445,6 +447,7 @@ const server = http.createServer((req, res) => {
       return sendJson(res, 401, { code: 401, msg: "账号或密码错误" });
     }
     const token = await createAdminSession(username);
+    await touchAdminUserLogin(username);
     return sendJson(res, 200, { code: 200, data: { token, username } });
   }
   // ---------------------------------------------------------------------------
@@ -505,6 +508,88 @@ const server = http.createServer((req, res) => {
     const limit = Math.max(1, Math.min(500, Number(url.searchParams.get("limit") || 200)));
     const list = adminLogBuffer.slice(-limit);
     return sendJson(res, 200, { code: 200, data: { list } });
+  }
+  if (req.method === "GET" && url.pathname === "/api/v1/admin/users") {
+    const auth = await requireAdminAuth(req);
+    if (!auth.ok) {
+      return sendJson(res, 401, { code: 401, msg: "未登录" });
+    }
+    const list = await listAdminUsers();
+    return sendJson(res, 200, { code: 200, data: { list } });
+  }
+  if (req.method === "POST" && url.pathname === "/api/v1/admin/users") {
+    const auth = await requireAdminAuth(req);
+    if (!auth.ok) {
+      return sendJson(res, 401, { code: 401, msg: "未登录" });
+    }
+    const bodyText = await readBody(req, maxContentLength);
+    if (bodyText == null) {
+      return sendJson(res, 413, { code: 413, msg: "请求体过大" });
+    }
+    const body = safeJson(bodyText) || {};
+    const result = await createAdminUser(body.username, body.password);
+    if (!result.ok) {
+      return sendJson(res, result.code || 400, { code: result.code || 400, msg: result.msg || "创建失败" });
+    }
+    pushAdminLog("info", "新增管理账号", {
+      source: "admin-api",
+      operator: auth.username,
+      username: (body.username || "").toString()
+    });
+    return sendJson(res, 200, { code: 200, msg: "ok" });
+  }
+  if (req.method === "POST" && url.pathname === "/api/v1/admin/users/rename") {
+    const auth = await requireAdminAuth(req);
+    if (!auth.ok) {
+      return sendJson(res, 401, { code: 401, msg: "未登录" });
+    }
+    const bodyText = await readBody(req, maxContentLength);
+    if (bodyText == null) {
+      return sendJson(res, 413, { code: 413, msg: "请求体过大" });
+    }
+    const body = safeJson(bodyText) || {};
+    const result = await renameAdminUser(body.oldUsername, body.newUsername);
+    if (!result.ok) {
+      return sendJson(res, result.code || 400, { code: result.code || 400, msg: result.msg || "修改失败" });
+    }
+    pushAdminLog("warning", "修改管理账号", {
+      source: "admin-api",
+      operator: auth.username,
+      oldUsername: (body.oldUsername || "").toString(),
+      newUsername: (body.newUsername || "").toString()
+    });
+    return sendJson(res, 200, { code: 200, msg: "ok" });
+  }
+  if (req.method === "POST" && url.pathname === "/api/v1/admin/users/password") {
+    const auth = await requireAdminAuth(req);
+    if (!auth.ok) {
+      return sendJson(res, 401, { code: 401, msg: "未登录" });
+    }
+    const bodyText = await readBody(req, maxContentLength);
+    if (bodyText == null) {
+      return sendJson(res, 413, { code: 413, msg: "请求体过大" });
+    }
+    const body = safeJson(bodyText) || {};
+    const result = await updateAdminUserPassword(body.username, body.newPassword);
+    if (!result.ok) {
+      return sendJson(res, result.code || 400, { code: result.code || 400, msg: result.msg || "修改失败" });
+    }
+    pushAdminLog("warning", "重置管理账号密码", {
+      source: "admin-api",
+      operator: auth.username,
+      username: (body.username || "").toString()
+    });
+    return sendJson(res, 200, { code: 200, msg: "ok" });
+  }
+  if (req.method === "GET" && url.pathname === "/api/v1/admin/runtime_logs") {
+    const auth = await requireAdminAuth(req);
+    if (!auth.ok) {
+      return sendJson(res, 401, { code: 401, msg: "未登录" });
+    }
+    const source = (url.searchParams.get("source") || "all").toString();
+    const limit = Math.max(50, Math.min(2000, Number(url.searchParams.get("limit") || 400)));
+    const data = await getRuntimeLogLines(source, limit);
+    return sendJson(res, 200, { code: 200, data });
   }
   if (req.method === "POST" && url.pathname === "/api/v1/admin/client_error") {
     const auth = await requireAdminAuth(req);
@@ -3029,60 +3114,221 @@ function hashPassword(password, salt) {
   return hashText(`${salt}:${password}`);
 }
 
-/**
- * 初始化管理后台账号密码，每次启动都会刷新密码并写入 Redis
- */
-async function initAdminCredentials() {
+async function initAdminUserStore() {
+  const now = Date.now();
   if (adminLocalMode) {
-    const username = adminLocalCredentials?.username || `admin_${randomString(6)}`;
-    const password = randomString(12);
-    const salt = randomString(8);
-    const passwordHash = hashPassword(password, salt);
-    adminLocalCredentials = {
-      username,
-      passwordHash,
-      salt,
-      createdAt: adminLocalCredentials?.createdAt || Date.now(),
-      updatedAt: Date.now()
-    };
-    return { username, password };
+    if (adminLocalUsers.size === 0) {
+      const salt = randomString(8);
+      adminLocalUsers.set("admin", {
+        username: "admin",
+        passwordHash: hashPassword("admin", salt),
+        salt,
+        createdAt: now,
+        updatedAt: now
+      });
+      return { username: "admin", password: "admin" };
+    }
+    const admin = adminLocalUsers.get("admin");
+    if (admin) {
+      return { username: "admin", password: "admin" };
+    }
+    const fallback = Array.from(adminLocalUsers.values())[0] || null;
+    return fallback ? { username: fallback.username, password: "" } : null;
   }
-  const key = buildAdminCredentialKey();
-  const cached = await redisClient.get(key);
-  const cachedPayload = cached ? safeJson(cached) : null;
-  const username = (cachedPayload?.username || "").toString() || `admin_${randomString(6)}`;
-  const password = randomString(12);
+  const users = await getAdminUsers();
+  if (users.length > 0) {
+    const adminUser = users.find((item) => item.username === "admin");
+    if (adminUser) {
+      return { username: "admin", password: "admin" };
+    }
+    return { username: users[0].username, password: "" };
+  }
+  const legacyRaw = await redisClient.get(buildAdminCredentialKey());
+  const legacy = legacyRaw ? safeJson(legacyRaw) : null;
+  if (legacy?.username && legacy?.passwordHash) {
+    const migrated = {
+      username: legacy.username.toString(),
+      passwordHash: legacy.passwordHash.toString(),
+      salt: (legacy.salt || "").toString(),
+      createdAt: Number(legacy.createdAt || now),
+      updatedAt: now
+    };
+    await saveAdminUsers([migrated]);
+    return { username: migrated.username, password: "" };
+  }
   const salt = randomString(8);
-  const passwordHash = hashPassword(password, salt);
-  const payload = {
-    username,
-    passwordHash,
+  const adminUser = {
+    username: "admin",
+    passwordHash: hashPassword("admin", salt),
     salt,
-    createdAt: Number(cachedPayload?.createdAt || Date.now()),
-    updatedAt: Date.now()
+    createdAt: now,
+    updatedAt: now
   };
-  await redisClient.set(key, JSON.stringify(payload));
-  return { username, password };
+  await saveAdminUsers([adminUser]);
+  return { username: "admin", password: "admin" };
 }
 
-/**
- * 获取当前保存的管理后台账号信息
- */
-async function getAdminCredentials() {
-  if (adminLocalMode) return adminLocalCredentials;
-  const raw = await redisClient.get(buildAdminCredentialKey());
-  return raw ? safeJson(raw) : null;
+async function getAdminUsers() {
+  if (adminLocalMode) {
+    return Array.from(adminLocalUsers.values()).map((item) => ({ ...item }));
+  }
+  const raw = await redisClient.get(buildAdminUsersKey());
+  const list = raw ? safeJson(raw) : [];
+  if (!Array.isArray(list)) return [];
+  return list
+    .map((item) => ({
+      username: (item?.username || "").toString(),
+      passwordHash: (item?.passwordHash || "").toString(),
+      salt: (item?.salt || "").toString(),
+      createdAt: Number(item?.createdAt || 0),
+      updatedAt: Number(item?.updatedAt || 0),
+      lastLoginAt: Number(item?.lastLoginAt || 0)
+    }))
+    .filter((item) => item.username && item.passwordHash);
 }
 
-/**
- * 校验管理后台账号密码
- */
+async function saveAdminUsers(users) {
+  const normalized = Array.isArray(users)
+    ? users
+        .map((item) => ({
+          username: (item?.username || "").toString().trim(),
+          passwordHash: (item?.passwordHash || "").toString(),
+          salt: (item?.salt || "").toString(),
+          createdAt: Number(item?.createdAt || 0),
+          updatedAt: Number(item?.updatedAt || 0),
+          lastLoginAt: Number(item?.lastLoginAt || 0)
+        }))
+        .filter((item) => item.username && item.passwordHash)
+    : [];
+  if (adminLocalMode) {
+    adminLocalUsers.clear();
+    normalized.forEach((item) => {
+      adminLocalUsers.set(item.username, { ...item });
+    });
+    return;
+  }
+  await redisClient.set(buildAdminUsersKey(), JSON.stringify(normalized));
+}
+
+async function listAdminUsers() {
+  const users = await getAdminUsers();
+  return users
+    .map((item) => ({
+      username: item.username,
+      createdAt: item.createdAt || 0,
+      updatedAt: item.updatedAt || 0,
+      lastLoginAt: item.lastLoginAt || 0
+    }))
+    .sort((a, b) => a.username.localeCompare(b.username));
+}
+
+function normalizeAdminUsername(value) {
+  return (value || "").toString().trim();
+}
+
+function validateAdminPassword(value) {
+  const password = (value || "").toString();
+  return password.length >= 4;
+}
+
+async function createAdminUser(usernameInput, passwordInput) {
+  const username = normalizeAdminUsername(usernameInput);
+  if (!username) return { ok: false, code: 400, msg: "账号不能为空" };
+  if (!validateAdminPassword(passwordInput)) {
+    return { ok: false, code: 400, msg: "密码长度至少 4 位" };
+  }
+  const users = await getAdminUsers();
+  if (users.some((item) => item.username === username)) {
+    return { ok: false, code: 409, msg: "账号已存在" };
+  }
+  const now = Date.now();
+  const salt = randomString(8);
+  users.push({
+    username,
+    passwordHash: hashPassword(passwordInput, salt),
+    salt,
+    createdAt: now,
+    updatedAt: now,
+    lastLoginAt: 0
+  });
+  await saveAdminUsers(users);
+  return { ok: true };
+}
+
+async function renameAdminUser(oldUsernameInput, newUsernameInput) {
+  const oldUsername = normalizeAdminUsername(oldUsernameInput);
+  const newUsername = normalizeAdminUsername(newUsernameInput);
+  if (!oldUsername || !newUsername) return { ok: false, code: 400, msg: "账号不能为空" };
+  const users = await getAdminUsers();
+  const target = users.find((item) => item.username === oldUsername);
+  if (!target) return { ok: false, code: 404, msg: "原账号不存在" };
+  if (users.some((item) => item.username === newUsername && item.username !== oldUsername)) {
+    return { ok: false, code: 409, msg: "新账号已存在" };
+  }
+  target.username = newUsername;
+  target.updatedAt = Date.now();
+  await saveAdminUsers(users);
+  await remapAdminSessions(oldUsername, newUsername);
+  return { ok: true };
+}
+
+async function updateAdminUserPassword(usernameInput, passwordInput) {
+  const username = normalizeAdminUsername(usernameInput);
+  if (!username) return { ok: false, code: 400, msg: "账号不能为空" };
+  if (!validateAdminPassword(passwordInput)) {
+    return { ok: false, code: 400, msg: "密码长度至少 4 位" };
+  }
+  const users = await getAdminUsers();
+  const target = users.find((item) => item.username === username);
+  if (!target) return { ok: false, code: 404, msg: "账号不存在" };
+  target.salt = randomString(8);
+  target.passwordHash = hashPassword(passwordInput, target.salt);
+  target.updatedAt = Date.now();
+  await saveAdminUsers(users);
+  return { ok: true };
+}
+
+async function touchAdminUserLogin(usernameInput) {
+  const username = normalizeAdminUsername(usernameInput);
+  if (!username) return;
+  const users = await getAdminUsers();
+  const target = users.find((item) => item.username === username);
+  if (!target) return;
+  target.lastLoginAt = Date.now();
+  await saveAdminUsers(users);
+}
+
+async function remapAdminSessions(oldUsername, newUsername) {
+  if (!oldUsername || !newUsername || oldUsername === newUsername) return;
+  if (adminLocalMode) {
+    for (const [token, session] of adminLocalSessions.entries()) {
+      if (session?.username === oldUsername) {
+        adminLocalSessions.set(token, { ...session, username: newUsername });
+      }
+    }
+    return;
+  }
+  const keys = await redisClient.keys(buildAdminSessionKey("*"));
+  for (const key of keys) {
+    const username = await redisClient.get(key);
+    if (username === oldUsername) {
+      const ttl = await redisClient.pTTL(key);
+      if (ttl > 0) {
+        await redisClient.set(key, newUsername, { PX: ttl });
+      } else {
+        await redisClient.set(key, newUsername);
+      }
+    }
+  }
+}
+
 async function verifyAdminCredentials(username, password) {
-  const credentials = await getAdminCredentials();
-  if (!credentials) return false;
-  if (credentials.username !== username) return false;
-  const hash = hashPassword(password, credentials.salt || "");
-  return hash === credentials.passwordHash;
+  const users = await getAdminUsers();
+  const target = users.find((item) => item.username === username);
+  if (!target) return false;
+  const hash = hashPassword(password, target.salt || "");
+  if (hash !== target.passwordHash) return false;
+  return true;
 }
 
 /**
@@ -3162,6 +3408,60 @@ function getBearerToken(req) {
  */
 function randomString(length) {
   return crypto.randomBytes(length).toString("base64").replace(/[^a-zA-Z0-9]/g, "").slice(0, length);
+}
+
+async function readTailLinesFromFile(filePath, maxLines) {
+  if (!filePath) return [];
+  try {
+    const stats = await fs.promises.stat(filePath);
+    if (!stats.isFile() || stats.size <= 0) return [];
+    const readBytes = Math.min(stats.size, runtimeLogReadBytes);
+    const fd = await fs.promises.open(filePath, "r");
+    try {
+      const buffer = Buffer.alloc(readBytes);
+      await fd.read(buffer, 0, readBytes, stats.size - readBytes);
+      const raw = buffer.toString("utf8");
+      const lines = raw.split(/\r?\n/).filter(Boolean);
+      return lines.slice(-maxLines);
+    } finally {
+      await fd.close();
+    }
+  } catch {
+    return [];
+  }
+}
+
+async function getRuntimeLogLines(source, limit) {
+  const files = {
+    backend: backendMirrorLogFile,
+    nginx_access: nginxAccessLogFile,
+    nginx_error: nginxErrorLogFile
+  };
+  const memoryLines = adminLogBuffer.slice(-limit).map((item) => {
+    const detail = item?.detail ? ` ${JSON.stringify(item.detail)}` : "";
+    return `[admin:${item.level}] ${item.time} ${item.message}${detail}`;
+  });
+  if (source === "admin") {
+    return { source, files, lines: memoryLines.slice(-limit) };
+  }
+  if (source in files) {
+    const lines = await readTailLinesFromFile(files[source], limit);
+    return { source, files, lines };
+  }
+  const backendLines = await readTailLinesFromFile(files.backend, limit);
+  const accessLines = await readTailLinesFromFile(files.nginx_access, limit);
+  const errorLines = await readTailLinesFromFile(files.nginx_error, limit);
+  const merged = [
+    ...backendLines.map((line) => `[backend] ${line}`),
+    ...accessLines.map((line) => `[nginx-access] ${line}`),
+    ...errorLines.map((line) => `[nginx-error] ${line}`),
+    ...memoryLines.map((line) => `[admin-buffer] ${line}`)
+  ];
+  return {
+    source: "all",
+    files,
+    lines: merged.slice(-limit * 2)
+  };
 }
 
 async function getScriptFailures(limit) {
@@ -3771,6 +4071,10 @@ function buildMetricKey(type) {
  */
 function buildAdminCredentialKey() {
   return "admin:credentials";
+}
+
+function buildAdminUsersKey() {
+  return "admin:users";
 }
 
 /**

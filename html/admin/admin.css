@@ -256,6 +256,13 @@ header .meta {
   padding: 8px 10px;
   border-radius: 8px;
 }
+.filter input {
+  background: #10141c;
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 8px 10px;
+  border-radius: 8px;
+}
 .failure-summary {
   display: flex;
   flex-wrap: wrap;
@@ -735,4 +742,23 @@ input:checked + .slider:before {
   line-height: 1.4;
   white-space: pre;
   overflow: auto;
+}
+.user-form-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr auto;
+  gap: 12px;
+}
+.user-input {
+  background: #10141c;
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 8px 10px;
+  border-radius: 8px;
+  width: 100%;
+}
+.runtime-log-block {
+  min-height: 58vh;
+}
+.log-meta {
+  margin-bottom: 10px;
 }

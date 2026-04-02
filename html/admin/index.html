@@ -23,6 +23,12 @@
           <div class="nav-item" data-target="page-config">
             模型配置
           </div>
+          <div class="nav-item" data-target="page-users">
+            用户管理
+          </div>
+          <div class="nav-item" data-target="page-runtime-logs">
+            日志查看
+          </div>
         </nav>
         <div class="sidebar-footer">
           <button class="btn secondary full-width" id="logoutBtn" type="button">退出登录</button>
@@ -244,6 +250,62 @@
                 </thead>
                 <tbody></tbody>
               </table>
+            </section>
+          </div>
+
+          <div id="page-users" class="page-section">
+            <section class="mb-24">
+              <h3 class="section-title">新增登录用户</h3>
+              <div class="user-form-row">
+                <input id="newUserName" type="text" placeholder="新账号">
+                <input id="newUserPassword" type="password" placeholder="新密码（至少 4 位）">
+                <button class="btn" id="createUserBtn" type="button">新增用户</button>
+              </div>
+            </section>
+            <section class="mb-24">
+              <h3 class="section-title">账号列表</h3>
+              <table class="table" id="userTable">
+                <thead>
+                  <tr>
+                    <th>账号</th>
+                    <th>创建时间</th>
+                    <th>更新时间</th>
+                    <th>最近登录</th>
+                    <th>改账号名</th>
+                    <th>改密码</th>
+                  </tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </section>
+          </div>
+
+          <div id="page-runtime-logs" class="page-section">
+            <section class="filter-bar mb-24">
+              <div class="filters">
+                <div class="filter">
+                  <label>日志来源</label>
+                  <select id="runtimeLogSource">
+                    <option value="all">全部</option>
+                    <option value="backend">llm-backend</option>
+                    <option value="nginx_access">nginx access</option>
+                    <option value="nginx_error">nginx error</option>
+                    <option value="admin">admin buffer</option>
+                  </select>
+                </div>
+                <div class="filter">
+                  <label>读取行数</label>
+                  <input id="runtimeLogLimit" type="number" min="50" max="2000" step="50" value="400">
+                </div>
+              </div>
+              <div class="actions">
+                <button class="btn secondary" id="runtimeLogRefreshBtn" type="button">刷新日志</button>
+              </div>
+            </section>
+            <section>
+              <h3 class="section-title">运行日志</h3>
+              <div class="log-meta muted" id="runtimeLogMeta">等待加载…</div>
+              <pre class="code-block runtime-log-block" id="runtimeLogContent"></pre>
             </section>
           </div>
 

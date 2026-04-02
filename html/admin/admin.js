@@ -25,6 +25,15 @@ const scriptModalHistory = document.getElementById("scriptModalHistory");
 const scriptModalCode = document.getElementById("scriptModalCode");
 const scriptModalClose = document.getElementById("scriptModalClose");
 const scriptModalSource = document.getElementById("scriptModalSource");
+const createUserBtn = document.getElementById("createUserBtn");
+const newUserNameInput = document.getElementById("newUserName");
+const newUserPasswordInput = document.getElementById("newUserPassword");
+const userTableBody = document.querySelector("#userTable tbody");
+const runtimeLogSource = document.getElementById("runtimeLogSource");
+const runtimeLogLimit = document.getElementById("runtimeLogLimit");
+const runtimeLogRefreshBtn = document.getElementById("runtimeLogRefreshBtn");
+const runtimeLogMeta = document.getElementById("runtimeLogMeta");
+const runtimeLogContent = document.getElementById("runtimeLogContent");
 let currentData = null;
 let eventSource = null;
 let scriptsCache = null;
@@ -311,6 +320,8 @@ navItems.forEach((item) => {
         page.classList.add("active");
         if (target === "page-config") loadConfig();
         if (target === "page-scripts") loadScriptsPage();
+        if (target === "page-users") loadUsersPage();
+        if (target === "page-runtime-logs") loadRuntimeLogs();
       } else {
         page.classList.remove("active");
       }
@@ -318,9 +329,9 @@ navItems.forEach((item) => {
   });
 });
 
-function isScriptsPageActive() {
+function getActivePageId() {
   const active = document.querySelector(".page-section.active");
-  return active?.id === "page-scripts";
+  return active?.id || "";
 }
 
 function stageBadge(stage) {
@@ -893,6 +904,120 @@ async function postWithAuth(requestPath, payload) {
   return res.json();
 }
 
+function escapeHtml(value) {
+  return `${value ?? ""}`
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function renderUsersTable(list) {
+  if (!userTableBody) return;
+  const items = Array.isArray(list) ? list : [];
+  if (!items.length) {
+    userTableBody.innerHTML = `<tr><td colspan="6" class="muted">暂无用户</td></tr>`;
+    return;
+  }
+  userTableBody.innerHTML = items
+    .map((item) => {
+      const username = (item?.username || "").toString();
+      return `
+      <tr>
+        <td>${escapeHtml(username)}</td>
+        <td>${formatTime(item?.createdAt || 0)}</td>
+        <td>${formatTime(item?.updatedAt || 0)}</td>
+        <td>${formatTime(item?.lastLoginAt || 0)}</td>
+        <td>
+          <div class="actions">
+            <input class="user-input" type="text" data-role="rename-input" data-username="${encodeURIComponent(
+              username
+            )}" placeholder="新账号名">
+            <button class="btn secondary" type="button" data-action="rename-user" data-username="${encodeURIComponent(
+              username
+            )}">修改账号</button>
+          </div>
+        </td>
+        <td>
+          <div class="actions">
+            <input class="user-input" type="password" data-role="password-input" data-username="${encodeURIComponent(
+              username
+            )}" placeholder="新密码">
+            <button class="btn secondary" type="button" data-action="reset-password" data-username="${encodeURIComponent(
+              username
+            )}">修改密码</button>
+          </div>
+        </td>
+      </tr>
+      `;
+    })
+    .join("");
+}
+
+async function loadUsersPage() {
+  try {
+    const result = await fetchWithAuth("/api/v1/admin/users");
+    renderUsersTable(result.data?.list || []);
+  } catch (e) {
+    if (e?.message === "unauthorized") {
+      clearToken();
+      overlay.style.display = "flex";
+      closeAdminEvents();
+      return;
+    }
+    showToast("error", "加载用户失败", e?.message || "网络错误");
+  }
+}
+
+async function createUser() {
+  const username = (newUserNameInput?.value || "").trim();
+  const password = (newUserPasswordInput?.value || "").trim();
+  if (!username || !password) {
+    showToast("warning", "参数不足", "请输入账号和密码");
+    return;
+  }
+  const result = await postWithAuth("/api/v1/admin/users", { username, password });
+  if (result.code !== 200) {
+    showToast("error", "新增失败", result.msg || "未知错误");
+    return;
+  }
+  if (newUserNameInput) newUserNameInput.value = "";
+  if (newUserPasswordInput) newUserPasswordInput.value = "";
+  showToast("info", "新增成功", `已创建账号 ${username}`);
+  await loadUsersPage();
+}
+
+async function loadRuntimeLogs() {
+  if (!runtimeLogContent) return;
+  const source = (runtimeLogSource?.value || "all").toString();
+  const limit = Math.max(50, Math.min(2000, Number(runtimeLogLimit?.value || 400)));
+  runtimeLogContent.textContent = "日志加载中...";
+  try {
+    const qs = new URLSearchParams();
+    qs.set("source", source);
+    qs.set("limit", String(limit));
+    const result = await fetchWithAuth(`/api/v1/admin/runtime_logs?${qs.toString()}`);
+    const files = result.data?.files || {};
+    const lines = Array.isArray(result.data?.lines) ? result.data.lines : [];
+    if (runtimeLogMeta) {
+      runtimeLogMeta.textContent = `来源：${source} | 行数：${lines.length} | backend: ${files.backend || "-"} | nginx_access: ${
+        files.nginx_access || "-"
+      } | nginx_error: ${files.nginx_error || "-"}`;
+    }
+    runtimeLogContent.textContent = lines.length ? lines.join("\n") : "暂无日志";
+  } catch (e) {
+    if (e?.message === "unauthorized") {
+      clearToken();
+      overlay.style.display = "flex";
+      closeAdminEvents();
+      return;
+    }
+    runtimeLogContent.textContent = "日志加载失败";
+    showToast("error", "加载日志失败", e?.message || "网络错误");
+  }
+}
+
 async function refreshData() {
   const result = await fetchWithAuth("/api/v1/admin/data");
   const data = result.data || {};
@@ -1274,8 +1399,13 @@ if (toggleLoginPassBtn && loginPassInput) {
 }
 
 refreshBtn.addEventListener("click", async () => {
-  if (isScriptsPageActive()) {
+  const activePageId = getActivePageId();
+  if (activePageId === "page-scripts") {
     await loadScriptsPage();
+  } else if (activePageId === "page-users") {
+    await loadUsersPage();
+  } else if (activePageId === "page-runtime-logs") {
+    await loadRuntimeLogs();
   } else {
     await refreshData();
   }
@@ -1292,6 +1422,90 @@ filterSystemType.addEventListener("change", () => {
 filterFailureType.addEventListener("change", () => {
   applyFilters();
 });
+if (createUserBtn) {
+  createUserBtn.addEventListener("click", async () => {
+    try {
+      await createUser();
+    } catch (e) {
+      showToast("error", "新增失败", e?.message || "网络错误");
+    }
+  });
+}
+if (newUserPasswordInput) {
+  newUserPasswordInput.addEventListener("keydown", async (e) => {
+    if (e.key !== "Enter") return;
+    try {
+      await createUser();
+    } catch (err) {
+      showToast("error", "新增失败", err?.message || "网络错误");
+    }
+  });
+}
+if (userTableBody) {
+  userTableBody.addEventListener("click", async (e) => {
+    const btn = e.target?.closest?.("button[data-action]");
+    if (!btn) return;
+    const action = (btn.getAttribute("data-action") || "").toString();
+    const username = decodeURIComponent(btn.getAttribute("data-username") || "");
+    if (!username) return;
+    try {
+      if (action === "rename-user") {
+        const input = userTableBody.querySelector(
+          `input[data-role="rename-input"][data-username="${encodeURIComponent(username)}"]`
+        );
+        const newUsername = (input?.value || "").trim();
+        if (!newUsername) {
+          showToast("warning", "参数不足", "请输入新账号名");
+          return;
+        }
+        const result = await postWithAuth("/api/v1/admin/users/rename", { oldUsername: username, newUsername });
+        if (result.code !== 200) {
+          showToast("error", "修改失败", result.msg || "未知错误");
+          return;
+        }
+        showToast("info", "修改成功", `${username} -> ${newUsername}`);
+        await loadUsersPage();
+        return;
+      }
+      if (action === "reset-password") {
+        const input = userTableBody.querySelector(
+          `input[data-role="password-input"][data-username="${encodeURIComponent(username)}"]`
+        );
+        const newPassword = (input?.value || "").trim();
+        if (!newPassword) {
+          showToast("warning", "参数不足", "请输入新密码");
+          return;
+        }
+        const result = await postWithAuth("/api/v1/admin/users/password", { username, newPassword });
+        if (result.code !== 200) {
+          showToast("error", "修改失败", result.msg || "未知错误");
+          return;
+        }
+        if (input) input.value = "";
+        showToast("info", "修改成功", `账号 ${username} 密码已更新`);
+        await loadUsersPage();
+      }
+    } catch (err) {
+      if (err?.message === "unauthorized") {
+        clearToken();
+        overlay.style.display = "flex";
+        closeAdminEvents();
+        return;
+      }
+      showToast("error", "操作失败", err?.message || "网络错误");
+    }
+  });
+}
+if (runtimeLogRefreshBtn) {
+  runtimeLogRefreshBtn.addEventListener("click", async () => {
+    await loadRuntimeLogs();
+  });
+}
+if (runtimeLogSource) {
+  runtimeLogSource.addEventListener("change", async () => {
+    await loadRuntimeLogs();
+  });
+}
 
 logoutBtn.addEventListener("click", async () => {
   try {
@@ -1307,7 +1521,14 @@ checkSession();
 setInterval(async () => {
   if (overlay.style.display === "none") {
     try {
-      await refreshData();
+      const activePageId = getActivePageId();
+      if (activePageId === "page-scripts") {
+        await loadScriptsPage();
+      } else if (activePageId === "page-runtime-logs") {
+        await loadRuntimeLogs();
+      } else {
+        await refreshData();
+      }
     } catch {}
   }
 }, 10000);

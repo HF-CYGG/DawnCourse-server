@@ -1036,6 +1036,9 @@ async function loadRuntimeLogs() {
     qs.set("source", source);
     qs.set("limit", String(limit));
     const result = await fetchWithAuth(`/api/v1/admin/runtime_logs?${qs.toString()}`);
+    if (!result || Number(result.code) !== 200) {
+      throw new Error(result?.msg || "日志接口不可用");
+    }
     const files = result.data?.files || {};
     const lines = Array.isArray(result.data?.lines) ? result.data.lines : [];
     const counts = result.data?.sourceCounts || {};

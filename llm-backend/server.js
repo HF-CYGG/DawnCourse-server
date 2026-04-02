@@ -41,6 +41,8 @@ let apiKey = summaryApiKey;
 let model = summaryModel;
 let baseUrl = summaryBaseUrl;
 const redisUrl = process.env.REDIS_URL || "redis://redis:6379";
+const redisConnectRetryMs = Math.max(500, Number(process.env.REDIS_CONNECT_RETRY_MS || 3000));
+const redisConnectMaxAttempts = Math.max(1, Number(process.env.REDIS_CONNECT_MAX_ATTEMPTS || 20));
 // 脚本输出目录
 const scriptOutputDir = process.env.SCRIPT_OUTPUT_DIR || "/shared/parsers";
 // 老版本脚本目录（支持逗号分隔多个目录），用于升级时回退读取与自动迁移
@@ -302,19 +304,41 @@ async function loadDynamicConfig() {
 // ---------------------------------------------------------------------------
 const redisClient = createClient({ url: redisUrl });
 let redisReady = false;
+const redisUrlRaw = (process.env.REDIS_URL || "").trim();
+const shouldConnectRedis = !adminLocalMode || Boolean(redisUrlRaw);
 redisClient.on("error", (error) => {
   console.error("redis error:", error);
 });
-try {
-  const redisUrlRaw = (process.env.REDIS_URL || "").trim();
-  const shouldConnectRedis = !adminLocalMode || Boolean(redisUrlRaw);
-  if (shouldConnectRedis) {
-    await redisClient.connect();
-    redisReady = true;
-    await loadDynamicConfig();
+redisClient.on("ready", () => {
+  redisReady = true;
+});
+redisClient.on("end", () => {
+  redisReady = false;
+});
+async function connectRedisWithRetry() {
+  if (!shouldConnectRedis) return false;
+  for (let attempt = 1; attempt <= redisConnectMaxAttempts; attempt += 1) {
+    try {
+      if (!redisClient.isOpen) {
+        await redisClient.connect();
+      }
+      redisReady = true;
+      await loadDynamicConfig();
+      return true;
+    } catch (e) {
+      redisReady = false;
+      console.error(`redis connect attempt ${attempt}/${redisConnectMaxAttempts} failed:`, e);
+      if (attempt < redisConnectMaxAttempts) {
+        await sleep(redisConnectRetryMs);
+      }
+    }
   }
+  return false;
+}
+try {
+  await connectRedisWithRetry();
 } catch (e) {
-  console.error("redis connect error:", e);
+  console.error("redis init error:", e);
 }
 const adminBootstrapInfo = await initAdminUserStore();
 if (adminBootstrapInfo?.username && adminBootstrapInfo?.password) {
@@ -341,6 +365,9 @@ const server = http.createServer((req, res) => {
   const url = new URL(req.url || "/", "http://localhost");
   // 健康检查接口
   if (req.method === "GET" && url.pathname === "/health") {
+    if (shouldConnectRedis && !redisReady) {
+      return sendJson(res, 503, { ok: false, redisReady: false });
+    }
     return sendJson(res, 200, { ok: true });
   }
   // ---------------------------------------------------------------------------

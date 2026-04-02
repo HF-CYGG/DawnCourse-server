@@ -29,6 +29,7 @@ const createUserBtn = document.getElementById("createUserBtn");
 const newUserNameInput = document.getElementById("newUserName");
 const newUserPasswordInput = document.getElementById("newUserPassword");
 const userTableBody = document.querySelector("#userTable tbody");
+const userStats = document.getElementById("userStats");
 const runtimeLogSource = document.getElementById("runtimeLogSource");
 const runtimeLogLimit = document.getElementById("runtimeLogLimit");
 const runtimeLogRefreshBtn = document.getElementById("runtimeLogRefreshBtn");
@@ -916,6 +917,14 @@ function escapeHtml(value) {
 function renderUsersTable(list) {
   if (!userTableBody) return;
   const items = Array.isArray(list) ? list : [];
+  if (userStats) {
+    const onlineCount = items.filter((item) => Number(item?.lastLoginAt || 0) > 0).length;
+    userStats.innerHTML = `
+      <span class="badge">总账号 ${items.length}</span>
+      <span class="badge success">有登录记录 ${onlineCount}</span>
+      <span class="badge warning">首次可用默认账号 admin/admin</span>
+    `;
+  }
   if (!items.length) {
     userTableBody.innerHTML = `<tr><td colspan="6" class="muted">暂无用户</td></tr>`;
     return;
@@ -941,7 +950,7 @@ function renderUsersTable(list) {
         </td>
         <td>
           <div class="actions">
-            <input class="user-input" type="password" data-role="password-input" data-username="${encodeURIComponent(
+            <input class="user-input" type="password" autocomplete="new-password" data-role="password-input" data-username="${encodeURIComponent(
               username
             )}" placeholder="新密码">
             <button class="btn secondary" type="button" data-action="reset-password" data-username="${encodeURIComponent(
@@ -991,7 +1000,7 @@ async function createUser() {
 async function loadRuntimeLogs() {
   if (!runtimeLogContent) return;
   const source = (runtimeLogSource?.value || "all").toString();
-  const limit = Math.max(50, Math.min(2000, Number(runtimeLogLimit?.value || 400)));
+  const limit = Math.max(100, Math.min(20000, Number(runtimeLogLimit?.value || 1000)));
   runtimeLogContent.textContent = "日志加载中...";
   try {
     const qs = new URLSearchParams();
@@ -1000,10 +1009,16 @@ async function loadRuntimeLogs() {
     const result = await fetchWithAuth(`/api/v1/admin/runtime_logs?${qs.toString()}`);
     const files = result.data?.files || {};
     const lines = Array.isArray(result.data?.lines) ? result.data.lines : [];
+    const counts = result.data?.sourceCounts || {};
+    const missingSources = Array.isArray(result.data?.missingSources) ? result.data.missingSources : [];
     if (runtimeLogMeta) {
-      runtimeLogMeta.textContent = `来源：${source} | 行数：${lines.length} | backend: ${files.backend || "-"} | nginx_access: ${
-        files.nginx_access || "-"
-      } | nginx_error: ${files.nginx_error || "-"}`;
+      const countText = `backend:${counts.backend ?? "-"} | nginx_access:${counts.nginx_access ?? "-"} | nginx_error:${
+        counts.nginx_error ?? "-"
+      } | admin:${counts.admin ?? "-"}`;
+      const missingText = missingSources.length ? `\n缺失来源文件：${missingSources.join(", ")}` : "";
+      runtimeLogMeta.textContent = `来源：${source} | 总行数：${lines.length}\n来源行数：${countText}\nbackend 文件：${
+        files.backend || "-"
+      } | nginx_access 文件：${files.nginx_access || "-"} | nginx_error 文件：${files.nginx_error || "-"}${missingText}`;
     }
     runtimeLogContent.textContent = lines.length ? lines.join("\n") : "暂无日志";
   } catch (e) {

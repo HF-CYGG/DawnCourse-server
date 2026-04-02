@@ -162,10 +162,10 @@ const adminEventClients = new Set();
 const scriptHistoryLimit = Number(process.env.SCRIPT_HISTORY_LIMIT || 200);
 const scriptBackupDir = process.env.SCRIPT_BACKUP_DIR || path.join(scriptOutputDir, "backup_versions");
 const scriptFeedbackErrorLimit = Number(process.env.SCRIPT_FEEDBACK_ERROR_LIMIT || 300);
-const backendMirrorLogFile = (process.env.BACKEND_MIRROR_LOG_FILE || "").trim();
+const backendMirrorLogFile = (process.env.BACKEND_MIRROR_LOG_FILE || "/shared/parsers/llm-backend.log").trim();
 const nginxAccessLogFile = (process.env.NGINX_ACCESS_LOG_FILE || "/shared/parsers/nginx_access.log").trim();
 const nginxErrorLogFile = (process.env.NGINX_ERROR_LOG_FILE || "/shared/parsers/nginx_error.log").trim();
-const runtimeLogReadBytes = Math.max(32 * 1024, Number(process.env.RUNTIME_LOG_READ_BYTES || 512 * 1024));
+const runtimeLogReadBytes = Math.max(64 * 1024, Number(process.env.RUNTIME_LOG_READ_BYTES || 8 * 1024 * 1024));
 const nativeConsole = {
   log: console.log.bind(console),
   warn: console.warn.bind(console),
@@ -587,7 +587,7 @@ const server = http.createServer((req, res) => {
       return sendJson(res, 401, { code: 401, msg: "未登录" });
     }
     const source = (url.searchParams.get("source") || "all").toString();
-    const limit = Math.max(50, Math.min(2000, Number(url.searchParams.get("limit") || 400)));
+    const limit = Math.max(1, Math.min(20000, Number(url.searchParams.get("limit") || 1000)));
     const data = await getRuntimeLogLines(source, limit);
     return sendJson(res, 200, { code: 200, data });
   }
@@ -3411,10 +3411,11 @@ function randomString(length) {
 }
 
 async function readTailLinesFromFile(filePath, maxLines) {
-  if (!filePath) return [];
+  if (!filePath) return { lines: [], exists: false };
   try {
     const stats = await fs.promises.stat(filePath);
-    if (!stats.isFile() || stats.size <= 0) return [];
+    if (!stats.isFile()) return { lines: [], exists: false };
+    if (stats.size <= 0) return { lines: [], exists: true };
     const readBytes = Math.min(stats.size, runtimeLogReadBytes);
     const fd = await fs.promises.open(filePath, "r");
     try {
@@ -3422,12 +3423,12 @@ async function readTailLinesFromFile(filePath, maxLines) {
       await fd.read(buffer, 0, readBytes, stats.size - readBytes);
       const raw = buffer.toString("utf8");
       const lines = raw.split(/\r?\n/).filter(Boolean);
-      return lines.slice(-maxLines);
+      return { lines: lines.slice(-maxLines), exists: true };
     } finally {
       await fd.close();
     }
   } catch {
-    return [];
+    return { lines: [], exists: false };
   }
 }
 
@@ -3442,25 +3443,51 @@ async function getRuntimeLogLines(source, limit) {
     return `[admin:${item.level}] ${item.time} ${item.message}${detail}`;
   });
   if (source === "admin") {
-    return { source, files, lines: memoryLines.slice(-limit) };
+    return {
+      source,
+      files,
+      lines: memoryLines.slice(-limit),
+      sourceCounts: { admin: Math.min(memoryLines.length, limit) },
+      missingSources: []
+    };
   }
   if (source in files) {
-    const lines = await readTailLinesFromFile(files[source], limit);
-    return { source, files, lines };
+    const result = await readTailLinesFromFile(files[source], limit);
+    return {
+      source,
+      files,
+      lines: result.lines,
+      sourceCounts: { [source]: result.lines.length },
+      missingSources: result.exists ? [] : [source]
+    };
   }
-  const backendLines = await readTailLinesFromFile(files.backend, limit);
-  const accessLines = await readTailLinesFromFile(files.nginx_access, limit);
-  const errorLines = await readTailLinesFromFile(files.nginx_error, limit);
+  const backendResult = await readTailLinesFromFile(files.backend, limit);
+  const accessResult = await readTailLinesFromFile(files.nginx_access, limit);
+  const errorResult = await readTailLinesFromFile(files.nginx_error, limit);
+  const backendLines = backendResult.lines;
+  const accessLines = accessResult.lines;
+  const errorLines = errorResult.lines;
   const merged = [
     ...backendLines.map((line) => `[backend] ${line}`),
     ...accessLines.map((line) => `[nginx-access] ${line}`),
     ...errorLines.map((line) => `[nginx-error] ${line}`),
     ...memoryLines.map((line) => `[admin-buffer] ${line}`)
   ];
+  const missingSources = [];
+  if (!backendResult.exists) missingSources.push("backend");
+  if (!accessResult.exists) missingSources.push("nginx_access");
+  if (!errorResult.exists) missingSources.push("nginx_error");
   return {
     source: "all",
     files,
-    lines: merged.slice(-limit * 2)
+    lines: merged,
+    sourceCounts: {
+      backend: backendLines.length,
+      nginx_access: accessLines.length,
+      nginx_error: errorLines.length,
+      admin: memoryLines.length
+    },
+    missingSources
   };
 }
 

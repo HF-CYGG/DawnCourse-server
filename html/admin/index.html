@@ -256,15 +256,21 @@
           <div id="page-users" class="page-section">
             <section class="mb-24">
               <h3 class="section-title">新增登录用户</h3>
-              <div class="user-form-row">
-                <input id="newUserName" type="text" placeholder="新账号">
-                <input id="newUserPassword" type="password" placeholder="新密码（至少 4 位）">
-                <button class="btn" id="createUserBtn" type="button">新增用户</button>
+              <div class="user-create-card">
+                <div class="user-form-row">
+                  <input id="newUserName" type="text" placeholder="新账号">
+                  <input id="newUserPassword" type="password" autocomplete="new-password" placeholder="新密码（至少 4 位）">
+                  <button class="btn" id="createUserBtn" type="button">新增用户</button>
+                </div>
+                <div class="muted user-create-tip">建议：使用专属运维账号，避免多人共用 admin。</div>
               </div>
             </section>
             <section class="mb-24">
-              <h3 class="section-title">账号列表</h3>
-              <table class="table" id="userTable">
+              <div class="user-list-header">
+                <h3 class="section-title">账号列表</h3>
+                <div class="user-stats" id="userStats"></div>
+              </div>
+              <table class="table user-table" id="userTable">
                 <thead>
                   <tr>
                     <th>账号</th>
@@ -295,7 +301,7 @@
                 </div>
                 <div class="filter">
                   <label>读取行数</label>
-                  <input id="runtimeLogLimit" type="number" min="50" max="2000" step="50" value="400">
+                  <input id="runtimeLogLimit" type="number" min="100" max="20000" step="100" value="1000">
                 </div>
               </div>
               <div class="actions">

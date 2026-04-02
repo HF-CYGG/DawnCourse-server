@@ -9,7 +9,8 @@ COPY ./llm-backend/package-lock.json /app/llm-backend/package-lock.json
 RUN cd /app/llm-backend && npm ci --omit=dev
 COPY ./llm-backend/server.js /app/llm-backend/server.js
 COPY ./start.sh /app/start.sh
-RUN chmod +x /app/start.sh && mkdir -p /shared/parsers /var/log/nginx /data
+RUN chmod +x /app/start.sh && mkdir -p /shared/parsers /data
+VOLUME ["/shared/parsers", "/data"]
 EXPOSE 80
 EXPOSE 15000
 CMD ["/app/start.sh"]

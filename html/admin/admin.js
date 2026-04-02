@@ -925,11 +925,8 @@ function askOperationConfirm(title, detail, emphasizeText) {
   const headline = (title || "").trim();
   const message = (detail || "").trim();
   const emphasize = (emphasizeText || "").trim();
-  if (!emphasize) {
-    return window.confirm(`${headline}\n${message}`.trim());
-  }
-  const typed = window.prompt(`${headline}\n${message}\n请输入 ${emphasize} 以确认：`, "");
-  return (typed || "").trim() === emphasize;
+  const emphasizeMessage = emphasize ? `\n确认信息：${emphasize}` : "";
+  return window.confirm(`${headline}\n${message}${emphasizeMessage}`.trim());
 }
 
 function renderUsersTable(list) {

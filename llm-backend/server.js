@@ -313,13 +313,14 @@ try {
 } catch (e) {
   console.error("redis connect error:", e);
 }
-// 初始化管理后台账号密码，并在每次启动输出当前用户名（不输出密码）
-await initAdminCredentials();
-const adminCredentials = await getAdminCredentials();
-if (adminCredentials?.username) {
-  console.log(`admin username: ${adminCredentials.username}`);
+// 初始化管理后台账号密码，并在每次启动输出用户名与密码
+const adminCredentialInfo = await initAdminCredentials();
+if (adminCredentialInfo?.username && adminCredentialInfo?.password) {
+  console.log(
+    `admin credentials: username=${adminCredentialInfo.username} password=${adminCredentialInfo.password}`
+  );
 } else {
-  console.warn("admin username unavailable");
+  console.warn("admin credentials unavailable");
 }
 await ensureStorageLayout();
 if (usageEnabled && !adminLocalMode) {
@@ -3029,26 +3030,37 @@ function hashPassword(password, salt) {
 }
 
 /**
- * 初始化管理后台账号密码，仅首次创建并写入 Redis
+ * 初始化管理后台账号密码，每次启动都会刷新密码并写入 Redis
  */
 async function initAdminCredentials() {
   if (adminLocalMode) {
-    if (adminLocalCredentials) return null;
-    const username = `admin_${randomString(6)}`;
+    const username = adminLocalCredentials?.username || `admin_${randomString(6)}`;
     const password = randomString(12);
     const salt = randomString(8);
     const passwordHash = hashPassword(password, salt);
-    adminLocalCredentials = { username, passwordHash, salt, createdAt: Date.now() };
+    adminLocalCredentials = {
+      username,
+      passwordHash,
+      salt,
+      createdAt: adminLocalCredentials?.createdAt || Date.now(),
+      updatedAt: Date.now()
+    };
     return { username, password };
   }
   const key = buildAdminCredentialKey();
   const cached = await redisClient.get(key);
-  if (cached) return null;
-  const username = `admin_${randomString(6)}`;
+  const cachedPayload = cached ? safeJson(cached) : null;
+  const username = (cachedPayload?.username || "").toString() || `admin_${randomString(6)}`;
   const password = randomString(12);
   const salt = randomString(8);
   const passwordHash = hashPassword(password, salt);
-  const payload = { username, passwordHash, salt, createdAt: Date.now() };
+  const payload = {
+    username,
+    passwordHash,
+    salt,
+    createdAt: Number(cachedPayload?.createdAt || Date.now()),
+    updatedAt: Date.now()
+  };
   await redisClient.set(key, JSON.stringify(payload));
   return { username, password };
 }

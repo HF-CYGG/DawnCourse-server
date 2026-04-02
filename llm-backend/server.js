@@ -2063,7 +2063,6 @@ async function applyScriptUpdate(scriptName, content, previousContent, options =
       validate: { ok: true },
       replay: { ok: true }
     });
-    await writeScriptMeta(scriptName, meta);
     await pushScriptHistory(scriptName, {
       type: "pending",
       appliedBy: options.appliedBy || "auto-repair",

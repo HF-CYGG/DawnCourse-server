@@ -6,7 +6,7 @@ services:
     ports:
       - "10000:80"
       - "8080:80"
-      - "15000:80"
+      - "15000:15000"
     restart: ${RESTART_POLICY:-no}
     volumes:
       - parsers-data:/shared/parsers

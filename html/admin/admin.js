@@ -732,9 +732,43 @@ function calcSuccessRate(success, failed, empty) {
   return success / total;
 }
 
+/**
+ * 汇总 App 端上报的脚本解析反馈
+ *
+ * 数据来源：/api/v1/admin/data.scriptParseFeedback
+ * 结构：{ scriptName: [{ successCount, failureCount, ... }, ...] }
+ */
+function aggregateAppParseFeedback(scriptParseFeedback) {
+  const summary = {
+    successCount: 0,
+    failureCount: 0,
+    totalCount: 0
+  };
+  if (!scriptParseFeedback || typeof scriptParseFeedback !== "object") {
+    return summary;
+  }
+  const scripts = Object.values(scriptParseFeedback);
+  for (const versions of scripts) {
+    if (!Array.isArray(versions)) continue;
+    for (const item of versions) {
+      const success = Number(item?.successCount || 0);
+      const failure = Number(item?.failureCount || 0);
+      summary.successCount += success;
+      summary.failureCount += failure;
+      summary.totalCount += success + failure;
+    }
+  }
+  return summary;
+}
+
 function renderCards(data) {
   const metrics = data.metrics || {};
   const latestMetricsAt = data.latestMetricsAt || 0;
+  const appParseSummary = aggregateAppParseFeedback(data.scriptParseFeedback || {});
+  const scriptPullStats = data.scriptPullStats || {};
+  const pullTotal = Number(scriptPullStats.total || 0);
+  const pullFromCloud = Number(scriptPullStats.fromCloud || 0);
+  const pullFromLocal = Number(scriptPullStats.fromLocal || 0);
   const modelUsage = data.modelUsage || {};
   const summaryUsage = modelUsage.summary || {};
   const scriptUsage = modelUsage.script || {};
@@ -750,14 +784,19 @@ function renderCards(data) {
       } | 更新 ${formatTime(scriptUsage.updatedAt)}`;
   const cards = [
     {
-      title: "解析成功",
-      value: formatCount(metrics.parse_success?.count),
-      sub: `平均耗时 ${Number(metrics.parse_success?.latencyMsAvg || 0).toFixed(1)} ms`
+      title: "App 上报解析成功",
+      value: formatCount(appParseSummary.successCount),
+      sub: `上报总数 ${formatCount(appParseSummary.totalCount)}`
     },
     {
-      title: "解析失败",
-      value: formatCount(metrics.parse_failed?.count),
-      sub: `空结果 ${formatCount(metrics.parse_empty?.count)}`
+      title: "App 上报解析失败",
+      value: formatCount(appParseSummary.failureCount),
+      sub: `成功率 ${appParseSummary.totalCount > 0 ? ((appParseSummary.successCount / appParseSummary.totalCount) * 100).toFixed(1) : "0.0"}%`
+    },
+    {
+      title: "App 脚本拉取次数",
+      value: formatCount(pullTotal),
+      sub: `云端 ${formatCount(pullFromCloud)} | 本地 ${formatCount(pullFromLocal)}`
     },
     {
       title: "总结成功",

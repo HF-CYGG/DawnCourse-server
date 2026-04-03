@@ -460,11 +460,13 @@ const server = http.createServer((req, res) => {
     const scriptName = (body?.scriptName || body?.script_name || "").toString();
     const category = (body?.category || "").toString();
     const source = (body?.source || "").toString();
+    const pullTaskId = (body?.pullTaskId || body?.pull_task_id || "").toString();
     const fromCloud = body?.fromCloud === true;
     await recordScriptPull({
       scriptName,
       category,
       source,
+      pullTaskId,
       fromCloud,
       clientIp: req.socket?.remoteAddress || "",
       userAgent: (req.headers?.["user-agent"] || "").toString()
@@ -2685,6 +2687,14 @@ function buildScriptPullScriptSetKey(dateKey) {
   return `script:pull:scripts:${dateKey}`;
 }
 
+function buildScriptPullTaskDailySetKey(dateKey) {
+  return `script:pull:tasks:${dateKey}`;
+}
+
+function buildScriptPullTaskScriptSetKey(scriptName, dateKey) {
+  return `script:pull:task:script:${sanitizeScriptName(scriptName)}:${dateKey}`;
+}
+
 function formatDateKey(timestamp) {
   const d = new Date(Number(timestamp || Date.now()));
   const y = d.getUTCFullYear();
@@ -2705,6 +2715,7 @@ async function recordScriptPull(payload) {
   const scriptName = sanitizeScriptName(payload?.scriptName || "");
   const category = (payload?.category || "").toString();
   const source = (payload?.source || "").toString() || "unknown";
+  const pullTaskId = sanitizeScriptName(payload?.pullTaskId || "");
   const fromCloud = payload?.fromCloud === true;
   const clientIp = (payload?.clientIp || "").toString();
   const userAgent = (payload?.userAgent || "").toString();
@@ -2715,13 +2726,23 @@ async function recordScriptPull(payload) {
     return;
   }
   const dailyKey = buildScriptPullDailyKey(dateKey);
+  const dailyTaskSetKey = buildScriptPullTaskDailySetKey(dateKey);
   await redisClient.hIncrBy(dailyKey, "total", 1);
   await redisClient.hIncrBy(dailyKey, fromCloud ? "fromCloud" : "fromLocal", 1);
   await redisClient.hIncrBy(dailyKey, `source:${source || "unknown"}`, 1);
   await redisClient.expire(dailyKey, Math.ceil(backupTtlMs / 1000));
+  if (pullTaskId) {
+    const isNewTask = await redisClient.sAdd(dailyTaskSetKey, pullTaskId);
+    await redisClient.expire(dailyTaskSetKey, Math.ceil(backupTtlMs / 1000));
+    if (isNewTask > 0) {
+      await redisClient.hIncrBy(dailyKey, "uniqueTotal", 1);
+      await redisClient.hIncrBy(dailyKey, fromCloud ? "uniqueFromCloud" : "uniqueFromLocal", 1);
+    }
+  }
   if (scriptName) {
     const scriptDailyKey = buildScriptPullScriptDailyKey(scriptName, dateKey);
     const scriptSetKey = buildScriptPullScriptSetKey(dateKey);
+    const scriptTaskSetKey = buildScriptPullTaskScriptSetKey(scriptName, dateKey);
     await redisClient.sAdd(scriptSetKey, scriptName);
     await redisClient.expire(scriptSetKey, Math.ceil(backupTtlMs / 1000));
     await redisClient.hIncrBy(scriptDailyKey, "total", 1);
@@ -2733,6 +2754,14 @@ async function recordScriptPull(payload) {
       updatedAt: now
     });
     await redisClient.expire(scriptDailyKey, Math.ceil(backupTtlMs / 1000));
+    if (pullTaskId) {
+      const isNewScriptTask = await redisClient.sAdd(scriptTaskSetKey, pullTaskId);
+      await redisClient.expire(scriptTaskSetKey, Math.ceil(backupTtlMs / 1000));
+      if (isNewScriptTask > 0) {
+        await redisClient.hIncrBy(scriptDailyKey, "uniqueTotal", 1);
+        await redisClient.hIncrBy(scriptDailyKey, fromCloud ? "uniqueFromCloud" : "uniqueFromLocal", 1);
+      }
+    }
   }
 }
 
@@ -2762,6 +2791,9 @@ async function getScriptPullSummary() {
       total: Number(item.total || 0),
       fromCloud: Number(item.fromCloud || 0),
       fromLocal: Number(item.fromLocal || 0),
+      uniqueTotal: Number(item.uniqueTotal || 0),
+      uniqueFromCloud: Number(item.uniqueFromCloud || 0),
+      uniqueFromLocal: Number(item.uniqueFromLocal || 0),
       sourceStats,
       updatedAt: Number(item.updatedAt || 0)
     });
@@ -2772,6 +2804,9 @@ async function getScriptPullSummary() {
     total: Number(daily.total || 0),
     fromCloud: Number(daily.fromCloud || 0),
     fromLocal: Number(daily.fromLocal || 0),
+    uniqueTotal: Number(daily.uniqueTotal || 0),
+    uniqueFromCloud: Number(daily.uniqueFromCloud || 0),
+    uniqueFromLocal: Number(daily.uniqueFromLocal || 0),
     sourceStats: Object.keys(daily)
       .filter((key) => key.startsWith("source:"))
       .reduce((acc, key) => {

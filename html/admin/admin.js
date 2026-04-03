@@ -940,6 +940,9 @@ function renderPullScriptStats(data) {
       const total = Number(item?.total || 0);
       const fromCloud = Number(item?.fromCloud || 0);
       const fromLocal = Number(item?.fromLocal || 0);
+      const uniqueTotal = Number(item?.uniqueTotal || 0);
+      const uniqueFromCloud = Number(item?.uniqueFromCloud || 0);
+      const uniqueFromLocal = Number(item?.uniqueFromLocal || 0);
       const cloudRate = total > 0 ? ((fromCloud / total) * 100).toFixed(1) : "0.0";
       return `
         <tr>
@@ -948,6 +951,9 @@ function renderPullScriptStats(data) {
           <td>${formatCount(total)}</td>
           <td>${formatCount(fromCloud)}</td>
           <td>${formatCount(fromLocal)}</td>
+          <td>${formatCount(uniqueTotal)}</td>
+          <td>${formatCount(uniqueFromCloud)}</td>
+          <td>${formatCount(uniqueFromLocal)}</td>
           <td>${cloudRate}%</td>
           <td>${formatTime(item?.updatedAt || 0)}</td>
         </tr>
@@ -955,7 +961,7 @@ function renderPullScriptStats(data) {
     })
     .join("");
   if (!list.length) {
-    pullScriptTableBody.innerHTML = `<tr><td colspan="7" class="muted">暂无脚本拉取统计</td></tr>`;
+    pullScriptTableBody.innerHTML = `<tr><td colspan="10" class="muted">暂无脚本拉取统计</td></tr>`;
   }
 }
 

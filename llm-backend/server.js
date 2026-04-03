@@ -4727,7 +4727,7 @@ function calculateUsageCost(usageType, usage) {
 }
 
 function buildLocalUsageKey(usageType) {
-  return `${redisKeyPrefix}usage:local:${usageType}`;
+  return `usage:local:${usageType}`;
 }
 
 async function recordLocalUsage(usageType, usage, providerName, modelName) {

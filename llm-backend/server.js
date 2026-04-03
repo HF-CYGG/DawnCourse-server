@@ -2681,6 +2681,10 @@ function buildScriptPullScriptDailyKey(scriptName, dateKey) {
   return `script:pull:script:${sanitizeScriptName(scriptName)}:${dateKey}`;
 }
 
+function buildScriptPullScriptSetKey(dateKey) {
+  return `script:pull:scripts:${dateKey}`;
+}
+
 function formatDateKey(timestamp) {
   const d = new Date(Number(timestamp || Date.now()));
   const y = d.getUTCFullYear();
@@ -2717,6 +2721,9 @@ async function recordScriptPull(payload) {
   await redisClient.expire(dailyKey, Math.ceil(backupTtlMs / 1000));
   if (scriptName) {
     const scriptDailyKey = buildScriptPullScriptDailyKey(scriptName, dateKey);
+    const scriptSetKey = buildScriptPullScriptSetKey(dateKey);
+    await redisClient.sAdd(scriptSetKey, scriptName);
+    await redisClient.expire(scriptSetKey, Math.ceil(backupTtlMs / 1000));
     await redisClient.hIncrBy(scriptDailyKey, "total", 1);
     await redisClient.hIncrBy(scriptDailyKey, fromCloud ? "fromCloud" : "fromLocal", 1);
     await redisClient.hIncrBy(scriptDailyKey, `source:${source || "unknown"}`, 1);
@@ -2734,6 +2741,32 @@ async function getScriptPullSummary() {
   const dateKey = formatDateKey(Date.now());
   const daily = await redisClient.hGetAll(buildScriptPullDailyKey(dateKey));
   if (!daily || Object.keys(daily).length === 0) return {};
+  const scriptSetKey = buildScriptPullScriptSetKey(dateKey);
+  const scriptNames = await redisClient.sMembers(scriptSetKey);
+  const scriptStats = [];
+  for (const scriptNameRaw of scriptNames) {
+    const scriptName = sanitizeScriptName(scriptNameRaw);
+    if (!scriptName) continue;
+    const scriptDailyKey = buildScriptPullScriptDailyKey(scriptName, dateKey);
+    const item = await redisClient.hGetAll(scriptDailyKey);
+    if (!item || Object.keys(item).length === 0) continue;
+    const sourceStats = Object.keys(item)
+      .filter((key) => key.startsWith("source:"))
+      .reduce((acc, key) => {
+        acc[key.replace("source:", "")] = Number(item[key] || 0);
+        return acc;
+      }, {});
+    scriptStats.push({
+      scriptName,
+      category: item.category || "",
+      total: Number(item.total || 0),
+      fromCloud: Number(item.fromCloud || 0),
+      fromLocal: Number(item.fromLocal || 0),
+      sourceStats,
+      updatedAt: Number(item.updatedAt || 0)
+    });
+  }
+  scriptStats.sort((a, b) => b.total - a.total || b.updatedAt - a.updatedAt);
   return {
     dateKey,
     total: Number(daily.total || 0),
@@ -2744,7 +2777,8 @@ async function getScriptPullSummary() {
       .reduce((acc, key) => {
         acc[key.replace("source:", "")] = Number(daily[key] || 0);
         return acc;
-      }, {})
+      }, {}),
+    scriptStats
   };
 }
 

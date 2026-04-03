@@ -12,6 +12,7 @@ const filterSystemType = document.getElementById("filterSystemType");
 const filterFailureType = document.getElementById("filterFailureType");
 const failureSummary = document.getElementById("failureSummary");
 const summaryCards = document.getElementById("summaryCards");
+const pullScriptTableBody = document.querySelector("#pullScriptTable tbody");
 const schoolTableBody = document.querySelector("#schoolTable tbody");
 const failureTableBody = document.querySelector("#failureTable tbody");
 const headerMeta = document.getElementById("headerMeta");
@@ -931,6 +932,33 @@ function renderFailures(data, filters) {
   return list;
 }
 
+function renderPullScriptStats(data) {
+  if (!pullScriptTableBody) return;
+  const list = Array.isArray(data?.scriptPullStats?.scriptStats) ? data.scriptPullStats.scriptStats : [];
+  pullScriptTableBody.innerHTML = list
+    .map((item) => {
+      const total = Number(item?.total || 0);
+      const fromCloud = Number(item?.fromCloud || 0);
+      const fromLocal = Number(item?.fromLocal || 0);
+      const cloudRate = total > 0 ? ((fromCloud / total) * 100).toFixed(1) : "0.0";
+      return `
+        <tr>
+          <td>${item?.scriptName || "-"}</td>
+          <td>${item?.category || "-"}</td>
+          <td>${formatCount(total)}</td>
+          <td>${formatCount(fromCloud)}</td>
+          <td>${formatCount(fromLocal)}</td>
+          <td>${cloudRate}%</td>
+          <td>${formatTime(item?.updatedAt || 0)}</td>
+        </tr>
+      `;
+    })
+    .join("");
+  if (!list.length) {
+    pullScriptTableBody.innerHTML = `<tr><td colspan="7" class="muted">暂无脚本拉取统计</td></tr>`;
+  }
+}
+
 function renderFailureSummary(failures) {
   const stats = {};
   failures.forEach((item) => {
@@ -1385,6 +1413,7 @@ function applyFilters() {
   };
   renderSchools(currentData, filters);
   renderFailures(currentData, filters);
+  renderPullScriptStats(currentData);
 }
 
 function escapeCsv(value) {

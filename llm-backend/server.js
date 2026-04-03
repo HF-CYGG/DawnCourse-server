@@ -451,6 +451,26 @@ const server = http.createServer((req, res) => {
     });
     return sendJson(res, 200, { code: 200, msg: "ok" });
   }
+  if (req.method === "POST" && url.pathname === "/api/v1/script_pull") {
+    const bodyText = await readBody(req, maxContentLength);
+    if (bodyText == null) {
+      return sendJson(res, 413, { code: 413, msg: "请求体过大" });
+    }
+    const body = safeJson(bodyText) || {};
+    const scriptName = (body?.scriptName || body?.script_name || "").toString();
+    const category = (body?.category || "").toString();
+    const source = (body?.source || "").toString();
+    const fromCloud = body?.fromCloud === true;
+    await recordScriptPull({
+      scriptName,
+      category,
+      source,
+      fromCloud,
+      clientIp: req.socket?.remoteAddress || "",
+      userAgent: (req.headers?.["user-agent"] || "").toString()
+    });
+    return sendJson(res, 200, { code: 200, msg: "ok" });
+  }
   if (req.method === "GET" && url.pathname === "/metrics") {
     const text = await buildPrometheusMetrics();
     return sendText(res, 200, text);
@@ -2653,6 +2673,81 @@ function buildScriptFeedbackVersionSetKey(scriptName) {
   return `script:feedback:versions:${safeScriptName}`;
 }
 
+function buildScriptPullDailyKey(dateKey) {
+  return `script:pull:daily:${dateKey}`;
+}
+
+function buildScriptPullScriptDailyKey(scriptName, dateKey) {
+  return `script:pull:script:${sanitizeScriptName(scriptName)}:${dateKey}`;
+}
+
+function formatDateKey(timestamp) {
+  const d = new Date(Number(timestamp || Date.now()));
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  return `${y}${m}${day}`;
+}
+
+/**
+ * 记录 App 端脚本拉取统计
+ *
+ * 说明：
+ * 1. 每次 App 请求云端脚本都会上报一次（不区分成功/降级路径）
+ * 2. 统计维度包含：日期总量、来源类型、脚本名维度次数
+ * 3. Redis 不可用时退化为仅打印日志，不影响主流程
+ */
+async function recordScriptPull(payload) {
+  const scriptName = sanitizeScriptName(payload?.scriptName || "");
+  const category = (payload?.category || "").toString();
+  const source = (payload?.source || "").toString() || "unknown";
+  const fromCloud = payload?.fromCloud === true;
+  const clientIp = (payload?.clientIp || "").toString();
+  const userAgent = (payload?.userAgent || "").toString();
+  const now = Date.now();
+  const dateKey = formatDateKey(now);
+  if (!redisReady) {
+    console.log("[script_pull]", JSON.stringify({ scriptName, category, source, fromCloud, clientIp, userAgent }));
+    return;
+  }
+  const dailyKey = buildScriptPullDailyKey(dateKey);
+  await redisClient.hIncrBy(dailyKey, "total", 1);
+  await redisClient.hIncrBy(dailyKey, fromCloud ? "fromCloud" : "fromLocal", 1);
+  await redisClient.hIncrBy(dailyKey, `source:${source || "unknown"}`, 1);
+  await redisClient.expire(dailyKey, Math.ceil(backupTtlMs / 1000));
+  if (scriptName) {
+    const scriptDailyKey = buildScriptPullScriptDailyKey(scriptName, dateKey);
+    await redisClient.hIncrBy(scriptDailyKey, "total", 1);
+    await redisClient.hIncrBy(scriptDailyKey, fromCloud ? "fromCloud" : "fromLocal", 1);
+    await redisClient.hIncrBy(scriptDailyKey, `source:${source || "unknown"}`, 1);
+    await redisClient.hSet(scriptDailyKey, {
+      scriptName,
+      category,
+      updatedAt: now
+    });
+    await redisClient.expire(scriptDailyKey, Math.ceil(backupTtlMs / 1000));
+  }
+}
+
+async function getScriptPullSummary() {
+  if (!redisReady) return {};
+  const dateKey = formatDateKey(Date.now());
+  const daily = await redisClient.hGetAll(buildScriptPullDailyKey(dateKey));
+  if (!daily || Object.keys(daily).length === 0) return {};
+  return {
+    dateKey,
+    total: Number(daily.total || 0),
+    fromCloud: Number(daily.fromCloud || 0),
+    fromLocal: Number(daily.fromLocal || 0),
+    sourceStats: Object.keys(daily)
+      .filter((key) => key.startsWith("source:"))
+      .reduce((acc, key) => {
+        acc[key.replace("source:", "")] = Number(daily[key] || 0);
+        return acc;
+      }, {})
+  };
+}
+
 async function recordScriptParseFeedback(payload) {
   if (!redisReady) return;
   const scriptName = sanitizeScriptName(payload?.scriptName || "");
@@ -3017,6 +3112,7 @@ async function buildAdminDashboardData() {
       schoolInfoById: {},
       failureTypeStats: {},
       scriptParseFeedback: {},
+      scriptPullStats: {},
       modelUsage: {
         summary: {
           provider: summaryProvider,
@@ -3073,6 +3169,7 @@ async function buildAdminDashboardData() {
       schoolInfoById: {},
       failureTypeStats: {},
       scriptParseFeedback: {},
+      scriptPullStats: {},
       modelUsage: {
         summary: usageSummary || {
           provider: summaryProvider,
@@ -3105,7 +3202,7 @@ async function buildAdminDashboardData() {
       }
     };
   }
-  const [metrics, schoolMetrics, failures, schoolIds, schoolInfoById, usageSummary, usageScript, scriptParseFeedback] =
+  const [metrics, schoolMetrics, failures, schoolIds, schoolInfoById, usageSummary, usageScript, scriptParseFeedback, scriptPullStats] =
     await Promise.all([
       getMetricsSnapshot(),
       getSchoolMetricsSnapshot(),
@@ -3114,7 +3211,8 @@ async function buildAdminDashboardData() {
       getSchoolInfoMap(),
       getUsageSnapshot("summary"),
       getUsageSnapshot("script"),
-      getScriptFeedbackSummary()
+      getScriptFeedbackSummary(),
+      getScriptPullSummary()
     ]);
   const schoolQueues = {};
   let totalQueueLength = 0;
@@ -3155,6 +3253,7 @@ async function buildAdminDashboardData() {
     schoolInfoById,
     failureTypeStats,
     scriptParseFeedback,
+    scriptPullStats,
     modelUsage: {
       summary: usageSummary,
       script: usageScript

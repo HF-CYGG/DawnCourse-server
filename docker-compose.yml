@@ -50,6 +50,8 @@ services:
       REDIS_URL: redis://redis:6379
       # 脚本输出目录
       SCRIPT_OUTPUT_DIR: /shared/parsers
+      # 挂载原始脚本以便自动迁移并生成 meta.json
+      LEGACY_SCRIPT_OUTPUT_DIRS: /shared/scripts/parsers,/shared/scripts/js
       # 单次请求超时
       LLM_TIMEOUT_MS: 20000
       # 最大请求体长度
@@ -75,6 +77,7 @@ services:
       BACKEND_MIRROR_LOG_FILE: /shared/parsers/llm-backend.log
     volumes:
       - parsers-data:/shared/parsers
+      - ./html/scripts:/shared/scripts:ro
     restart: ${RESTART_POLICY:-no}
     depends_on:
       redis:

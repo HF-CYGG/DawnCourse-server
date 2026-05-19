@@ -949,6 +949,13 @@ const server = http.createServer((req, res) => {
     const schoolSystemTypeInput = (body?.schoolSystemType || body?.systemType || "").toString();
     const sourceUrl = (body?.sourceUrl || body?.source_url || "").toString().trim();
     const scriptName = (body?.scriptName || body?.script_name || "").toString();
+    const scriptVersion = Number(body?.scriptVersion || body?.script_version || 0);
+    const scriptSource = (body?.scriptSource || body?.script_source || "").toString();
+    const failureType = (body?.failureType || body?.failure_type || "").toString();
+    const attemptedParsersRaw = body?.attemptedParsers || body?.attempted_parsers || [];
+    const attemptedParsers = Array.isArray(attemptedParsersRaw)
+      ? attemptedParsersRaw.map((item) => sanitizeScriptName(item)).filter(Boolean).slice(0, 12)
+      : [];
     const clientVersion = (body?.clientVersion || body?.client_version || "").toString();
     const userConsent = body?.userConsent === true || body?.consent === true;
     // content 不能为空
@@ -1012,7 +1019,13 @@ const server = http.createServer((req, res) => {
       schoolId,
       schoolName,
       schoolSystemType,
-      sourceUrl
+      sourceUrl,
+      scriptName,
+      scriptVersion,
+      scriptSource,
+      failureType,
+      clientVersion,
+      attemptedParsers
     });
     if (parseProviderReady) {
       runTask(taskId, safeContent, schoolId).catch(async () => {
@@ -1026,7 +1039,13 @@ const server = http.createServer((req, res) => {
           schoolId,
           schoolName,
           schoolSystemType,
-          sourceUrl
+          sourceUrl,
+          scriptName,
+          scriptVersion,
+          scriptSource,
+          failureType,
+          clientVersion,
+          attemptedParsers
         });
       });
     } else {
@@ -1036,7 +1055,13 @@ const server = http.createServer((req, res) => {
         schoolId,
         schoolName,
         schoolSystemType,
-        sourceUrl
+        sourceUrl,
+        scriptName,
+        scriptVersion,
+        scriptSource,
+        failureType,
+        clientVersion,
+        attemptedParsers
       });
       schedulePendingParseProcessing();
     }
@@ -1045,7 +1070,12 @@ const server = http.createServer((req, res) => {
         schoolName,
         schoolSystemType,
         sourceUrl,
-        candidateUrls
+        candidateUrls,
+        scriptVersion,
+        scriptSource,
+        failureType,
+        clientVersion,
+        attemptedParsers
       });
     }
     await redisClient.set(idempotentKey, taskId, { PX: idempotentTtlMs });
@@ -1128,6 +1158,13 @@ async function enqueueSchoolSubmission(schoolId, content, scriptName, schoolInfo
     schoolName: schoolInfo?.schoolName || "",
     schoolSystemType: schoolInfo?.schoolSystemType || "unknown",
     sourceUrl: schoolInfo?.sourceUrl || "",
+    scriptVersion: Number(schoolInfo?.scriptVersion || 0),
+    scriptSource: (schoolInfo?.scriptSource || "").toString(),
+    failureType: (schoolInfo?.failureType || "").toString(),
+    clientVersion: (schoolInfo?.clientVersion || "").toString(),
+    attemptedParsers: Array.isArray(schoolInfo?.attemptedParsers)
+      ? schoolInfo.attemptedParsers.map((item) => sanitizeScriptName(item)).filter(Boolean).slice(0, 12)
+      : [],
     candidateUrls: Array.isArray(schoolInfo?.candidateUrls) ? schoolInfo.candidateUrls.slice(0, 12) : []
   };
   const queueKey = buildQueueKey(schoolId);
@@ -1365,6 +1402,7 @@ async function processQueueCluster(schoolId, items, normalizedIssues, state, now
     schoolId,
     previousMeta,
     context,
+    releaseStage: "pending",
     actionType: "auto_repair"
   });
   if (applyResult.pending) {
@@ -1441,6 +1479,7 @@ async function processIndividualSummaries(schoolId, queue) {
     schoolId,
     previousMeta,
     context,
+    releaseStage: "pending",
     actionType: "auto_repair"
   });
   if (applyResult.pending) return;
@@ -1488,6 +1527,12 @@ async function runTask(taskId, content, schoolId) {
     schoolName: existing?.schoolName || "",
     schoolSystemType: existing?.schoolSystemType || "unknown",
     sourceUrl: existing?.sourceUrl || "",
+    scriptName: existing?.scriptName || "",
+    scriptVersion: Number(existing?.scriptVersion || 0),
+    scriptSource: existing?.scriptSource || "",
+    failureType: existing?.failureType || "",
+    clientVersion: existing?.clientVersion || "",
+    attemptedParsers: Array.isArray(existing?.attemptedParsers) ? existing.attemptedParsers : [],
     startedAt,
     pendingReason: ""
   };
@@ -1939,6 +1984,8 @@ async function generateParserScript(summary, patchGuidance, previousScript, scho
 function resolveScriptName(schoolId, queue) {
   const withName = queue.find((item) => item.scriptName);
   if (withName?.scriptName) return sanitizeScriptName(withName.scriptName);
+  const withAttempted = queue.find((item) => Array.isArray(item.attemptedParsers) && item.attemptedParsers.length > 0);
+  if (withAttempted?.attemptedParsers?.[0]) return sanitizeScriptName(withAttempted.attemptedParsers[0]);
   const systemTypeRaw = (queue.find((item) => item.schoolSystemType)?.schoolSystemType || "").toString();
   const normalizedSystemType =
     normalizeSchoolSystemType(systemTypeRaw) || detectSchoolSystemType((queue?.[0]?.content || "").toString());
@@ -2307,6 +2354,7 @@ function executeScriptWithContent(scriptContent, content) {
       "content",
       `"use strict";let __result=null;let __dawnResult=null;let __dawnReady=false;${scriptContent}\n` +
         "if (typeof globalThis.__dawnResult !== 'undefined' && globalThis.__dawnResult !== null) return globalThis.__dawnResult;" +
+        "if (typeof scheduleHtmlParser === 'function') return scheduleHtmlParser(content);" +
         "if (typeof scheduleHtmlProvider === 'function') return scheduleHtmlProvider(content);" +
         "if (typeof parseHtml === 'function') return parseHtml(content);" +
         "if (typeof parse === 'function') return parse(content);" +

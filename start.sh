@@ -9,6 +9,7 @@ redis-server --bind 127.0.0.1 --port 6379 --dir /data --appendonly yes --save 60
 export REDIS_URL="${REDIS_URL:-redis://127.0.0.1:6379}"
 export BACKEND_MIRROR_LOG_FILE="${BACKEND_MIRROR_LOG_FILE:-/shared/parsers/llm-backend.log}"
 export SCRIPT_OUTPUT_DIR="${SCRIPT_OUTPUT_DIR:-/shared/parsers}"
+export LLM_BACKEND_UPSTREAM="${LLM_BACKEND_UPSTREAM:-127.0.0.1:8080}"
 
 node /app/llm-backend/server.js &
 BACKEND_PID=$!
@@ -43,8 +44,9 @@ term_handler() {
 
 trap term_handler TERM INT
 
-nginx -t
-nginx -g "daemon off;" &
+sed "s#__LLM_BACKEND_UPSTREAM__#${LLM_BACKEND_UPSTREAM}#g" /etc/nginx/nginx.conf > /tmp/nginx.conf
+nginx -t -c /tmp/nginx.conf
+nginx -g "daemon off;" -c /tmp/nginx.conf &
 NGINX_PID=$!
 
 while true; do

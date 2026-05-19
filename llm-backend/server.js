@@ -1806,14 +1806,21 @@ async function normalizeIssueBatch(items, schoolId) {
   if (!Array.isArray(items) || items.length === 0) return [];
   const payload = items.map((item, index) => ({
     index: index + 1,
-    content: (item?.content || "").toString().slice(0, 2000)
+    content: (item?.content || "").toString().slice(0, 2000),
+    failureType: (item?.failureType || "").toString().slice(0, 80),
+    scriptName: sanitizeScriptName(item?.scriptName || "").slice(0, 120),
+    attemptedParsers: Array.isArray(item?.attemptedParsers)
+      ? item.attemptedParsers.map((v) => sanitizeScriptName(v)).filter(Boolean).slice(0, 6)
+      : [],
+    schoolSystemType: normalizeSchoolSystemType(item?.schoolSystemType || "")
   }));
   const systemPrompt =
     "你是问题标准化助手，需要把原始反馈转换为结构化 JSON 数组。" +
     "每项包含 index, category, symptom, scope, trigger, confidence。" +
     "category 仅允许：login_failed,login_success,timetable_empty,server_error,parse_error,other。";
   const userPrompt =
-    "请基于以下多条内容输出 JSON 数组，不要包含任何额外说明。\n" +
+    "请基于以下多条内容输出 JSON 数组，不要包含任何额外说明。" +
+    "可结合 failureType、scriptName、attemptedParsers、schoolSystemType 做更准确归类。\n" +
     `${JSON.stringify(payload)}`;
   const rawText =
     summaryProvider === "gemini"
@@ -2312,6 +2319,7 @@ function runSubmissionReplay(scriptContent, submissions) {
     return { ok: false, reason: "提交回放样本为空" };
   }
   let nonEmptyCount = 0;
+  let validCourseCount = 0;
   for (const sample of samples) {
     const parsed = parseScriptExecutionOutput(executeScriptWithContent(scriptContent, sample.content));
     if (parsed == null) {
@@ -2319,18 +2327,54 @@ function runSubmissionReplay(scriptContent, submissions) {
     }
     if (parsed.length > 0) {
       nonEmptyCount += 1;
-      const first = parsed[0] || {};
-      const required = ["name", "dayOfWeek", "startSection", "duration", "startWeek", "endWeek", "weekType"];
-      const missing = required.filter((field) => first[field] == null || first[field] === "");
-      if (missing.length > 0) {
-        return { ok: false, reason: "提交回放缺少关键字段" };
+      let sampleHasValidCourse = false;
+      for (const course of parsed) {
+        const check = validateReplayCourse(course);
+        if (check.ok) {
+          sampleHasValidCourse = true;
+          validCourseCount += 1;
+          break;
+        }
+      }
+      if (!sampleHasValidCourse) {
+        return { ok: false, reason: "提交回放关键字段非法" };
       }
     }
   }
   if (nonEmptyCount <= 0) {
     return { ok: false, reason: "提交回放结果均为空" };
   }
+  if (validCourseCount <= 0) {
+    return { ok: false, reason: "提交回放无有效课程" };
+  }
   return { ok: true };
+}
+
+function validateReplayCourse(course) {
+  if (!course || typeof course !== "object") return { ok: false, reason: "course_not_object" };
+  const requiredTextFields = ["name", "weekType"];
+  const missingText = requiredTextFields.some((field) => {
+    const value = (course[field] ?? "").toString().trim();
+    return !value;
+  });
+  if (missingText) return { ok: false, reason: "missing_text_field" };
+  const dayOfWeek = toPositiveInt(course.dayOfWeek);
+  const startSection = toPositiveInt(course.startSection);
+  const duration = toPositiveInt(course.duration);
+  const startWeek = toPositiveInt(course.startWeek);
+  const endWeek = toPositiveInt(course.endWeek);
+  if (!dayOfWeek || dayOfWeek < 1 || dayOfWeek > 7) return { ok: false, reason: "invalid_day" };
+  if (!startSection || startSection < 1 || startSection > 30) return { ok: false, reason: "invalid_start_section" };
+  if (!duration || duration < 1 || duration > 12) return { ok: false, reason: "invalid_duration" };
+  if (!startWeek || startWeek < 1 || startWeek > 40) return { ok: false, reason: "invalid_start_week" };
+  if (!endWeek || endWeek < startWeek || endWeek > 40) return { ok: false, reason: "invalid_end_week" };
+  return { ok: true };
+}
+
+function toPositiveInt(value) {
+  const parsed = Number.parseInt(String(value ?? "").trim(), 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return 0;
+  return parsed;
 }
 
 /**

@@ -16,6 +16,13 @@ const pullScriptTableBody = document.querySelector("#pullScriptTable tbody");
 const schoolTableBody = document.querySelector("#schoolTable tbody");
 const failureTableBody = document.querySelector("#failureTable tbody");
 const headerMeta = document.getElementById("headerMeta");
+const scriptAnalyticsCards = document.getElementById("scriptAnalyticsCards");
+const scriptAnalyticsMeta = document.getElementById("scriptAnalyticsMeta");
+const scriptViewMode = document.getElementById("scriptViewMode");
+const scriptFilterSystemType = document.getElementById("scriptFilterSystemType");
+const scriptFilterFinalResult = document.getElementById("scriptFilterFinalResult");
+const scriptFilterFailureType = document.getElementById("scriptFilterFailureType");
+const scriptAnalyticsTableBody = document.querySelector("#scriptAnalyticsTable tbody");
 const scriptSummaryCards = document.getElementById("scriptSummaryCards");
 const scriptTableBody = document.querySelector("#scriptTable tbody");
 const scriptModal = document.getElementById("scriptModal");
@@ -690,6 +697,21 @@ const failureTypeLabels = {
   submission_replay: "提交回放失败",
   write: "写入失败",
   rollback: "回滚失败",
+  parser_crash: "脚本崩溃",
+  parser_empty: "脚本空结果",
+  extractor_empty: "提取为空",
+  unsupported_format: "内容格式不支持",
+  login_required: "未进入课表页",
+  captcha_required: "验证码页",
+  non_timetable: "非课表页面",
+  unknown: "未知"
+};
+const sourceTypeLabels = {
+  client: "客户端",
+  rule: "规则",
+  model: "模型",
+  url: "URL",
+  content: "内容",
   unknown: "未知"
 };
 
@@ -723,6 +745,13 @@ function formatSystemType(value) {
 function formatFailureType(value) {
   const key = value || "unknown";
   return failureTypeLabels[key] || key;
+}
+function formatSourceType(value) {
+  const key = value || "unknown";
+  return sourceTypeLabels[key] || key;
+}
+function formatPercent(value) {
+  return `${(Number(value || 0) * 100).toFixed(1)}%`;
 }
 function getSchoolInfo(data, schoolId) {
   return data.schoolInfoById?.[schoolId] || {};
@@ -765,7 +794,10 @@ function aggregateAppParseFeedback(scriptParseFeedback) {
 function renderCards(data) {
   const metrics = data.metrics || {};
   const latestMetricsAt = data.latestMetricsAt || 0;
-  const appParseSummary = aggregateAppParseFeedback(data.scriptParseFeedback || {});
+  const appParseSummary =
+    data.scriptSessionFeedback?.totals?.totalCount > 0
+      ? data.scriptSessionFeedback.totals
+      : aggregateAppParseFeedback(data.scriptParseFeedback || {});
   const scriptPullStats = data.scriptPullStats || {};
   const pullTotal = Number(scriptPullStats.total || 0);
   const pullFromCloud = Number(scriptPullStats.fromCloud || 0);
@@ -883,6 +915,7 @@ function renderSchools(data, filters) {
               <td>${schoolId}</td>
               <td>${schoolInfo.schoolName || "-"}</td>
               <td>${formatSystemType(schoolInfo.schoolSystemType)}</td>
+              <td>${formatSourceType(schoolInfo.systemSource)}</td>
               <td><span class="badge">${queueLen}</span></td>
               <td><span class="badge ${badgeClass}">${(rate * 100).toFixed(1)}%</span></td>
               <td>${info.parse_success}/${info.parse_failed}/${info.parse_empty}</td>
@@ -895,7 +928,7 @@ function renderSchools(data, filters) {
     })
     .join("");
   if (!filtered.length) {
-    schoolTableBody.innerHTML = `<tr><td colspan="10" class="muted">暂无数据</td></tr>`;
+    schoolTableBody.innerHTML = `<tr><td colspan="11" class="muted">暂无数据</td></tr>`;
   }
 }
 
@@ -1183,6 +1216,213 @@ async function refreshData() {
   applyFilters();
 }
 
+function summarizeDistribution(stats, formatter = (value) => value, emptyText = "-") {
+  const entries = Object.entries(stats || {}).filter(([, count]) => Number(count || 0) > 0);
+  if (!entries.length) return emptyText;
+  return entries
+    .sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0))
+    .slice(0, 3)
+    .map(([key, count]) => `${formatter(key)} ${formatCount(count)}`)
+    .join(" | ");
+}
+
+function buildRawScriptAnalytics(scriptParseFeedback) {
+  const byScript = {};
+  for (const [scriptName, versions] of Object.entries(scriptParseFeedback || {})) {
+    if (!Array.isArray(versions) || !versions.length) continue;
+    let successCount = 0;
+    let failureCount = 0;
+    let updatedAt = 0;
+    for (const item of versions) {
+      successCount += Number(item?.successCount || 0);
+      failureCount += Number(item?.failureCount || 0);
+      updatedAt = Math.max(updatedAt, Number(item?.updatedAt || 0));
+    }
+    const totalCount = successCount + failureCount;
+    byScript[scriptName] = {
+      scriptName,
+      successCount,
+      failureCount,
+      totalCount,
+      successRate: totalCount > 0 ? Number((successCount / totalCount).toFixed(4)) : 0,
+      bySystem: {},
+      byFailureType: {},
+      updatedAt,
+      unknownRate: 0
+    };
+  }
+  const scripts = Object.values(byScript).sort((a, b) => b.totalCount - a.totalCount || b.updatedAt - a.updatedAt);
+  const totals = scripts.reduce(
+    (acc, item) => {
+      acc.successCount += Number(item.successCount || 0);
+      acc.failureCount += Number(item.failureCount || 0);
+      return acc;
+    },
+    { successCount: 0, failureCount: 0 }
+  );
+  totals.totalCount = totals.successCount + totals.failureCount;
+  totals.successRate = totals.totalCount > 0 ? Number((totals.successCount / totals.totalCount).toFixed(4)) : 0;
+  return {
+    mode: "raw",
+    totals,
+    bySystem: {},
+    byFailureType: {},
+    scripts
+  };
+}
+
+function buildSessionScriptAnalytics(scriptSessionFeedback) {
+  const totals = scriptSessionFeedback?.totals || {
+    successCount: 0,
+    failureCount: 0,
+    totalCount: 0,
+    successRate: 0
+  };
+  const scripts = Object.values(scriptSessionFeedback?.byScript || {}).sort(
+    (a, b) => Number(b.totalCount || 0) - Number(a.totalCount || 0) || Number(b.updatedAt || 0) - Number(a.updatedAt || 0)
+  );
+  return {
+    mode: "session",
+    totals,
+    bySystem: scriptSessionFeedback?.bySystem || {},
+    byFailureType: scriptSessionFeedback?.byFailureType || {},
+    scripts
+  };
+}
+
+function getCurrentScriptAnalytics(data) {
+  const mode = scriptViewMode?.value === "raw" ? "raw" : "session";
+  if (mode === "raw") {
+    return buildRawScriptAnalytics(data?.scriptParseFeedback || {});
+  }
+  return buildSessionScriptAnalytics(data?.scriptSessionFeedback || {});
+}
+
+function updateScriptAnalyticsFilterOptions(analytics) {
+  if (!scriptFilterSystemType || !scriptFilterFailureType) return;
+  const currentSystem = scriptFilterSystemType.value;
+  const currentFailure = scriptFilterFailureType.value;
+  const systemEntries = analytics.mode === "session" ? Object.keys(analytics.bySystem || {}).sort() : [];
+  const failureEntries = analytics.mode === "session" ? Object.keys(analytics.byFailureType || {}).sort() : [];
+  scriptFilterSystemType.innerHTML = [`<option value="">全部</option>`]
+    .concat(systemEntries.map((type) => `<option value="${type}">${formatSystemType(type)}</option>`))
+    .join("");
+  scriptFilterFailureType.innerHTML = [`<option value="">全部</option>`]
+    .concat(failureEntries.map((type) => `<option value="${type}">${formatFailureType(type)}</option>`))
+    .join("");
+  if (systemEntries.includes(currentSystem)) {
+    scriptFilterSystemType.value = currentSystem;
+  }
+  if (failureEntries.includes(currentFailure)) {
+    scriptFilterFailureType.value = currentFailure;
+  }
+  const disabled = analytics.mode !== "session";
+  scriptFilterSystemType.disabled = disabled;
+  scriptFilterFailureType.disabled = disabled;
+  if (disabled) {
+    scriptFilterSystemType.value = "";
+    scriptFilterFailureType.value = "";
+  }
+}
+
+function renderScriptAnalyticsCards(analytics) {
+  if (!scriptAnalyticsCards) return;
+  const totals = analytics.totals || {};
+  const topSystem = summarizeDistribution(analytics.bySystem, formatSystemType, analytics.mode === "session" ? "暂无" : "仅会话口径");
+  const topFailure = summarizeDistribution(
+    analytics.byFailureType,
+    formatFailureType,
+    analytics.mode === "session" ? "暂无" : "仅会话口径"
+  );
+  const cards = [
+    {
+      title: analytics.mode === "session" ? "会话成功" : "原始成功",
+      value: formatCount(totals.successCount || 0),
+      sub: `统计脚本 ${formatCount(analytics.scripts.length)}`
+    },
+    {
+      title: analytics.mode === "session" ? "会话失败" : "原始失败",
+      value: formatCount(totals.failureCount || 0),
+      sub: `总数 ${formatCount(totals.totalCount || 0)}`
+    },
+    {
+      title: "成功率",
+      value: formatPercent(totals.successRate || 0),
+      sub: analytics.mode === "session" ? "任一 parser 成功即计成功" : "逐 parser 原始上报"
+    },
+    {
+      title: "系统分布",
+      value: analytics.mode === "session" ? formatCount(Object.keys(analytics.bySystem || {}).length) : "-",
+      sub: topSystem
+    },
+    {
+      title: "失败类型",
+      value: analytics.mode === "session" ? formatCount(Object.keys(analytics.byFailureType || {}).length) : "-",
+      sub: topFailure
+    }
+  ];
+  scriptAnalyticsCards.innerHTML = cards
+    .map(
+      (card) => `
+          <div class="card">
+            <h3>${card.title}</h3>
+            <div class="value">${card.value}</div>
+            <div class="sub">${card.sub}</div>
+          </div>
+        `
+    )
+    .join("");
+}
+
+function renderScriptAnalyticsTable(analytics) {
+  if (!scriptAnalyticsTableBody) return;
+  const mode = analytics.mode;
+  const systemType = scriptFilterSystemType?.value || "";
+  const finalResult = scriptFilterFinalResult?.value || "";
+  const failureType = scriptFilterFailureType?.value || "";
+  const list = (analytics.scripts || []).filter((item) => {
+    if (finalResult === "success" && Number(item.successCount || 0) <= 0) return false;
+    if (finalResult === "failed" && Number(item.failureCount || 0) <= 0) return false;
+    if (mode === "session" && systemType && Number(item.bySystem?.[systemType] || 0) <= 0) return false;
+    if (mode === "session" && failureType && Number(item.byFailureType?.[failureType] || 0) <= 0) return false;
+    return true;
+  });
+  scriptAnalyticsTableBody.innerHTML = list
+    .map((item) => {
+      const systemSummary =
+        mode === "session" ? summarizeDistribution(item.bySystem || {}, formatSystemType, "-") : "-";
+      const failureSummary =
+        mode === "session" ? summarizeDistribution(item.byFailureType || {}, formatFailureType, "-") : "-";
+      const unknownRate = mode === "session" ? formatPercent(item.unknownRate || 0) : "-";
+      return `
+        <tr>
+          <td>${item.scriptName || "-"}</td>
+          <td>${formatCount(item.successCount || 0)}</td>
+          <td>${formatCount(item.failureCount || 0)}</td>
+          <td>${formatPercent(item.successRate || 0)}</td>
+          <td>${systemSummary}</td>
+          <td>${failureSummary}</td>
+          <td>${unknownRate}</td>
+          <td>${formatTime(item.updatedAt || 0)}</td>
+        </tr>
+      `;
+    })
+    .join("");
+  if (!list.length) {
+    scriptAnalyticsTableBody.innerHTML = `<tr><td colspan="8" class="muted">暂无脚本统计</td></tr>`;
+  }
+  if (scriptAnalyticsMeta) {
+    scriptAnalyticsMeta.textContent =
+      mode === "session"
+        ? `当前为会话级口径：成功 ${formatCount(analytics.totals.successCount)}，失败 ${formatCount(
+            analytics.totals.failureCount
+          )}，任一 parser 成功则该次仅计成功。`
+        : `当前为原始逐 parser 口径：成功 ${formatCount(analytics.totals.successCount)}，失败 ${formatCount(
+            analytics.totals.failureCount
+          )}，保留旧诊断统计。`;
+  }
+}
+
 function renderScriptCards(list) {
   if (!scriptSummaryCards) return;
   const items = Array.isArray(list) ? list : [];
@@ -1277,8 +1517,22 @@ function renderScriptsTable(list) {
 
 async function loadScriptsPage() {
   try {
-    const result = await fetchWithAuth("/api/v1/admin/scripts");
-    const list = result.data?.list || [];
+    const [dataResult, scriptResult] = await Promise.all([
+      fetchWithAuth("/api/v1/admin/data"),
+      fetchWithAuth("/api/v1/admin/scripts")
+    ]);
+    const data = dataResult.data || {};
+    currentData = data;
+    headerMeta.textContent = `启动时间：${formatTime(data.serverStartedAt)} | 指标刷新：${formatTime(
+      data.latestMetricsAt
+    )} | 最后刷新：${formatTime(Date.now())} | 统计文件：${data.metricsFile || "-"}`;
+    renderCards(data);
+    updateFilterOptions(data);
+    const analytics = getCurrentScriptAnalytics(data);
+    updateScriptAnalyticsFilterOptions(analytics);
+    renderScriptAnalyticsCards(analytics);
+    renderScriptAnalyticsTable(analytics);
+    const list = scriptResult.data?.list || [];
     scriptsCache = list;
     renderScriptCards(list);
     renderScriptsTable(list);
@@ -1438,6 +1692,7 @@ function buildCsvContent(data, filters) {
       "学校ID",
       "学校名称",
       "教务系统",
+      "识别来源",
       "队列",
       "解析成功",
       "解析失败",
@@ -1461,6 +1716,7 @@ function buildCsvContent(data, filters) {
         schoolId,
         schoolInfo.schoolName || "",
         formatSystemType(schoolInfo.schoolSystemType),
+        formatSourceType(schoolInfo.systemSource),
         data.schoolQueues?.[schoolId] ?? 0,
         info.parse_success,
         info.parse_failed,
@@ -1576,6 +1832,33 @@ filterSystemType.addEventListener("change", () => {
 filterFailureType.addEventListener("change", () => {
   applyFilters();
 });
+if (scriptViewMode) {
+  scriptViewMode.addEventListener("change", () => {
+    if (!currentData) return;
+    const analytics = getCurrentScriptAnalytics(currentData);
+    updateScriptAnalyticsFilterOptions(analytics);
+    renderScriptAnalyticsCards(analytics);
+    renderScriptAnalyticsTable(analytics);
+  });
+}
+if (scriptFilterSystemType) {
+  scriptFilterSystemType.addEventListener("change", () => {
+    if (!currentData) return;
+    renderScriptAnalyticsTable(getCurrentScriptAnalytics(currentData));
+  });
+}
+if (scriptFilterFinalResult) {
+  scriptFilterFinalResult.addEventListener("change", () => {
+    if (!currentData) return;
+    renderScriptAnalyticsTable(getCurrentScriptAnalytics(currentData));
+  });
+}
+if (scriptFilterFailureType) {
+  scriptFilterFailureType.addEventListener("change", () => {
+    if (!currentData) return;
+    renderScriptAnalyticsTable(getCurrentScriptAnalytics(currentData));
+  });
+}
 if (createUserBtn) {
   createUserBtn.addEventListener("click", async () => {
     try {

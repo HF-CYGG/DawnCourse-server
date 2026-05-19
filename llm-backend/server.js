@@ -438,6 +438,15 @@ const server = http.createServer((req, res) => {
     const category = (body?.category || "").toString();
     const errorMessage = (body?.errorMessage || body?.error_message || "").toString();
     const sourceUrl = (body?.sourceUrl || body?.source_url || "").toString();
+    const parseSessionId = (body?.parseSessionId || body?.parse_session_id || "").toString().trim();
+    const isSessionFinal = body?.isSessionFinal === true || body?.is_session_final === true;
+    const finalResult = (body?.finalResult || body?.final_result || "").toString();
+    const failureType = (body?.failureType || body?.failure_type || "").toString();
+    const schoolSystemType = (body?.schoolSystemType || body?.school_system_type || "").toString();
+    const attemptedParsersRaw = body?.attemptedParsers || body?.attempted_parsers || [];
+    const attemptedParsers = Array.isArray(attemptedParsersRaw)
+      ? attemptedParsersRaw.map((item) => sanitizeScriptName(item)).filter(Boolean).slice(0, 12)
+      : [];
     if (!scriptName) {
       return sendJson(res, 400, { code: 400, msg: "缺少 scriptName" });
     }
@@ -447,7 +456,13 @@ const server = http.createServer((req, res) => {
       success,
       category,
       errorMessage,
-      sourceUrl
+      sourceUrl,
+      parseSessionId,
+      isSessionFinal,
+      finalResult,
+      failureType,
+      schoolSystemType,
+      attemptedParsers
     });
     return sendJson(res, 200, { code: 200, msg: "ok" });
   }
@@ -951,12 +966,13 @@ const server = http.createServer((req, res) => {
     const scriptName = (body?.scriptName || body?.script_name || "").toString();
     const scriptVersion = Number(body?.scriptVersion || body?.script_version || 0);
     const scriptSource = (body?.scriptSource || body?.script_source || "").toString();
-    const failureType = (body?.failureType || body?.failure_type || "").toString();
+    const failureTypeInput = (body?.failureType || body?.failure_type || "").toString();
     const attemptedParsersRaw = body?.attemptedParsers || body?.attempted_parsers || [];
     const attemptedParsers = Array.isArray(attemptedParsersRaw)
       ? attemptedParsersRaw.map((item) => sanitizeScriptName(item)).filter(Boolean).slice(0, 12)
       : [];
     const clientVersion = (body?.clientVersion || body?.client_version || "").toString();
+    const parseSessionId = (body?.parseSessionId || body?.parse_session_id || "").toString().trim();
     const userConsent = body?.userConsent === true || body?.consent === true;
     // content 不能为空
     if (!content) {
@@ -1003,10 +1019,20 @@ const server = http.createServer((req, res) => {
         });
       }
     }
-    const schoolSystemType = resolveSchoolSystemType(safeContent, schoolSystemTypeInput);
     const candidateUrls = extractCandidateUrls(content, safeContent, sourceUrl);
+    const classification = await resolveSubmissionClassification({
+      content: safeContent,
+      sourceUrl,
+      failureTypeInput,
+      schoolSystemTypeInput,
+      attemptedParsers,
+      scriptName
+    });
+    const schoolSystemType = classification.schoolSystemType;
     if (schoolId) {
-      await saveSchoolInfo(schoolId, schoolName, schoolSystemType, candidateUrls);
+      await saveSchoolInfo(schoolId, schoolName, schoolSystemType, candidateUrls, {
+        systemSource: classification.schoolSystemSource
+      });
     }
     // 生成任务并进入异步处理
     const taskId = crypto.randomUUID();
@@ -1023,8 +1049,13 @@ const server = http.createServer((req, res) => {
       scriptName,
       scriptVersion,
       scriptSource,
-      failureType,
+      failureType: failureTypeInput,
+      classifiedFailureType: classification.failureType,
+      failureCategory: classification.failureCategory,
+      failureSource: classification.failureSource,
+      schoolSystemSource: classification.schoolSystemSource,
       clientVersion,
+      parseSessionId,
       attemptedParsers
     });
     if (parseProviderReady) {
@@ -1043,8 +1074,13 @@ const server = http.createServer((req, res) => {
           scriptName,
           scriptVersion,
           scriptSource,
-          failureType,
+          failureType: failureTypeInput,
+          classifiedFailureType: classification.failureType,
+          failureCategory: classification.failureCategory,
+          failureSource: classification.failureSource,
+          schoolSystemSource: classification.schoolSystemSource,
           clientVersion,
+          parseSessionId,
           attemptedParsers
         });
       });
@@ -1059,8 +1095,13 @@ const server = http.createServer((req, res) => {
         scriptName,
         scriptVersion,
         scriptSource,
-        failureType,
+        failureType: failureTypeInput,
+        classifiedFailureType: classification.failureType,
+        failureCategory: classification.failureCategory,
+        failureSource: classification.failureSource,
+        schoolSystemSource: classification.schoolSystemSource,
         clientVersion,
+        parseSessionId,
         attemptedParsers
       });
       schedulePendingParseProcessing();
@@ -1073,8 +1114,13 @@ const server = http.createServer((req, res) => {
         candidateUrls,
         scriptVersion,
         scriptSource,
-        failureType,
+        failureType: failureTypeInput,
+        classifiedFailureType: classification.failureType,
+        failureCategory: classification.failureCategory,
+        failureSource: classification.failureSource,
+        schoolSystemSource: classification.schoolSystemSource,
         clientVersion,
+        parseSessionId,
         attemptedParsers
       });
     }
@@ -1161,7 +1207,12 @@ async function enqueueSchoolSubmission(schoolId, content, scriptName, schoolInfo
     scriptVersion: Number(schoolInfo?.scriptVersion || 0),
     scriptSource: (schoolInfo?.scriptSource || "").toString(),
     failureType: (schoolInfo?.failureType || "").toString(),
+    classifiedFailureType: (schoolInfo?.classifiedFailureType || "").toString(),
+    failureCategory: (schoolInfo?.failureCategory || "").toString(),
+    failureSource: (schoolInfo?.failureSource || "").toString(),
+    schoolSystemSource: (schoolInfo?.schoolSystemSource || "").toString(),
     clientVersion: (schoolInfo?.clientVersion || "").toString(),
+    parseSessionId: (schoolInfo?.parseSessionId || "").toString(),
     attemptedParsers: Array.isArray(schoolInfo?.attemptedParsers)
       ? schoolInfo.attemptedParsers.map((item) => sanitizeScriptName(item)).filter(Boolean).slice(0, 12)
       : [],
@@ -1531,7 +1582,12 @@ async function runTask(taskId, content, schoolId) {
     scriptVersion: Number(existing?.scriptVersion || 0),
     scriptSource: existing?.scriptSource || "",
     failureType: existing?.failureType || "",
+    classifiedFailureType: existing?.classifiedFailureType || "",
+    failureCategory: existing?.failureCategory || "",
+    failureSource: existing?.failureSource || "",
+    schoolSystemSource: existing?.schoolSystemSource || "",
     clientVersion: existing?.clientVersion || "",
+    parseSessionId: existing?.parseSessionId || "",
     attemptedParsers: Array.isArray(existing?.attemptedParsers) ? existing.attemptedParsers : [],
     startedAt,
     pendingReason: ""
@@ -1807,12 +1863,14 @@ async function normalizeIssueBatch(items, schoolId) {
   const payload = items.map((item, index) => ({
     index: index + 1,
     content: (item?.content || "").toString().slice(0, 2000),
-    failureType: (item?.failureType || "").toString().slice(0, 80),
+    failureType: (item?.classifiedFailureType || item?.failureType || "").toString().slice(0, 80),
     scriptName: sanitizeScriptName(item?.scriptName || "").slice(0, 120),
     attemptedParsers: Array.isArray(item?.attemptedParsers)
       ? item.attemptedParsers.map((v) => sanitizeScriptName(v)).filter(Boolean).slice(0, 6)
       : [],
-    schoolSystemType: normalizeSchoolSystemType(item?.schoolSystemType || "")
+    schoolSystemType: normalizeSchoolSystemType(item?.schoolSystemType || ""),
+    failureSource: (item?.failureSource || "").toString().slice(0, 40),
+    schoolSystemSource: (item?.schoolSystemSource || "").toString().slice(0, 40)
   }));
   const systemPrompt =
     "你是问题标准化助手，需要把原始反馈转换为结构化 JSON 数组。" +
@@ -2767,6 +2825,22 @@ function buildScriptFeedbackVersionSetKey(scriptName) {
   return `script:feedback:versions:${safeScriptName}`;
 }
 
+function buildScriptSessionFinalKey(parseSessionId) {
+  return `script:session:final:${(parseSessionId || "").toString().trim()}`;
+}
+
+function buildScriptSessionSummaryKey(scriptName) {
+  return `script:session:summary:${sanitizeScriptName(scriptName)}`;
+}
+
+function buildScriptSessionGlobalKey() {
+  return "script:session:summary:global";
+}
+
+function buildScriptSessionScriptSetKey() {
+  return "script:session:scripts";
+}
+
 function buildScriptPullDailyKey(dateKey) {
   return `script:pull:daily:${dateKey}`;
 }
@@ -2918,6 +2992,14 @@ async function recordScriptParseFeedback(payload) {
   const category = (payload?.category || "").toString();
   const errorMessage = (payload?.errorMessage || "").toString();
   const sourceUrl = (payload?.sourceUrl || "").toString();
+  const parseSessionId = (payload?.parseSessionId || "").toString().trim();
+  const isSessionFinal = payload?.isSessionFinal === true;
+  const finalResult = normalizeFinalResult(payload?.finalResult);
+  const failureType = normalizeSubmissionFailureType(payload?.failureType) || "unknown";
+  const schoolSystemType = normalizeSchoolSystemType(payload?.schoolSystemType) || "unknown";
+  const attemptedParsers = Array.isArray(payload?.attemptedParsers)
+    ? payload.attemptedParsers.map((item) => sanitizeScriptName(item)).filter(Boolean).slice(0, 12)
+    : [];
   const now = Date.now();
   const key = buildScriptFeedbackKey(scriptName, scriptVersion);
   const versionSetKey = buildScriptFeedbackVersionSetKey(scriptName);
@@ -2944,6 +3026,38 @@ async function recordScriptParseFeedback(payload) {
     const errorKey = buildScriptFeedbackErrorListKey(scriptName);
     await redisClient.lPush(errorKey, errorPayload);
     await redisClient.lTrim(errorKey, 0, Math.max(0, scriptFeedbackErrorLimit - 1));
+  }
+  if (!isSessionFinal || !parseSessionId || !finalResult) {
+    return;
+  }
+  const finalKey = buildScriptSessionFinalKey(parseSessionId);
+  const accepted = await redisClient.set(finalKey, scriptName, { NX: true, PX: backupTtlMs });
+  if (!accepted) {
+    return;
+  }
+  const summaryKey = buildScriptSessionSummaryKey(scriptName);
+  const globalKey = buildScriptSessionGlobalKey();
+  await redisClient.sAdd(buildScriptSessionScriptSetKey(), scriptName);
+  await redisClient.hSet(summaryKey, {
+    scriptName,
+    updatedAt: now,
+    lastSourceUrl: sourceUrl,
+    lastFinalResult: finalResult,
+    lastFailureType: failureType,
+    lastSchoolSystemType: schoolSystemType,
+    lastAttemptedParsers: JSON.stringify(attemptedParsers)
+  });
+  await redisClient.hSet(globalKey, { updatedAt: now });
+  const resultField = finalResult === "success" ? "successCount" : "failureCount";
+  await redisClient.hIncrBy(summaryKey, resultField, 1);
+  await redisClient.hIncrBy(globalKey, resultField, 1);
+  if (schoolSystemType) {
+    await redisClient.hIncrBy(summaryKey, `system:${schoolSystemType}`, 1);
+    await redisClient.hIncrBy(globalKey, `system:${schoolSystemType}`, 1);
+  }
+  if (finalResult === "failed") {
+    await redisClient.hIncrBy(summaryKey, `failure:${failureType}`, 1);
+    await redisClient.hIncrBy(globalKey, `failure:${failureType}`, 1);
   }
 }
 
@@ -2983,6 +3097,80 @@ async function getScriptFeedbackSummary() {
     }
   }
   return summary;
+}
+
+async function getScriptSessionSummary() {
+  const empty = {
+    totals: {
+      successCount: 0,
+      failureCount: 0,
+      totalCount: 0,
+      successRate: 0
+    },
+    bySystem: {},
+    byFailureType: {},
+    byScript: {}
+  };
+  if (!redisReady) return empty;
+  const global = await redisClient.hGetAll(buildScriptSessionGlobalKey());
+  const successCount = Number(global?.successCount || 0);
+  const failureCount = Number(global?.failureCount || 0);
+  const totalCount = successCount + failureCount;
+  const bySystem = {};
+  const byFailureType = {};
+  for (const [key, value] of Object.entries(global || {})) {
+    if (key.startsWith("system:")) {
+      bySystem[key.replace("system:", "")] = Number(value || 0);
+    } else if (key.startsWith("failure:")) {
+      byFailureType[key.replace("failure:", "")] = Number(value || 0);
+    }
+  }
+  const byScript = {};
+  const scripts = await redisClient.sMembers(buildScriptSessionScriptSetKey());
+  for (const scriptNameRaw of scripts) {
+    const scriptName = sanitizeScriptName(scriptNameRaw);
+    if (!scriptName) continue;
+    const item = await redisClient.hGetAll(buildScriptSessionSummaryKey(scriptName));
+    if (!item || Object.keys(item).length === 0) continue;
+    const scriptSuccess = Number(item.successCount || 0);
+    const scriptFailure = Number(item.failureCount || 0);
+    const scriptTotal = scriptSuccess + scriptFailure;
+    const scriptBySystem = {};
+    const scriptByFailureType = {};
+    for (const [key, value] of Object.entries(item)) {
+      if (key.startsWith("system:")) {
+        scriptBySystem[key.replace("system:", "")] = Number(value || 0);
+      } else if (key.startsWith("failure:")) {
+        scriptByFailureType[key.replace("failure:", "")] = Number(value || 0);
+      }
+    }
+    const unknownCount = Number(scriptBySystem.unknown || 0);
+    byScript[scriptName] = {
+      scriptName,
+      successCount: scriptSuccess,
+      failureCount: scriptFailure,
+      totalCount: scriptTotal,
+      successRate: scriptTotal > 0 ? Number((scriptSuccess / scriptTotal).toFixed(4)) : 0,
+      bySystem: scriptBySystem,
+      byFailureType: scriptByFailureType,
+      lastSourceUrl: item.lastSourceUrl || "",
+      lastFinalResult: item.lastFinalResult || "",
+      lastFailureType: item.lastFailureType || "",
+      updatedAt: Number(item.updatedAt || 0),
+      unknownRate: scriptTotal > 0 ? Number((unknownCount / scriptTotal).toFixed(4)) : 0
+    };
+  }
+  return {
+    totals: {
+      successCount,
+      failureCount,
+      totalCount,
+      successRate: totalCount > 0 ? Number((successCount / totalCount).toFixed(4)) : 0
+    },
+    bySystem,
+    byFailureType,
+    byScript
+  };
 }
 
 async function recordMetric(type, latencyMs, cost) {
@@ -3273,6 +3461,7 @@ async function buildAdminDashboardData() {
       schoolInfoById: {},
       failureTypeStats: {},
       scriptParseFeedback: {},
+      scriptSessionFeedback: {},
       scriptPullStats: {},
       modelUsage: {
         summary: {
@@ -3330,6 +3519,7 @@ async function buildAdminDashboardData() {
       schoolInfoById: {},
       failureTypeStats: {},
       scriptParseFeedback: {},
+      scriptSessionFeedback: {},
       scriptPullStats: {},
       modelUsage: {
         summary: usageSummary || {
@@ -3363,7 +3553,18 @@ async function buildAdminDashboardData() {
       }
     };
   }
-  const [metrics, schoolMetrics, failures, schoolIds, schoolInfoById, usageSummary, usageScript, scriptParseFeedback, scriptPullStats] =
+  const [
+    metrics,
+    schoolMetrics,
+    failures,
+    schoolIds,
+    schoolInfoById,
+    usageSummary,
+    usageScript,
+    scriptParseFeedback,
+    scriptSessionFeedback,
+    scriptPullStats
+  ] =
     await Promise.all([
       getMetricsSnapshot(),
       getSchoolMetricsSnapshot(),
@@ -3373,6 +3574,7 @@ async function buildAdminDashboardData() {
       getUsageSnapshot("summary"),
       getUsageSnapshot("script"),
       getScriptFeedbackSummary(),
+      getScriptSessionSummary(),
       getScriptPullSummary()
     ]);
   const schoolQueues = {};
@@ -3414,6 +3616,7 @@ async function buildAdminDashboardData() {
     schoolInfoById,
     failureTypeStats,
     scriptParseFeedback,
+    scriptSessionFeedback,
     scriptPullStats,
     modelUsage: {
       summary: usageSummary,
@@ -4092,10 +4295,282 @@ function detectSchoolSystemType(content) {
   return "unknown";
 }
 
+function detectSchoolSystemTypeFromUrl(sourceUrl) {
+  const text = (sourceUrl || "").toString().trim().toLowerCase();
+  if (!text) return "";
+  if (/jwglxt|zhengfang|zfjw/.test(text)) return "zhengfang";
+  if (/qiangzhi|qzjw|jwmanage/.test(text)) return "qiangzhi";
+  if (/kingosoft|qingguo/.test(text)) return "kingosoft";
+  if (/chaoxing|xuexitong|superstar/.test(text)) return "chaoxing";
+  return "";
+}
+
+function normalizeSubmissionFailureType(value) {
+  const text = (value || "").toString().trim().toLowerCase();
+  if (!text) return "";
+  if (text === "parser_crash" || text === "parsercrash") return "parser_crash";
+  if (text === "parser_empty" || text === "parserempty") return "parser_empty";
+  if (text === "extractor_empty" || text === "extractorempty") return "extractor_empty";
+  if (text === "unsupported_format" || text === "unsupportedformat") return "unsupported_format";
+  if (text === "login_required" || text === "loginrequired") return "login_required";
+  if (text === "captcha_required" || text === "captcharequired") return "captcha_required";
+  if (text === "non_timetable" || text === "nontimetable") return "non_timetable";
+  if (text === "unknown") return "unknown";
+  return "";
+}
+
+function normalizeFinalResult(value) {
+  const text = (value || "").toString().trim().toLowerCase();
+  if (text === "success" || text === "succeeded") return "success";
+  if (text === "failed" || text === "failure" || text === "error") return "failed";
+  return "";
+}
+
+function mapFailureCategory(failureType) {
+  switch (failureType) {
+    case "login_required":
+    case "captcha_required":
+      return "page_state";
+    case "parser_crash":
+    case "parser_empty":
+      return "parser_failure";
+    case "extractor_empty":
+    case "unsupported_format":
+    case "non_timetable":
+      return "content_state";
+    default:
+      return "unknown";
+  }
+}
+
+function detectSubmissionSignals(content, sourceUrl) {
+  const text = `${content || ""}\n${sourceUrl || ""}`;
+  const hasHtml = /<\/?(html|body|table|div|span|script|form|input)[^>]*>/i.test(text);
+  const loginLike =
+    /(?:^|[^a-z])(login|signin|cas|sso)(?:[^a-z]|$)/i.test(text) ||
+    /\u767b\u5f55|\u7528\u6237\u540d|\u5bc6\u7801|\u7edf\u4e00\u8eab\u4efd\u8ba4\u8bc1/.test(text);
+  const captchaLike =
+    /captcha|checkcode|verifycode|validcode/i.test(text) ||
+    /\u9a8c\u8bc1\u7801|\u56fe\u5f62\u6821\u9a8c/.test(text);
+  const timetableLike =
+    /courseName|courseTable|kbList|scheduleHtmlParser|xskbcx|timeTable|weekday/i.test(text) ||
+    /\u8bfe\u8868|\u8bfe\u7a0b\u8868|\u4e0a\u8bfe\u65f6\u95f4|\u5468\u6b21|\u8282\u6b21|\u6559\u5b66\u73ed|\u8bfe\u7a0b\u5b89\u6392|\u661f\u671f[\u4e00-\u65e5\u5929]/.test(
+      text
+    );
+  return {
+    hasHtml,
+    loginLike,
+    captchaLike,
+    timetableLike,
+    systemFromUrl: detectSchoolSystemTypeFromUrl(sourceUrl),
+    systemFromContent: detectSchoolSystemType(content)
+  };
+}
+
+function classifyFailureByRule({ content, sourceUrl, failureTypeInput, attemptedParsers }) {
+  const normalizedInput = normalizeSubmissionFailureType(failureTypeInput);
+  if (normalizedInput) {
+    return {
+      failureType: normalizedInput,
+      failureCategory: mapFailureCategory(normalizedInput),
+      failureSource: "client",
+      confident: normalizedInput !== "unknown"
+    };
+  }
+  const signals = detectSubmissionSignals(content, sourceUrl);
+  const trimmed = (content || "").toString().trim();
+  if (!trimmed) {
+    return {
+      failureType: "extractor_empty",
+      failureCategory: mapFailureCategory("extractor_empty"),
+      failureSource: "rule",
+      confident: true
+    };
+  }
+  if (!signals.hasHtml && trimmed.length < 80) {
+    return {
+      failureType: "extractor_empty",
+      failureCategory: mapFailureCategory("extractor_empty"),
+      failureSource: "rule",
+      confident: true
+    };
+  }
+  if (signals.captchaLike) {
+    return {
+      failureType: "captcha_required",
+      failureCategory: mapFailureCategory("captcha_required"),
+      failureSource: "rule",
+      confident: true
+    };
+  }
+  if (signals.loginLike && !signals.timetableLike) {
+    return {
+      failureType: "login_required",
+      failureCategory: mapFailureCategory("login_required"),
+      failureSource: "rule",
+      confident: true
+    };
+  }
+  if (!signals.timetableLike) {
+    return {
+      failureType: "non_timetable",
+      failureCategory: mapFailureCategory("non_timetable"),
+      failureSource: "rule",
+      confident: signals.hasHtml
+    };
+  }
+  if (Array.isArray(attemptedParsers) && attemptedParsers.length > 0) {
+    return {
+      failureType: "parser_empty",
+      failureCategory: mapFailureCategory("parser_empty"),
+      failureSource: "rule",
+      confident: true
+    };
+  }
+  return {
+    failureType: "unsupported_format",
+    failureCategory: mapFailureCategory("unsupported_format"),
+    failureSource: "rule",
+    confident: false
+  };
+}
+
+function isSummaryProviderReady() {
+  if (summaryProvider === "gemini") {
+    return Boolean(summaryApiKey);
+  }
+  return Boolean(summaryApiKey);
+}
+
+async function classifyFailureByModel({
+  content,
+  sourceUrl,
+  attemptedParsers,
+  scriptName,
+  ruleFailureType,
+  schoolSystemType
+}) {
+  if (!isSummaryProviderReady()) return null;
+  const systemPrompt =
+    "你是教务解析失败分类助手，只输出 JSON 对象。" +
+    '字段仅允许：failureType, schoolSystemType, confidence。' +
+    'failureType 仅允许：parser_crash, parser_empty, extractor_empty, unsupported_format, login_required, captcha_required, non_timetable, unknown。' +
+    'schoolSystemType 仅允许：zhengfang, qiangzhi, kingosoft, chaoxing, unknown。';
+  const userPrompt =
+    "请结合以下上下文判断失败原因与教务系统类型，不要输出额外说明。\n" +
+    JSON.stringify({
+      sourceUrl: (sourceUrl || "").toString().slice(0, 400),
+      attemptedParsers: Array.isArray(attemptedParsers) ? attemptedParsers.slice(0, 6) : [],
+      scriptName: sanitizeScriptName(scriptName || "").slice(0, 120),
+      ruleFailureType: normalizeSubmissionFailureType(ruleFailureType) || "unknown",
+      schoolSystemType: normalizeSchoolSystemType(schoolSystemType) || "unknown",
+      contentPreview: (content || "").toString().slice(0, 2400)
+    });
+  const rawText =
+    summaryProvider === "gemini"
+      ? await callGemini(systemPrompt, userPrompt, {
+          provider: summaryProvider,
+          apiKey: summaryApiKey,
+          model: summaryModel,
+          baseUrl: summaryBaseUrl,
+          usageType: "summary",
+          extra: summaryRequestExtra,
+          apiStyle: summaryApiStyleRaw
+        })
+      : await callOpenAICompatible(systemPrompt, userPrompt, {
+          provider: summaryProvider,
+          apiKey: summaryApiKey,
+          model: summaryModel,
+          baseUrl: summaryBaseUrl,
+          usageType: "summary",
+          extra: summaryRequestExtra,
+          apiStyle: summaryApiStyleRaw
+        });
+  const objectText = sliceJson(rawText?.text || "", "{", "}");
+  const parsed = objectText ? safeJson(objectText) : null;
+  if (!parsed || typeof parsed !== "object") return null;
+  const failureType = normalizeSubmissionFailureType(parsed.failureType) || "unknown";
+  const inferredSystem = normalizeSchoolSystemType(parsed.schoolSystemType) || "unknown";
+  const confidence = Number(parsed.confidence || 0);
+  return {
+    failureType,
+    schoolSystemType: inferredSystem,
+    confidence: Number.isFinite(confidence) ? confidence : 0
+  };
+}
+
+function resolveSchoolSystemTypeWithEvidence(content, input, sourceUrl, inferredHint = "") {
+  const normalizedInput = normalizeSchoolSystemType(input);
+  if (normalizedInput) {
+    return { schoolSystemType: normalizedInput, schoolSystemSource: "client" };
+  }
+  const fromUrl = detectSchoolSystemTypeFromUrl(sourceUrl);
+  if (fromUrl) {
+    return { schoolSystemType: fromUrl, schoolSystemSource: "url" };
+  }
+  const fromContent = detectSchoolSystemType(content);
+  if (fromContent && fromContent !== "unknown") {
+    return { schoolSystemType: fromContent, schoolSystemSource: "content" };
+  }
+  const fromHint = normalizeSchoolSystemType(inferredHint);
+  if (fromHint) {
+    return { schoolSystemType: fromHint, schoolSystemSource: "model" };
+  }
+  return { schoolSystemType: "unknown", schoolSystemSource: "unknown" };
+}
+
+async function resolveSubmissionClassification({
+  content,
+  sourceUrl,
+  failureTypeInput,
+  schoolSystemTypeInput,
+  attemptedParsers,
+  scriptName
+}) {
+  const rule = classifyFailureByRule({
+    content,
+    sourceUrl,
+    failureTypeInput,
+    attemptedParsers
+  });
+  let modelResult = null;
+  if (!rule.confident || !normalizeSchoolSystemType(schoolSystemTypeInput)) {
+    modelResult = await classifyFailureByModel({
+      content,
+      sourceUrl,
+      attemptedParsers,
+      scriptName,
+      ruleFailureType: rule.failureType,
+      schoolSystemType: schoolSystemTypeInput
+    });
+  }
+  const modelFailureType = normalizeSubmissionFailureType(modelResult?.failureType);
+  const failureType =
+    modelFailureType && (!rule.confident || rule.failureType === "unsupported_format" || rule.failureType === "unknown")
+      ? modelFailureType
+      : rule.failureType;
+  const failureSource =
+    modelFailureType && failureType === modelFailureType && failureType !== rule.failureType
+      ? "model"
+      : rule.failureSource;
+  const failureCategory = mapFailureCategory(failureType);
+  const schoolSystem = resolveSchoolSystemTypeWithEvidence(
+    content,
+    schoolSystemTypeInput,
+    sourceUrl,
+    modelResult?.schoolSystemType || ""
+  );
+  return {
+    failureType: failureType || "unknown",
+    failureCategory,
+    failureSource,
+    schoolSystemType: schoolSystem.schoolSystemType || "unknown",
+    schoolSystemSource: schoolSystem.schoolSystemSource || "unknown"
+  };
+}
+
 function resolveSchoolSystemType(content, input) {
-  const normalized = normalizeSchoolSystemType(input);
-  if (normalized) return normalized;
-  return detectSchoolSystemType(content);
+  return resolveSchoolSystemTypeWithEvidence(content, input, "", "").schoolSystemType;
 }
 
 function extractSchoolNameFromContent(content) {
@@ -4361,7 +4836,7 @@ async function resolveSchoolIdByName(schoolIdInput, schoolNameInput) {
   return normalizedFull;
 }
 
-async function saveSchoolInfo(schoolId, schoolName, schoolSystemType, urls = []) {
+async function saveSchoolInfo(schoolId, schoolName, schoolSystemType, urls = [], options = {}) {
   // 维护学校基础信息，便于面板展示与统计
   if (!schoolId) return;
   const key = "school:info";
@@ -4374,6 +4849,7 @@ async function saveSchoolInfo(schoolId, schoolName, schoolSystemType, urls = [])
     schoolId,
     schoolName: resolvedSchoolName,
     schoolSystemType: schoolSystemType || existing?.schoolSystemType || "unknown",
+    systemSource: (options?.systemSource || existing?.systemSource || "").toString(),
     primaryUrl,
     urls: mergedUrls,
     updatedAt: Date.now()
@@ -4392,6 +4868,7 @@ async function getSchoolInfoMap() {
       schoolId,
       schoolName: info.schoolName || "",
       schoolSystemType: normalizeSchoolSystemType(info.schoolSystemType) || "unknown",
+      systemSource: (info.systemSource || "").toString(),
       primaryUrl: info.primaryUrl || "",
       urls: Array.isArray(info.urls) ? info.urls : [],
       updatedAt: Number(info.updatedAt || 0)

@@ -79,6 +79,7 @@
                       <th>学校</th>
                       <th>名称</th>
                       <th>教务系统</th>
+                      <th>识别来源</th>
                       <th>队列</th>
                       <th>成功率</th>
                       <th>解析</th>
@@ -250,10 +251,59 @@
 
           <div id="page-scripts" class="page-section">
             <section class="mb-24">
+              <div class="grid cards" id="scriptAnalyticsCards"></div>
+            </section>
+            <section class="filter-bar mb-24">
+              <div class="filters">
+                <div class="filter">
+                  <label>统计口径</label>
+                  <select id="scriptViewMode">
+                    <option value="session">会话级</option>
+                    <option value="raw">原始逐脚本</option>
+                  </select>
+                </div>
+                <div class="filter">
+                  <label>教务系统</label>
+                  <select id="scriptFilterSystemType"></select>
+                </div>
+                <div class="filter">
+                  <label>结果</label>
+                  <select id="scriptFilterFinalResult">
+                    <option value="">全部</option>
+                    <option value="success">含成功</option>
+                    <option value="failed">含失败</option>
+                  </select>
+                </div>
+                <div class="filter">
+                  <label>失败类型</label>
+                  <select id="scriptFilterFailureType"></select>
+                </div>
+              </div>
+            </section>
+            <section class="mb-24">
+              <h3 class="section-title">脚本解析统计</h3>
+              <div class="meta" id="scriptAnalyticsMeta">等待数据...</div>
+              <table class="table" id="scriptAnalyticsTable">
+                <thead>
+                  <tr>
+                    <th>脚本</th>
+                    <th>成功</th>
+                    <th>失败</th>
+                    <th>成功率</th>
+                    <th>系统分布</th>
+                    <th>失败原因</th>
+                    <th>未知占比</th>
+                    <th>最近更新</th>
+                  </tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </section>
+            <section class="mb-24">
               <div class="grid cards" id="scriptSummaryCards"></div>
             </section>
             <section class="mb-24">
-              <h3 class="section-title">脚本列表</h3>
+              <h3 class="section-title">脚本发布管理</h3>
               <table class="table" id="scriptTable">
                 <thead>
                   <tr>

@@ -2092,6 +2092,9 @@ function buildRepairTraceContext(meta) {
   if (info.scriptName) parts.push(`脚本 ${info.scriptName}`);
   if (Number(info.previousVersion || 0) > 0) parts.push(`基于 v${Number(info.previousVersion || 0)}`);
   if (Number(info.sampleCount || 0) > 0) parts.push(`样本 ${Number(info.sampleCount || 0)}`);
+  if (Number(info.statusCode || 0) > 0) parts.push(`HTTP ${Number(info.statusCode || 0)}`);
+  if ((info.errorCode || "").toString().trim()) parts.push(`错误码 ${String(info.errorCode).trim()}`);
+  if (Number(info.latencyMs || 0) > 0) parts.push(`耗时 ${Number(info.latencyMs || 0)}ms`);
   return parts.join(" · ");
 }
 

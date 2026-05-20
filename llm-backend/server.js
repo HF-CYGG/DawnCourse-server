@@ -2683,24 +2683,29 @@ async function processQueueCluster(schoolId, items, normalizedIssues, state, now
       action: "summarize_submissions"
     }
   });
-  const summary = await summarizeSubmissions(mergedText, schoolId);
-  if (!summary) {
+  const summaryResult = await summarizeSubmissions(mergedText, schoolId);
+  if (!summaryResult.ok || !summaryResult.text) {
     await appendRepairIssueTraceBatch(issueIds, {
       stage: "CANDIDATE_TEST_RESULT",
       level: "error",
-      message: "模型 1 汇总失败，未生成结构总结",
+      message: `模型 1 汇总失败：${summaryResult.failureReason || "未生成结构总结"}`,
       source: "queue_processor",
       meta: {
         schoolId,
         modelRole: "summary",
-        provider: summaryProvider,
-        model: summaryModel,
+        provider: summaryResult.provider || summaryProvider,
+        model: summaryResult.model || summaryModel,
         action: "summarize_submissions",
-        ok: false
+        ok: false,
+        statusCode: Number(summaryResult.statusCode || 0),
+        latencyMs: Number(summaryResult.latencyMs || 0),
+        errorCode: summaryResult.errorCode || "",
+        errorMessage: summaryResult.errorMessage || ""
       }
     });
     return { state, applied: false };
   }
+  const summary = summaryResult.text;
   await appendRepairIssueTraceBatch(issueIds, {
     stage: "CANDIDATE_TEST_RUNNING",
     level: "info",
@@ -2715,23 +2720,28 @@ async function processQueueCluster(schoolId, items, normalizedIssues, state, now
       ok: true
     }
   });
-  const patchGuidance = await generatePatchGuidance(summary, schoolId);
+  const patchGuidanceResult = await generatePatchGuidance(summary, schoolId);
   await appendRepairIssueTraceBatch(issueIds, {
     stage: "CANDIDATE_TEST_RUNNING",
-    level: patchGuidance ? "info" : "warning",
-    message: patchGuidance
+    level: patchGuidanceResult.ok && patchGuidanceResult.text ? "info" : "warning",
+    message: patchGuidanceResult.ok && patchGuidanceResult.text
       ? "修复指令生成完成，准备调用模型 2 生成候选脚本"
-      : "修复指令为空，仍继续调用模型 2 生成候选脚本",
+      : `修复指令生成失败：${patchGuidanceResult.failureReason || "输出为空"}，仍继续调用模型 2 生成候选脚本`,
     source: "queue_processor",
     meta: {
       schoolId,
       modelRole: "summary",
-      provider: summaryProvider,
-      model: summaryModel,
+      provider: patchGuidanceResult.provider || summaryProvider,
+      model: patchGuidanceResult.model || summaryModel,
       action: "generate_patch_guidance",
-      ok: Boolean(patchGuidance)
+      ok: Boolean(patchGuidanceResult.ok && patchGuidanceResult.text),
+      statusCode: Number(patchGuidanceResult.statusCode || 0),
+      latencyMs: Number(patchGuidanceResult.latencyMs || 0),
+      errorCode: patchGuidanceResult.errorCode || "",
+      errorMessage: patchGuidanceResult.errorMessage || ""
     }
   });
+  const patchGuidance = patchGuidanceResult.text || "";
   const summaryHash = hashText(summary);
   const issueCategories = Array.from(
     new Set((normalizedIssues || []).map((item) => (item?.category || "").toString()).filter(Boolean))
@@ -2778,26 +2788,31 @@ async function processQueueCluster(schoolId, items, normalizedIssues, state, now
       action: "generate_candidate_script"
     }
   });
-  const generatedScript = await generateParserScript(summary, patchGuidance, previousScript, schoolId);
-  if (!generatedScript) {
+  const generatedScriptResult = await generateParserScript(summary, patchGuidance, previousScript, schoolId);
+  if (!generatedScriptResult.ok || !generatedScriptResult.text) {
     await appendRepairIssueTraceBatch(issueIds, {
       stage: "CANDIDATE_TEST_RESULT",
       level: "error",
-      message: "模型 2 生成候选脚本失败",
+      message: `模型 2 生成候选脚本失败：${generatedScriptResult.failureReason || "未生成脚本"}`,
       source: "queue_processor",
       meta: {
         schoolId,
         scriptName,
         previousVersion: Number(previousMeta?.version || 0),
         modelRole: "script_repair",
-        provider: scriptProvider,
-        model: scriptModel,
+        provider: generatedScriptResult.provider || scriptProvider,
+        model: generatedScriptResult.model || scriptModel,
         action: "generate_candidate_script",
-        ok: false
+        ok: false,
+        statusCode: Number(generatedScriptResult.statusCode || 0),
+        latencyMs: Number(generatedScriptResult.latencyMs || 0),
+        errorCode: generatedScriptResult.errorCode || "",
+        errorMessage: generatedScriptResult.errorMessage || ""
       }
     });
     return { state, applied: false };
   }
+  const generatedScript = generatedScriptResult.text;
   const replayStart = Date.now();
   await appendRepairIssueTraceBatch(issueIds, {
     stage: "CANDIDATE_TEST_RUNNING",
@@ -2904,6 +2919,7 @@ async function processQueueCluster(schoolId, items, normalizedIssues, state, now
  */
 async function processIndividualSummaries(schoolId, queue, issueIds = []) {
   const summaries = [];
+  let lastSummaryFailure = null;
   await appendRepairIssueTraceBatch(issueIds, {
     stage: "CANDIDATE_TEST_RUNNING",
     level: "info",
@@ -2919,22 +2935,30 @@ async function processIndividualSummaries(schoolId, queue, issueIds = []) {
     }
   });
   for (const item of queue) {
-    const summary = await summarizeSubmissions(item.content, schoolId);
-    if (summary) summaries.push(summary);
+    const summaryResult = await summarizeSubmissions(item.content, schoolId);
+    if (summaryResult.ok && summaryResult.text) {
+      summaries.push(summaryResult.text);
+    } else if (!lastSummaryFailure || summaryResult.failureReason) {
+      lastSummaryFailure = summaryResult;
+    }
   }
   if (summaries.length === 0) {
     await appendRepairIssueTraceBatch(issueIds, {
       stage: "CANDIDATE_TEST_RESULT",
       level: "error",
-      message: "逐条汇总失败，未生成可用总结",
+      message: `逐条汇总失败：${lastSummaryFailure?.failureReason || "未生成可用总结"}`,
       source: "queue_processor",
       meta: {
         schoolId,
         modelRole: "summary",
-        provider: summaryProvider,
-        model: summaryModel,
+        provider: lastSummaryFailure?.provider || summaryProvider,
+        model: lastSummaryFailure?.model || summaryModel,
         action: "summarize_submissions_single",
-        ok: false
+        ok: false,
+        statusCode: Number(lastSummaryFailure?.statusCode || 0),
+        latencyMs: Number(lastSummaryFailure?.latencyMs || 0),
+        errorCode: lastSummaryFailure?.errorCode || "",
+        errorMessage: lastSummaryFailure?.errorMessage || ""
       }
     });
     return;
@@ -2958,24 +2982,29 @@ async function processIndividualSummaries(schoolId, queue, issueIds = []) {
       ok: true
     }
   });
-  const patchGuidance = await generatePatchGuidance(mergedSummary, schoolId);
+  const patchGuidanceResult = await generatePatchGuidance(mergedSummary, schoolId);
   await appendRepairIssueTraceBatch(issueIds, {
     stage: "CANDIDATE_TEST_RUNNING",
-    level: patchGuidance ? "info" : "warning",
-    message: patchGuidance
+    level: patchGuidanceResult.ok && patchGuidanceResult.text ? "info" : "warning",
+    message: patchGuidanceResult.ok && patchGuidanceResult.text
       ? "逐条修复指令生成完成，准备调用模型 2"
-      : "逐条修复指令为空，仍继续调用模型 2",
+      : `逐条修复指令生成失败：${patchGuidanceResult.failureReason || "输出为空"}，仍继续调用模型 2`,
     source: "queue_processor",
     meta: {
       schoolId,
       scriptName,
       modelRole: "summary",
-      provider: summaryProvider,
-      model: summaryModel,
+      provider: patchGuidanceResult.provider || summaryProvider,
+      model: patchGuidanceResult.model || summaryModel,
       action: "generate_patch_guidance_single",
-      ok: Boolean(patchGuidance)
+      ok: Boolean(patchGuidanceResult.ok && patchGuidanceResult.text),
+      statusCode: Number(patchGuidanceResult.statusCode || 0),
+      latencyMs: Number(patchGuidanceResult.latencyMs || 0),
+      errorCode: patchGuidanceResult.errorCode || "",
+      errorMessage: patchGuidanceResult.errorMessage || ""
     }
   });
+  const patchGuidance = patchGuidanceResult.text || "";
   await appendRepairIssueTraceBatch(issueIds, {
     stage: "CANDIDATE_TEST_RUNNING",
     level: "info",
@@ -2991,26 +3020,31 @@ async function processIndividualSummaries(schoolId, queue, issueIds = []) {
       action: "generate_candidate_script_single"
     }
   });
-  const generatedScript = await generateParserScript(mergedSummary, patchGuidance, previousScript, schoolId);
-  if (!generatedScript) {
+  const generatedScriptResult = await generateParserScript(mergedSummary, patchGuidance, previousScript, schoolId);
+  if (!generatedScriptResult.ok || !generatedScriptResult.text) {
     await appendRepairIssueTraceBatch(issueIds, {
       stage: "CANDIDATE_TEST_RESULT",
       level: "error",
-      message: "模型 2 生成逐条修复候选脚本失败",
+      message: `模型 2 生成逐条修复候选脚本失败：${generatedScriptResult.failureReason || "未生成脚本"}`,
       source: "queue_processor",
       meta: {
         schoolId,
         scriptName,
         previousVersion: Number(previousMeta?.version || 0),
         modelRole: "script_repair",
-        provider: scriptProvider,
-        model: scriptModel,
+        provider: generatedScriptResult.provider || scriptProvider,
+        model: generatedScriptResult.model || scriptModel,
         action: "generate_candidate_script_single",
-        ok: false
+        ok: false,
+        statusCode: Number(generatedScriptResult.statusCode || 0),
+        latencyMs: Number(generatedScriptResult.latencyMs || 0),
+        errorCode: generatedScriptResult.errorCode || "",
+        errorMessage: generatedScriptResult.errorMessage || ""
       }
     });
     return;
   }
+  const generatedScript = generatedScriptResult.text;
   const replayStart = Date.now();
   await appendRepairIssueTraceBatch(issueIds, {
     stage: "CANDIDATE_TEST_RUNNING",
@@ -3286,7 +3320,20 @@ async function callOpenAICompatible(systemPrompt, userPrompt, options = {}) {
   const requestApiKey = options.apiKey || apiKey;
   const requestModel = resolveModelName(options.model || model);
   const requestBaseUrl = options.baseUrl || baseUrl;
-  if (!requestApiKey) return null;
+  if (!requestApiKey) {
+    return {
+      ok: false,
+      text: "",
+      usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+      raw: null,
+      provider: requestProvider,
+      model: requestModel,
+      statusCode: 0,
+      latencyMs: 0,
+      errorCode: "missing_api_key",
+      errorMessage: "missing_api_key"
+    };
+  }
   const apiStyle =
     normalizeApiStyle(options.apiStyle) || resolveApiStyle(requestProvider, requestModel);
   const endpoint = buildOpenAICompatibleEndpoint(requestBaseUrl, requestProvider, apiStyle);
@@ -3309,18 +3356,29 @@ async function callOpenAICompatible(systemPrompt, userPrompt, options = {}) {
           ]
         };
   const body = mergeRequestExtras(baseBody, options.extra);
-  const responseText = await httpPostJson(endpoint, body, {
+  const response = await httpPostJsonDetailed(endpoint, body, {
     Authorization: `Bearer ${requestApiKey}`
   });
-  if (!responseText) return null;
-  const json = safeJson(responseText);
+  const json = safeJson(response.text || "");
   const text =
     apiStyle === "responses" ? extractResponsesText(json) : json?.choices?.[0]?.message?.content || "";
   const usage = extractOpenAIUsage(json);
   if (options.usageType) {
     await recordLocalUsage(options.usageType, usage, requestProvider, requestModel);
   }
-  return { text, usage, raw: json };
+  const hasText = Boolean(text && text.toString().trim());
+  return {
+    ok: Boolean(response.ok && hasText),
+    text,
+    usage,
+    raw: json,
+    provider: requestProvider,
+    model: requestModel,
+    statusCode: Number(response.statusCode || 0),
+    latencyMs: Number(response.latencyMs || 0),
+    errorCode: response.ok ? (hasText ? "" : "invalid_response") : response.errorCode || "http_error",
+    errorMessage: response.ok ? (hasText ? "" : "empty_content") : response.errorMessage || "request_failed"
+  };
 }
 
 /**
@@ -3331,7 +3389,20 @@ async function callGemini(systemPrompt, userPrompt, options = {}) {
   const requestApiKey = options.apiKey || apiKey;
   const requestModel = resolveModelName(options.model || model);
   const requestBaseUrl = options.baseUrl || baseUrl;
-  if (!requestApiKey) return null;
+  if (!requestApiKey) {
+    return {
+      ok: false,
+      text: "",
+      usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+      raw: null,
+      provider: "gemini",
+      model: requestModel,
+      statusCode: 0,
+      latencyMs: 0,
+      errorCode: "missing_api_key",
+      errorMessage: "missing_api_key"
+    };
+  }
   const endpoint = `${requestBaseUrl}/models/${requestModel}:generateContent?key=${requestApiKey}`;
   const baseBody = {
     contents: [
@@ -3346,9 +3417,8 @@ async function callGemini(systemPrompt, userPrompt, options = {}) {
     baseBody.systemInstruction = { parts: [{ text: systemPrompt }] };
   }
   const body = mergeRequestExtras(baseBody, options.extra);
-  const responseText = await httpPostJson(endpoint, body, {});
-  if (!responseText) return null;
-  const json = safeJson(responseText);
+  const response = await httpPostJsonDetailed(endpoint, body, {});
+  const json = safeJson(response.text || "");
   const text =
     json?.candidates?.[0]?.content?.parts?.[0]?.text ||
     json?.candidates?.[0]?.content?.text ||
@@ -3357,7 +3427,19 @@ async function callGemini(systemPrompt, userPrompt, options = {}) {
   if (options.usageType) {
     await recordLocalUsage(options.usageType, usage, "gemini", requestModel);
   }
-  return { text, usage, raw: json };
+  const hasText = Boolean(text && text.toString().trim());
+  return {
+    ok: Boolean(response.ok && hasText),
+    text,
+    usage,
+    raw: json,
+    provider: "gemini",
+    model: requestModel,
+    statusCode: Number(response.statusCode || 0),
+    latencyMs: Number(response.latencyMs || 0),
+    errorCode: response.ok ? (hasText ? "" : "invalid_response") : response.errorCode || "http_error",
+    errorMessage: response.ok ? (hasText ? "" : "empty_content") : response.errorMessage || "request_failed"
+  };
 }
 
 async function testModelConnectivity(config = {}) {
@@ -3499,6 +3581,34 @@ async function testModelConnectivity(config = {}) {
 /**
  * 使用模型 1 对提交内容进行总结
  */
+function normalizeModelFailureText(value) {
+  return (value || "")
+    .toString()
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 200);
+}
+
+/**
+ * 生成便于运维查看的模型失败原因摘要
+ */
+function formatModelFailureReason(result) {
+  const statusCode = Number(result?.statusCode || 0);
+  const errorCode = normalizeModelFailureText(result?.errorCode || "");
+  const errorMessage = normalizeModelFailureText(result?.errorMessage || "");
+  if (errorCode === "missing_api_key") return "未配置 API Key";
+  if (errorCode === "missing_model") return "未配置模型";
+  if (errorCode === "timeout" || errorMessage === "request_timeout") return "请求超时";
+  if (errorCode === "network_error") return `网络错误：${errorMessage || "network_error"}`;
+  if (errorMessage === "empty_content" || errorCode === "invalid_response") return "模型返回为空或无法解析";
+  if (statusCode === 401 || statusCode === 403) return `鉴权失败（HTTP ${statusCode}）`;
+  if (statusCode === 429) return "触发限流或额度不足（HTTP 429）";
+  if (statusCode >= 500) return `模型服务异常（HTTP ${statusCode}）`;
+  if (statusCode > 0 && errorMessage) return `${errorMessage}（HTTP ${statusCode}）`;
+  if (statusCode > 0) return `HTTP ${statusCode}`;
+  return errorMessage || errorCode || "unknown";
+}
+
 async function summarizeSubmissions(content, schoolId) {
   const systemPrompt =
     "你是课表解析总结助手，目标是提炼教务系统课表页面结构的关键信息。" +
@@ -3534,13 +3644,33 @@ async function summarizeSubmissions(content, schoolId) {
     if (schoolId) {
       await recordSchoolMetric(schoolId, "summary_failed", latencyMs, summaryCostPerCall);
     }
-    return "";
+    return {
+      ok: false,
+      text: "",
+      provider: rawText?.provider || summaryProvider,
+      model: rawText?.model || summaryModel,
+      statusCode: Number(rawText?.statusCode || 0),
+      latencyMs: Number(rawText?.latencyMs || latencyMs),
+      errorCode: (rawText?.errorCode || "").toString(),
+      errorMessage: (rawText?.errorMessage || "").toString(),
+      failureReason: formatModelFailureReason(rawText)
+    };
   }
   await recordMetric("summary_success", latencyMs, summaryCostPerCall);
   if (schoolId) {
     await recordSchoolMetric(schoolId, "summary_success", latencyMs, summaryCostPerCall);
   }
-  return rawText.text;
+  return {
+    ok: true,
+    text: rawText.text,
+    provider: rawText?.provider || summaryProvider,
+    model: rawText?.model || summaryModel,
+    statusCode: Number(rawText?.statusCode || 200),
+    latencyMs: Number(rawText?.latencyMs || latencyMs),
+    errorCode: "",
+    errorMessage: "",
+    failureReason: ""
+  };
 }
 
 /**
@@ -3667,13 +3797,33 @@ async function generatePatchGuidance(summary, schoolId) {
     if (schoolId) {
       await recordSchoolMetric(schoolId, "summary_failed", latencyMs, summaryCostPerCall);
     }
-    return "";
+    return {
+      ok: false,
+      text: "",
+      provider: rawText?.provider || summaryProvider,
+      model: rawText?.model || summaryModel,
+      statusCode: Number(rawText?.statusCode || 0),
+      latencyMs: Number(rawText?.latencyMs || latencyMs),
+      errorCode: (rawText?.errorCode || "").toString(),
+      errorMessage: (rawText?.errorMessage || "").toString(),
+      failureReason: formatModelFailureReason(rawText)
+    };
   }
   await recordMetric("summary_success", latencyMs, summaryCostPerCall);
   if (schoolId) {
     await recordSchoolMetric(schoolId, "summary_success", latencyMs, summaryCostPerCall);
   }
-  return rawText.text;
+  return {
+    ok: true,
+    text: rawText.text,
+    provider: rawText?.provider || summaryProvider,
+    model: rawText?.model || summaryModel,
+    statusCode: Number(rawText?.statusCode || 200),
+    latencyMs: Number(rawText?.latencyMs || latencyMs),
+    errorCode: "",
+    errorMessage: "",
+    failureReason: ""
+  };
 }
 
 /**
@@ -3724,13 +3874,33 @@ async function generateParserScript(summary, patchGuidance, previousScript, scho
     if (schoolId) {
       await recordSchoolMetric(schoolId, "script_failed", latencyMs, scriptCostPerCall);
     }
-    return "";
+    return {
+      ok: false,
+      text: "",
+      provider: rawText?.provider || scriptProvider,
+      model: rawText?.model || scriptModel,
+      statusCode: Number(rawText?.statusCode || 0),
+      latencyMs: Number(rawText?.latencyMs || latencyMs),
+      errorCode: (rawText?.errorCode || "").toString(),
+      errorMessage: (rawText?.errorMessage || "").toString(),
+      failureReason: formatModelFailureReason(rawText)
+    };
   }
   await recordMetric("script_success", latencyMs, scriptCostPerCall);
   if (schoolId) {
     await recordSchoolMetric(schoolId, "script_success", latencyMs, scriptCostPerCall);
   }
-  return cleanScriptOutput(rawText.text);
+  return {
+    ok: true,
+    text: cleanScriptOutput(rawText.text),
+    provider: rawText?.provider || scriptProvider,
+    model: rawText?.model || scriptModel,
+    statusCode: Number(rawText?.statusCode || 200),
+    latencyMs: Number(rawText?.latencyMs || latencyMs),
+    errorCode: "",
+    errorMessage: "",
+    failureReason: ""
+  };
 }
 
 /**

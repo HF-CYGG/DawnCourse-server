@@ -6099,6 +6099,24 @@ function mergeDistinctUrls(existing, incoming) {
   return Array.from(map.values());
 }
 
+function extractHost(sourceUrlOrHost) {
+  const text = (sourceUrlOrHost || "").toString().trim();
+  if (!text) return "";
+  try {
+    const parsed = new URL(text);
+    return (parsed.hostname || "").toString().trim().toLowerCase();
+  } catch {
+    // 兼容客户端上报的裸 host、带端口 host、以及错误拼接的 host/path 形式
+  }
+  const normalized = text
+    .replace(/^[a-z][a-z0-9+.-]*:\/\//i, "")
+    .replace(/[/?#].*$/, "")
+    .replace(/:\d+$/, "")
+    .trim()
+    .toLowerCase();
+  return /^[a-z0-9.-]+$/.test(normalized) ? normalized : "";
+}
+
 function extractSchoolNameFromText(text) {
   const value = (text || "").toString().replace(/\s+/g, "");
   if (!value) return "";

@@ -162,6 +162,7 @@ const adminLogBufferLimit = Number(process.env.ADMIN_LOG_BUFFER_LIMIT || 300);
 const adminLogBuffer = [];
 const adminEventClients = new Set();
 const scriptHistoryLimit = Number(process.env.SCRIPT_HISTORY_LIMIT || 200);
+const repairTraceLimit = Math.max(200, Number(process.env.REPAIR_TRACE_LIMIT || 1000));
 const scriptBackupDir = process.env.SCRIPT_BACKUP_DIR || path.join(scriptOutputDir, "backup_versions");
 const scriptFeedbackErrorLimit = Number(process.env.SCRIPT_FEEDBACK_ERROR_LIMIT || 300);
 const backendMirrorLogFile = (process.env.BACKEND_MIRROR_LOG_FILE || "/shared/parsers/llm-backend.log").trim();
@@ -773,6 +774,46 @@ const server = http.createServer((req, res) => {
     }
     return sendJson(res, 200, { code: 200, data: result });
   }
+  if (req.method === "GET" && /^\/api(?:\/v1)?\/admin\/repair\/issues\/[^/]+\/timeline$/.test(url.pathname)) {
+    const auth = await requireAdminAuth(req);
+    if (!auth.ok) {
+      return sendJson(res, 401, { code: 401, msg: "未登录" });
+    }
+    const issueId = decodeURIComponent(url.pathname.split("/").slice(-2)[0] || "");
+    const data = await getRepairIssueTimeline(issueId, Number(url.searchParams.get("limit") || 200));
+    if (!data) {
+      return sendJson(res, 404, { code: 404, msg: "Issue 不存在" });
+    }
+    return sendJson(res, 200, { code: 200, data });
+  }
+  if (req.method === "GET" && /^\/api(?:\/v1)?\/admin\/repair\/issues\/[^/]+\/logs$/.test(url.pathname)) {
+    const auth = await requireAdminAuth(req);
+    if (!auth.ok) {
+      return sendJson(res, 401, { code: 401, msg: "未登录" });
+    }
+    const issueId = decodeURIComponent(url.pathname.split("/").slice(-2)[0] || "");
+    const stage = normalizeTraceStage((url.searchParams.get("stage") || "").toString());
+    const level = normalizeTraceLevel((url.searchParams.get("level") || "").toString());
+    const limit = Math.max(1, Math.min(500, Number(url.searchParams.get("limit") || 100)));
+    const cursor = Math.max(0, Number(url.searchParams.get("cursor") || 0));
+    const data = await getRepairIssueLogs(issueId, { stage, level, limit, cursor });
+    if (!data) {
+      return sendJson(res, 404, { code: 404, msg: "Issue 不存在" });
+    }
+    return sendJson(res, 200, { code: 200, data });
+  }
+  if (req.method === "POST" && /^\/api(?:\/v1)?\/admin\/repair\/issues\/[^/]+\/retry$/.test(url.pathname)) {
+    const auth = await requireAdminAuth(req);
+    if (!auth.ok) {
+      return sendJson(res, 401, { code: 401, msg: "未登录" });
+    }
+    const issueId = decodeURIComponent(url.pathname.split("/").slice(-2)[0] || "");
+    const result = await retryRepairIssue(issueId, auth.username);
+    if (!result.ok) {
+      return sendJson(res, result.code || 400, { code: result.code || 400, msg: result.reason || "重试失败" });
+    }
+    return sendJson(res, 200, { code: 200, data: result });
+  }
   if (req.method === "POST" && (url.pathname === "/api/admin/scripts/releases" || url.pathname === "/api/v1/admin/scripts/releases")) {
     const auth = await requireAdminAuth(req);
     if (!auth.ok) {
@@ -807,6 +848,25 @@ const server = http.createServer((req, res) => {
     if (!result.ok) {
       return sendJson(res, 400, { code: 400, msg: result.reason || "发布失败", data: result });
     }
+    const releaseIssueIds = await resolveIssueIdsForScriptAction(
+      scriptName,
+      body?.issueIds || body?.issueId || body?.issue_id || []
+    );
+    const releaseTraceStage =
+      releaseStage === "pending" ? "PENDING_RELEASE" : releaseStage === "rollback" ? "ROLLED_BACK" : "PUBLISHED";
+    await appendRepairIssueTraceBatch(releaseIssueIds, {
+      stage: releaseTraceStage,
+      level: "info",
+      message:
+        releaseTraceStage === "PENDING_RELEASE"
+          ? "管理员发布：脚本进入 pending"
+          : releaseTraceStage === "ROLLED_BACK"
+            ? "管理员发布：脚本已回滚"
+            : "管理员发布：脚本已发布",
+      actor: auth.username,
+      source: "admin_release",
+      meta: { scriptName, releaseStage }
+    });
     const meta = await getScriptMeta(scriptName);
     return sendJson(res, 200, { code: 200, data: { meta, result } });
   }
@@ -863,6 +923,18 @@ const server = http.createServer((req, res) => {
     if (!result.ok) {
       return sendJson(res, 500, { code: 500, msg: result.reason || "发布失败" });
     }
+    const releaseIssueIds = await resolveIssueIdsForScriptAction(
+      scriptName,
+      body?.issueIds || body?.issueId || body?.issue_id || []
+    );
+    await appendRepairIssueTraceBatch(releaseIssueIds, {
+      stage: "PUBLISHED",
+      level: "info",
+      message: releaseStage === "canary" ? "管理员发布：灰度发布成功" : "管理员发布：全量发布成功",
+      actor: auth.username,
+      source: "admin_promote",
+      meta: { scriptName, releaseStage }
+    });
     if (!result.pending) {
       await clearPendingScript(scriptName);
     }
@@ -915,6 +987,18 @@ const server = http.createServer((req, res) => {
     if (!result.ok) {
       return sendJson(res, 500, { code: 500, msg: result.reason || "回滚失败" });
     }
+    const rollbackIssueIds = await resolveIssueIdsForScriptAction(
+      scriptName,
+      body?.issueIds || body?.issueId || body?.issue_id || []
+    );
+    await appendRepairIssueTraceBatch(rollbackIssueIds, {
+      stage: "ROLLED_BACK",
+      level: "warning",
+      message: "管理员回滚：脚本已回滚",
+      actor: auth.username,
+      source: "admin_rollback",
+      meta: { scriptName, targetVersion: version }
+    });
     const meta = await getScriptMeta(scriptName);
     return sendJson(res, 200, { code: 200, data: { meta } });
   }
@@ -1045,6 +1129,58 @@ const server = http.createServer((req, res) => {
   // 3. 将任务存入学校维度队列，进入异步合并窗口
   // 4. 返回 taskId 供客户端轮询
   // ---------------------------------------------------------------------------
+  if (req.method === "POST" && url.pathname === "/api/v1/admin/config/test") {
+    const auth = await requireAdminAuth(req);
+    if (!auth.ok) {
+      return sendJson(res, 401, { code: 401, msg: "未登录" });
+    }
+    const bodyText = await readBody(req, maxContentLength);
+    if (!bodyText) return sendJson(res, 400, { code: 400, msg: "无效请求体" });
+    const body = safeJson(bodyText) || {};
+    const target = (body?.target || "").toString().trim().toLowerCase();
+    const useSummary = target === "model1" || target === "summary";
+    const useScript = target === "model2" || target === "script";
+    const providerRaw = (body?.provider || (useScript ? scriptProviderRaw : summaryProviderRaw) || "auto")
+      .toString()
+      .trim()
+      .toLowerCase();
+    const modelRaw = (body?.model || (useScript ? scriptModelRaw : summaryModelRaw) || "").toString().trim();
+    const modelFallback =
+      providerRaw === "auto"
+        ? useScript
+          ? defaultScriptModel("gpt")
+          : defaultSummaryModel("gpt")
+        : "";
+    const modelName = resolveModelName(modelRaw || modelFallback);
+    const providerName = normalizeProvider(providerRaw || "auto", modelName);
+    const apiKeyValue = (body?.apiKey || (useScript ? scriptApiKey : summaryApiKey) || "").toString().trim();
+    const baseUrlValue = (body?.baseUrl || (useScript ? scriptBaseUrl : summaryBaseUrl) || defaultBaseUrl(providerName))
+      .toString()
+      .trim();
+    const apiStyleRaw = (body?.apiStyle || (useScript ? scriptApiStyleRaw : summaryApiStyleRaw) || "").toString().trim();
+    let extraBody = null;
+    const extraRaw = body?.extraBody ?? body?.extra ?? body?.extraJson ?? body?.requestExtraJson ?? "";
+    if (typeof extraRaw === "string" && extraRaw.trim()) {
+      const parsed = safeJson(extraRaw);
+      if (!parsed || typeof parsed !== "object") {
+        return sendJson(res, 400, { code: 400, msg: "extraBody JSON 格式无效" });
+      }
+      extraBody = parsed;
+    } else if (extraRaw && typeof extraRaw === "object") {
+      extraBody = extraRaw;
+    } else {
+      extraBody = useScript ? scriptRequestExtra : summaryRequestExtra;
+    }
+    const result = await testModelConnectivity({
+      provider: providerName,
+      model: modelName,
+      apiKey: apiKeyValue,
+      baseUrl: baseUrlValue,
+      apiStyle: apiStyleRaw,
+      extra: extraBody
+    });
+    return sendJson(res, 200, { code: 200, data: result });
+  }
   if (req.method === "POST" && url.pathname === "/api/v1/parse_task") {
     // 读取请求体并限制长度
     const bodyText = await readBody(req, maxContentLength);
@@ -1068,7 +1204,7 @@ const server = http.createServer((req, res) => {
       : [];
     const clientVersion = (body?.clientVersion || body?.client_version || "").toString();
     const parseSessionId = (body?.parseSessionId || body?.parse_session_id || "").toString().trim();
-    const issueId = (body?.issueId || body?.issue_id || "").toString().trim();
+    let issueId = (body?.issueId || body?.issue_id || "").toString().trim();
     const userConsent = body?.userConsent === true || body?.consent === true;
     // content 不能为空
     if (!content) {
@@ -1124,6 +1260,12 @@ const server = http.createServer((req, res) => {
       attemptedParsers,
       scriptName
     });
+    if (!issueId && parseSessionId) {
+      const mappedIssueId = await redisClient.get(buildParseSessionIssueKey(parseSessionId));
+      if (mappedIssueId) {
+        issueId = mappedIssueId.toString().trim();
+      }
+    }
     const schoolSystemType = classification.schoolSystemType;
     if (schoolId) {
       await saveSchoolInfo(schoolId, schoolName, schoolSystemType, candidateUrls, {
@@ -1155,6 +1297,20 @@ const server = http.createServer((req, res) => {
       issueId,
       attemptedParsers
     });
+    if (issueId) {
+      await appendRepairIssueTrace(issueId, {
+        stage: "QUEUED",
+        level: "info",
+        message: "云端兜底解析任务已创建",
+        source: "parse_task",
+        meta: {
+          taskId,
+          schoolId,
+          scriptName: sanitizeScriptName(scriptName || ""),
+          parseSessionId
+        }
+      });
+    }
     if (parseProviderReady) {
       runTask(taskId, safeContent, schoolId).catch(async () => {
         const existing = (await getTask(taskId)) || {};
@@ -1420,6 +1576,32 @@ async function recordParseReport(body) {
     finalFailureType,
     parseSessionId
   });
+  await redisClient.set(buildParseSessionIssueKey(parseSessionId), issue.issueId, { PX: queueItemTtlMs });
+  await appendRepairIssueTrace(issue.issueId, {
+    stage: "REPORT_RECEIVED",
+    level: "info",
+    message: "收到解析失败上报",
+    source: "parse_report",
+    meta: {
+      parseSessionId,
+      schoolId: storedSession.schoolId || "",
+      schoolSystemType: storedSession.schoolSystemType || "unknown",
+      failureType: issue.failureType || "unknown"
+    }
+  });
+  await appendRepairIssueTrace(issue.issueId, {
+    stage: "ISSUE_MERGED",
+    level: "info",
+    message: "失败样本已归并到 Repair Issue",
+    source: "parse_report",
+    meta: {
+      issueKey: issue.issueKey || "",
+      sampleCount: Number(issue.sampleCount || 0),
+      userCount: Number(issue.userCount || 0),
+      affectedScriptId: issue.affectedScriptId || "",
+      affectedVersion: Number(issue.affectedVersion || 0)
+    }
+  });
   if (sanitizedSample?.content && sanitizedSample?.hasUserConsent === true) {
     await saveFailureSample(issue.issueId, {
       parseSessionId,
@@ -1431,6 +1613,18 @@ async function recordParseReport(body) {
       schoolSystemType: storedSession.schoolSystemType,
       sourceUrlHost: storedSession.sourceUrlHost,
       createdAt: now
+    });
+    await appendRepairIssueTrace(issue.issueId, {
+      stage: "ISSUE_MERGED",
+      level: "info",
+      message: "脱敏样本已入库",
+      source: "parse_report",
+      meta: {
+        parseSessionId,
+        contentSha256:
+          (sanitizedSample.contentSha256 || "").toString() || hashText(sanitizedSample.content.toString()),
+        sanitizerVersion: Number(sanitizedSample.sanitizerVersion || 0)
+      }
     });
   }
   return { issueId: issue.issueId };
@@ -1484,6 +1678,9 @@ async function upsertRepairIssue({ session, pageFingerprint, attempt, finalFailu
     userCount: Number(previous?.userCount || 0),
     priority: previous?.priority || "P2",
     status: previous?.status || "open",
+    currentStage: previous?.currentStage || "REPORT_RECEIVED",
+    lastStepAt: Number(previous?.lastStepAt || now),
+    lastErrorMessage: (previous?.lastErrorMessage || "").toString(),
     lastParseSessionId: parseSessionId,
     lastAttempt: attempt,
     createdAt: Number(previous?.createdAt || now),
@@ -1543,7 +1740,16 @@ async function getRepairIssueDetail(issueId) {
     }
   }
   const attempts = issue.lastParseSessionId ? await readParserAttempts(issue.lastParseSessionId) : [];
-  return { issue, samples, attempts };
+  const timelineData = await getRepairIssueTimeline(issueId, 120);
+  const logsData = await getRepairIssueLogs(issueId, { limit: 120, cursor: 0 });
+  return {
+    issue,
+    samples,
+    attempts,
+    timeline: timelineData?.list || [],
+    logs: logsData?.list || [],
+    logsPage: logsData || { list: [], cursor: 0, nextCursor: null, total: 0 }
+  };
 }
 
 async function readParserAttempts(parseSessionId) {
@@ -1552,15 +1758,48 @@ async function readParserAttempts(parseSessionId) {
 }
 
 async function runRepairIssueTest(issueId, username) {
+  const replayStart = Date.now();
+  await appendRepairIssueTrace(issueId, {
+    stage: "REPLAY_RUNNING",
+    level: "info",
+    message: "开始执行提交样本回放",
+    actor: username || "admin",
+    source: "admin_run_test",
+    meta: {}
+  });
   const detail = await getRepairIssueDetail(issueId);
-  if (!detail) return { ok: false, code: 404, reason: "issue_not_found" };
+  if (!detail) {
+    return { ok: false, code: 404, reason: "issue_not_found" };
+  }
   const scriptName = detail.issue?.affectedScriptId || "";
   const script = await readScript(scriptName);
-  if (!script) return { ok: false, code: 404, reason: "script_not_found" };
+  if (!script) {
+    await appendRepairIssueTrace(issueId, {
+      stage: "REPLAY_RESULT",
+      level: "error",
+      message: "回放失败：脚本不存在",
+      actor: username || "admin",
+      source: "admin_run_test",
+      durationMs: Date.now() - replayStart,
+      meta: { scriptName }
+    });
+    return { ok: false, code: 404, reason: "script_not_found" };
+  }
   const submissions = detail.samples
     .filter((item) => item.content)
     .map((item) => ({ content: item.content, hash: item.contentSha256 || item.sampleId }));
-  if (submissions.length === 0) return { ok: false, code: 400, reason: "sample_not_found" };
+  if (submissions.length === 0) {
+    await appendRepairIssueTrace(issueId, {
+      stage: "REPLAY_RESULT",
+      level: "error",
+      message: "回放失败：无可用样本",
+      actor: username || "admin",
+      source: "admin_run_test",
+      durationMs: Date.now() - replayStart,
+      meta: {}
+    });
+    return { ok: false, code: 400, reason: "sample_not_found" };
+  }
   const replay = runSubmissionReplay(script, submissions);
   const result = {
     ok: replay.ok,
@@ -1573,10 +1812,233 @@ async function runRepairIssueTest(issueId, username) {
   const issue = issueRaw ? safeJson(issueRaw) : null;
   if (issue) {
     issue.lastReplay = result;
+    issue.currentStage = "REPLAY_RESULT";
+    issue.lastStepAt = Date.now();
+    if (!replay.ok) issue.lastErrorMessage = replay.reason || "replay_failed";
     issue.updatedAt = Date.now();
     await redisClient.set(buildRepairIssueKey(issueId), JSON.stringify(issue));
   }
+  await appendRepairIssueTrace(issueId, {
+    stage: "REPLAY_RESULT",
+    level: replay.ok ? "info" : "error",
+    message: replay.ok ? "提交样本回放通过" : `提交样本回放失败：${replay.reason || "unknown"}`,
+    actor: username || "admin",
+    source: "admin_run_test",
+    durationMs: Date.now() - replayStart,
+    meta: {
+      sampleCount: submissions.length,
+      scriptName,
+      ok: replay.ok
+    }
+  });
   return result;
+}
+
+function normalizeTraceStage(value) {
+  const stage = (value || "").toString().trim().toUpperCase();
+  const allowed = new Set([
+    "REPORT_RECEIVED",
+    "ISSUE_MERGED",
+    "QUEUED",
+    "REPLAY_RUNNING",
+    "REPLAY_RESULT",
+    "CANDIDATE_TEST_RUNNING",
+    "CANDIDATE_TEST_RESULT",
+    "PENDING_RELEASE",
+    "PUBLISHED",
+    "ROLLED_BACK",
+    "DISABLED"
+  ]);
+  if (!stage || !allowed.has(stage)) return "";
+  return stage;
+}
+
+function normalizeTraceLevel(value) {
+  const level = (value || "").toString().trim().toLowerCase();
+  if (level === "error" || level === "warning" || level === "info") return level;
+  return "info";
+}
+
+function extractIssueIdsFromItems(items) {
+  if (!Array.isArray(items)) return [];
+  return Array.from(
+    new Set(
+      items
+        .map((item) => (item?.issueId || "").toString().trim())
+        .filter(Boolean)
+        .slice(0, 20)
+    )
+  );
+}
+
+async function appendRepairIssueTrace(issueId, entry = {}) {
+  if (!redisReady) return;
+  const normalizedIssueId = (issueId || "").toString().trim();
+  const stage = normalizeTraceStage(entry.stage);
+  if (!normalizedIssueId || !stage) return;
+  const ts = Number(entry.ts || Date.now());
+  const payload = {
+    stepId: (entry.stepId || crypto.randomUUID()).toString(),
+    issueId: normalizedIssueId,
+    stage,
+    ts,
+    level: normalizeTraceLevel(entry.level),
+    message: (entry.message || "").toString(),
+    durationMs: Number(entry.durationMs || 0),
+    actor: (entry.actor || "system").toString(),
+    source: (entry.source || "").toString(),
+    meta: entry.meta && typeof entry.meta === "object" ? entry.meta : {}
+  };
+  const raw = JSON.stringify(payload);
+  const timelineKey = buildRepairIssueTimelineKey(normalizedIssueId);
+  const logsKey = buildRepairIssueLogsKey(normalizedIssueId);
+  await Promise.all([
+    redisClient.lPush(timelineKey, raw),
+    redisClient.lTrim(timelineKey, 0, repairTraceLimit - 1),
+    redisClient.expire(timelineKey, Math.ceil(queueItemTtlMs / 1000)),
+    redisClient.lPush(logsKey, raw),
+    redisClient.lTrim(logsKey, 0, repairTraceLimit - 1),
+    redisClient.expire(logsKey, Math.ceil(queueItemTtlMs / 1000))
+  ]);
+  const issueRaw = await redisClient.get(buildRepairIssueKey(normalizedIssueId));
+  const issue = issueRaw ? safeJson(issueRaw) : null;
+  if (!issue) return;
+  issue.currentStage = stage;
+  issue.lastStepAt = ts;
+  issue.updatedAt = Date.now();
+  if (payload.level === "error") {
+    issue.lastErrorMessage = payload.message || "unknown_error";
+  }
+  if (stage === "REPLAY_RESULT") {
+    issue.lastReplayStatus = payload.meta?.ok === true ? "success" : "failed";
+  }
+  if (stage === "CANDIDATE_TEST_RESULT") {
+    issue.lastCandidateStatus = payload.meta?.ok === true ? "success" : "failed";
+  }
+  if (stage === "PENDING_RELEASE") {
+    issue.status = "pending";
+  }
+  if (stage === "PUBLISHED") {
+    issue.status = "published";
+  }
+  if (stage === "ROLLED_BACK") {
+    issue.status = "rolled_back";
+  }
+  if (stage === "DISABLED") {
+    issue.status = "disabled";
+  }
+  await redisClient.set(buildRepairIssueKey(normalizedIssueId), JSON.stringify(issue));
+}
+
+async function appendRepairIssueTraceBatch(issueIds, entry = {}) {
+  const unique = Array.from(new Set((issueIds || []).map((item) => (item || "").toString().trim()).filter(Boolean)));
+  if (!unique.length) return;
+  for (const issueId of unique) {
+    await appendRepairIssueTrace(issueId, entry);
+  }
+}
+
+async function getRepairIssueTimeline(issueId, limit = 200) {
+  const issueRaw = await redisClient.get(buildRepairIssueKey(issueId));
+  const issue = issueRaw ? safeJson(issueRaw) : null;
+  if (!issue) return null;
+  const queryLimit = Math.max(1, Math.min(1000, Number(limit || 200)));
+  const listRaw = await redisClient.lRange(buildRepairIssueTimelineKey(issueId), 0, queryLimit - 1);
+  const list = listRaw.map((item) => safeJson(item)).filter(Boolean).reverse();
+  return {
+    issueId,
+    currentStage: issue.currentStage || "",
+    lastStepAt: Number(issue.lastStepAt || issue.updatedAt || 0),
+    list
+  };
+}
+
+async function getRepairIssueLogs(issueId, options = {}) {
+  const issueRaw = await redisClient.get(buildRepairIssueKey(issueId));
+  const issue = issueRaw ? safeJson(issueRaw) : null;
+  if (!issue) return null;
+  const stageFilter = normalizeTraceStage(options.stage || "");
+  const levelFilter = normalizeTraceLevel(options.level || "");
+  const hasLevelFilter = ["info", "warning", "error"].includes((options.level || "").toString().trim().toLowerCase());
+  const limit = Math.max(1, Math.min(500, Number(options.limit || 100)));
+  const cursor = Math.max(0, Number(options.cursor || 0));
+  const maxScan = Math.max(limit * 6, 600);
+  const logsRaw = await redisClient.lRange(buildRepairIssueLogsKey(issueId), 0, maxScan - 1);
+  let list = logsRaw.map((item) => safeJson(item)).filter(Boolean);
+  if (stageFilter) {
+    list = list.filter((item) => normalizeTraceStage(item?.stage || "") === stageFilter);
+  }
+  if (hasLevelFilter) {
+    list = list.filter((item) => normalizeTraceLevel(item?.level || "") === levelFilter);
+  }
+  const page = list.slice(cursor, cursor + limit);
+  const nextCursor = cursor + page.length < list.length ? cursor + page.length : null;
+  return {
+    issueId,
+    list: page,
+    cursor,
+    nextCursor,
+    total: list.length
+  };
+}
+
+async function retryRepairIssue(issueId, username) {
+  if (!redisReady) return { ok: false, code: 503, reason: "redis_unavailable" };
+  const detail = await getRepairIssueDetail(issueId);
+  if (!detail?.issue) return { ok: false, code: 404, reason: "issue_not_found" };
+  const schoolId = (detail.issue.schoolId || "").toString().trim();
+  if (!schoolId) return { ok: false, code: 400, reason: "missing_school_id" };
+  const samples = (detail.samples || []).filter((item) => item?.content).slice(0, 20);
+  if (!samples.length) return { ok: false, code: 400, reason: "sample_not_found" };
+  await appendRepairIssueTrace(issueId, {
+    stage: "QUEUED",
+    level: "info",
+    message: "管理员触发重试，样本重新入队",
+    actor: username || "admin",
+    source: "admin_retry",
+    meta: { sampleCount: samples.length }
+  });
+  for (const sample of samples) {
+    await enqueueSchoolSubmission(schoolId, sanitizeContent(sample.content || ""), detail.issue.affectedScriptId || "", {
+      schoolName: detail.issue.schoolName || "",
+      schoolSystemType: detail.issue.schoolSystemType || "unknown",
+      sourceUrl: detail.issue.sourceUrlHost || "",
+      failureType: detail.issue.failureType || "unknown",
+      clientVersion: "",
+      parseSessionId: sample.parseSessionId || "",
+      issueId,
+      attemptedParsers: detail.issue.affectedScriptId ? [detail.issue.affectedScriptId] : [],
+      candidateUrls: [],
+      forceQueue: true
+    });
+  }
+  return { ok: true, issueId, schoolId, queuedSamples: samples.length, queuedAt: Date.now() };
+}
+
+function normalizeIssueIdList(value) {
+  if (Array.isArray(value)) {
+    return Array.from(
+      new Set(
+        value
+          .map((item) => (item || "").toString().trim())
+          .filter((item) => item.startsWith("issue_"))
+      )
+    );
+  }
+  const single = (value || "").toString().trim();
+  if (!single) return [];
+  return single.startsWith("issue_") ? [single] : [];
+}
+
+async function resolveIssueIdsForScriptAction(scriptName, rawIssueIds) {
+  const direct = normalizeIssueIdList(rawIssueIds);
+  if (direct.length > 0) return direct;
+  const history = await getScriptHistory(scriptName, 40);
+  for (const entry of history) {
+    const ids = normalizeIssueIdList(entry?.context?.issueIds || entry?.context?.issueId || entry?.issueId || "");
+    if (ids.length > 0) return ids;
+  }
+  return [];
 }
 
 function normalizeReportSchoolSystemType(value) {
@@ -1625,6 +2087,18 @@ function buildFailureSampleKey(sampleId) {
   return `failure:sample:${sampleId}`;
 }
 
+function buildRepairIssueTimelineKey(issueId) {
+  return `repair:issue:timeline:${issueId}`;
+}
+
+function buildRepairIssueLogsKey(issueId) {
+  return `repair:issue:logs:${issueId}`;
+}
+
+function buildParseSessionIssueKey(parseSessionId) {
+  return `parse:session:issue:${(parseSessionId || "").toString().trim()}`;
+}
+
 /**
  * 将提交内容加入学校队列
  */
@@ -1635,9 +2109,12 @@ function buildFailureSampleKey(sampleId) {
 async function enqueueSchoolSubmission(schoolId, content, scriptName, schoolInfo) {
   const now = Date.now();
   const contentHash = hashText(content);
-  const dedupKey = buildDedupKey(schoolId, contentHash);
-  const deduped = await redisClient.set(dedupKey, "1", { NX: true, PX: dedupWindowMs });
-  if (!deduped) return;
+  const forceQueue = schoolInfo?.forceQueue === true;
+  if (!forceQueue) {
+    const dedupKey = buildDedupKey(schoolId, contentHash);
+    const deduped = await redisClient.set(dedupKey, "1", { NX: true, PX: dedupWindowMs });
+    if (!deduped) return;
+  }
   const item = {
     content,
     scriptName,
@@ -1655,6 +2132,7 @@ async function enqueueSchoolSubmission(schoolId, content, scriptName, schoolInfo
     schoolSystemSource: (schoolInfo?.schoolSystemSource || "").toString(),
     clientVersion: (schoolInfo?.clientVersion || "").toString(),
     parseSessionId: (schoolInfo?.parseSessionId || "").toString(),
+    issueId: (schoolInfo?.issueId || "").toString().trim(),
     attemptedParsers: Array.isArray(schoolInfo?.attemptedParsers)
       ? schoolInfo.attemptedParsers.map((item) => sanitizeScriptName(item)).filter(Boolean).slice(0, 12)
       : [],
@@ -1668,6 +2146,19 @@ async function enqueueSchoolSubmission(schoolId, content, scriptName, schoolInfo
     await redisClient.lTrim(queueKey, -maxQueueSize, -1);
     await redisClient.expire(queueKey, Math.ceil(queueItemTtlMs / 1000));
     await setSchoolPhase(schoolId, "WAITING_WINDOW");
+    if (item.issueId) {
+      await appendRepairIssueTrace(item.issueId, {
+        stage: "QUEUED",
+        level: "info",
+        message: "失败样本已进入修复队列",
+        source: "school_queue",
+        meta: {
+          schoolId,
+          scriptName: sanitizeScriptName(scriptName || ""),
+          parseSessionId: item.parseSessionId || ""
+        }
+      });
+    }
   } catch (error) {
     console.error("enqueue error:", error);
   }
@@ -1793,6 +2284,14 @@ async function processSchoolQueue(schoolId) {
       pendingSchools.size >= backpressurePendingThreshold ? backpressureMergeWindowMs : mergeWindowMs;
     const recentQueue = prunedQueue.filter((item) => now - item.createdAt <= effectiveMergeWindowMs);
     if (recentQueue.length < minQueueSize) return;
+    const issueIds = extractIssueIdsFromItems(recentQueue);
+    await appendRepairIssueTraceBatch(issueIds, {
+      stage: "QUEUED",
+      level: "info",
+      message: "修复队列达到处理阈值，准备执行自动修复",
+      source: "queue_processor",
+      meta: { schoolId, queueSize: recentQueue.length }
+    });
     let state = (await getSchoolState(schoolId)) || {
       lastSummaryHash: "",
       lastScriptHash: "",
@@ -1805,7 +2304,7 @@ async function processSchoolQueue(schoolId) {
       const items = cluster.map((entry) => entry.item);
       const issues = cluster.map((entry) => entry.normalized);
       if (!items || items.length < minQueueSize) continue;
-      const result = await processQueueCluster(schoolId, items, issues, state, now);
+      const result = await processQueueCluster(schoolId, items, issues, state, now, extractIssueIdsFromItems(items));
       if (result?.state) {
         state = result.state;
       }
@@ -1832,7 +2331,7 @@ async function processSchoolQueue(schoolId) {
  * - 修复指令生成（模型 1）：将总结转化为具体的脚本修复动作要点。
  * - 脚本修复（模型 2）：高成本模型基于原脚本和修复指令生成新脚本。
  */
-async function processQueueCluster(schoolId, items, normalizedIssues, state, now) {
+async function processQueueCluster(schoolId, items, normalizedIssues, state, now, issueIds = []) {
   await setSchoolPhase(schoolId, "MERGING");
   if (shouldDegradeHighCost()) {
     await setSchoolPhase(schoolId, "WAITING_WINDOW");
@@ -1841,7 +2340,14 @@ async function processQueueCluster(schoolId, items, normalizedIssues, state, now
   const hasConflict = detectConflict(normalizedIssues);
   if (hasConflict) {
     await setSchoolPhase(schoolId, "REPAIRING");
-    await processIndividualSummaries(schoolId, items);
+    await appendRepairIssueTraceBatch(issueIds, {
+      stage: "CANDIDATE_TEST_RUNNING",
+      level: "warning",
+      message: "问题冲突，降级为逐条修复流程",
+      source: "queue_processor",
+      meta: { schoolId, itemCount: Array.isArray(items) ? items.length : 0 }
+    });
+    await processIndividualSummaries(schoolId, items, issueIds);
     const refreshed = (await getSchoolState(schoolId)) || state;
     return { state: refreshed, applied: true };
   }
@@ -1865,7 +2371,14 @@ async function processQueueCluster(schoolId, items, normalizedIssues, state, now
     state.lastUpdatedAt > 0 && now - state.lastUpdatedAt <= reprocessWindowMs && summaryHash !== state.lastSummaryHash;
   if (shouldProcessIndividually) {
     await setSchoolPhase(schoolId, "REPAIRING");
-    await processIndividualSummaries(schoolId, items);
+    await appendRepairIssueTraceBatch(issueIds, {
+      stage: "CANDIDATE_TEST_RUNNING",
+      level: "warning",
+      message: "命中重处理窗口，降级为逐条修复流程",
+      source: "queue_processor",
+      meta: { schoolId, itemCount: Array.isArray(items) ? items.length : 0 }
+    });
+    await processIndividualSummaries(schoolId, items, issueIds);
     const refreshed = (await getSchoolState(schoolId)) || state;
     return { state: refreshed, applied: true };
   }
@@ -1875,8 +2388,29 @@ async function processQueueCluster(schoolId, items, normalizedIssues, state, now
   await setSchoolPhase(schoolId, "REPAIRING");
   const generatedScript = await generateParserScript(summary, patchGuidance, previousScript, schoolId);
   if (!generatedScript) return { state, applied: false };
+  const replayStart = Date.now();
+  await appendRepairIssueTraceBatch(issueIds, {
+    stage: "CANDIDATE_TEST_RUNNING",
+    level: "info",
+    message: "开始候选脚本回放验证",
+    source: "queue_processor",
+    meta: {
+      schoolId,
+      scriptName,
+      previousVersion: Number(previousMeta?.version || 0),
+      sampleCount: Array.isArray(items) ? items.length : 0
+    }
+  });
   const submissionReplay = runSubmissionReplay(generatedScript, items);
   if (!submissionReplay.ok) {
+    await appendRepairIssueTraceBatch(issueIds, {
+      stage: "CANDIDATE_TEST_RESULT",
+      level: "error",
+      message: `候选脚本回放失败：${submissionReplay.reason || "unknown"}`,
+      durationMs: Date.now() - replayStart,
+      source: "queue_processor",
+      meta: { schoolId, scriptName, ok: false }
+    });
     await recordScriptFailure(
       scriptName,
       submissionReplay.reason || "提交回放失败",
@@ -1890,18 +2424,41 @@ async function processQueueCluster(schoolId, items, normalizedIssues, state, now
     );
     return { state, failed: true };
   }
+  await appendRepairIssueTraceBatch(issueIds, {
+    stage: "CANDIDATE_TEST_RESULT",
+    level: "info",
+    message: "候选脚本回放通过",
+    durationMs: Date.now() - replayStart,
+    source: "queue_processor",
+    meta: { schoolId, scriptName, ok: true }
+  });
   await setSchoolPhase(schoolId, "APPLYING");
   const applyResult = await applyScriptUpdate(scriptName, generatedScript, previousScript, {
     schoolId,
     previousMeta,
     context,
+    issueIds,
     releaseStage: "pending",
     actionType: "auto_repair"
   });
   if (applyResult.pending) {
+    await appendRepairIssueTraceBatch(issueIds, {
+      stage: "PENDING_RELEASE",
+      level: "info",
+      message: "候选脚本验证通过，已进入 pending 待发布",
+      source: "queue_processor",
+      meta: { schoolId, scriptName, releaseStage: "pending" }
+    });
     return { state, applied: false };
   }
   if (!applyResult.ok) {
+    await appendRepairIssueTraceBatch(issueIds, {
+      stage: "CANDIDATE_TEST_RESULT",
+      level: "error",
+      message: `候选脚本应用失败：${applyResult.reason || "unknown"}`,
+      source: "queue_processor",
+      meta: { schoolId, scriptName, ok: false }
+    });
     await recordScriptFailure(
       scriptName,
       applyResult.reason || "脚本校验失败",
@@ -1931,7 +2488,7 @@ async function processQueueCluster(schoolId, items, normalizedIssues, state, now
  * 处理单条记录的降级方法（兜底流程）
  * 当无法聚类或存在严重冲突时，放弃汇总，直接针对单条用户的错误进行针对性修复
  */
-async function processIndividualSummaries(schoolId, queue) {
+async function processIndividualSummaries(schoolId, queue, issueIds = []) {
   const summaries = [];
   for (const item of queue) {
     const summary = await summarizeSubmissions(item.content, schoolId);
@@ -1945,8 +2502,28 @@ async function processIndividualSummaries(schoolId, queue) {
   const patchGuidance = await generatePatchGuidance(mergedSummary, schoolId);
   const generatedScript = await generateParserScript(mergedSummary, patchGuidance, previousScript, schoolId);
   if (!generatedScript) return;
+  const replayStart = Date.now();
+  await appendRepairIssueTraceBatch(issueIds, {
+    stage: "CANDIDATE_TEST_RUNNING",
+    level: "info",
+    message: "开始逐条修复候选脚本回放验证",
+    source: "queue_processor",
+    meta: {
+      schoolId,
+      scriptName,
+      sampleCount: Array.isArray(queue) ? queue.length : 0
+    }
+  });
   const submissionReplay = runSubmissionReplay(generatedScript, queue);
   if (!submissionReplay.ok) {
+    await appendRepairIssueTraceBatch(issueIds, {
+      stage: "CANDIDATE_TEST_RESULT",
+      level: "error",
+      message: `逐条修复回放失败：${submissionReplay.reason || "unknown"}`,
+      durationMs: Date.now() - replayStart,
+      source: "queue_processor",
+      meta: { schoolId, scriptName, ok: false }
+    });
     await recordScriptFailure(
       scriptName,
       submissionReplay.reason || "提交回放失败",
@@ -1960,6 +2537,14 @@ async function processIndividualSummaries(schoolId, queue) {
     );
     return;
   }
+  await appendRepairIssueTraceBatch(issueIds, {
+    stage: "CANDIDATE_TEST_RESULT",
+    level: "info",
+    message: "逐条修复候选脚本回放通过",
+    durationMs: Date.now() - replayStart,
+    source: "queue_processor",
+    meta: { schoolId, scriptName, ok: true }
+  });
   const context = {
     mode: "single",
     clusterSize: Array.isArray(queue) ? queue.length : 0,
@@ -1972,11 +2557,28 @@ async function processIndividualSummaries(schoolId, queue) {
     schoolId,
     previousMeta,
     context,
+    issueIds,
     releaseStage: "pending",
     actionType: "auto_repair"
   });
-  if (applyResult.pending) return;
+  if (applyResult.pending) {
+    await appendRepairIssueTraceBatch(issueIds, {
+      stage: "PENDING_RELEASE",
+      level: "info",
+      message: "逐条修复结果已进入 pending 待发布",
+      source: "queue_processor",
+      meta: { schoolId, scriptName, releaseStage: "pending" }
+    });
+    return;
+  }
   if (!applyResult.ok) {
+    await appendRepairIssueTraceBatch(issueIds, {
+      stage: "CANDIDATE_TEST_RESULT",
+      level: "error",
+      message: `逐条修复应用失败：${applyResult.reason || "unknown"}`,
+      source: "queue_processor",
+      meta: { schoolId, scriptName, ok: false }
+    });
     await recordScriptFailure(
       scriptName,
       applyResult.reason || "脚本校验失败",
@@ -2246,6 +2848,142 @@ async function callGemini(systemPrompt, userPrompt, options = {}) {
     await recordLocalUsage(options.usageType, usage, "gemini", requestModel);
   }
   return { text, usage, raw: json };
+}
+
+async function testModelConnectivity(config = {}) {
+  const providerRaw = (config.provider || "auto").toString().trim().toLowerCase();
+  const modelName = resolveModelName((config.model || "").toString().trim());
+  const providerName = normalizeProvider(providerRaw || "auto", modelName);
+  const apiKeyValue = (config.apiKey || "").toString().trim();
+  const baseUrlValue = ((config.baseUrl || "").toString().trim() || defaultBaseUrl(providerName)).replace(/\/+$/, "");
+  const apiStyleRaw = (config.apiStyle || "").toString().trim();
+  const extraBody = config.extra && typeof config.extra === "object" ? config.extra : null;
+  if (!apiKeyValue) {
+    return {
+      ok: false,
+      provider: providerName,
+      model: modelName,
+      statusCode: 0,
+      latencyMs: 0,
+      errorCode: "missing_api_key",
+      errorMessage: "missing_api_key"
+    };
+  }
+  if (!modelName) {
+    return {
+      ok: false,
+      provider: providerName,
+      model: "",
+      statusCode: 0,
+      latencyMs: 0,
+      errorCode: "missing_model",
+      errorMessage: "missing_model"
+    };
+  }
+  if (providerName === "gemini") {
+    const endpoint = `${baseUrlValue}/models/${modelName}:generateContent?key=${apiKeyValue}`;
+    const body = mergeRequestExtras(
+      {
+        contents: [
+          {
+            role: "user",
+            parts: [{ text: "Return exactly: pong" }]
+          }
+        ],
+        generationConfig: { temperature: 0 }
+      },
+      extraBody
+    );
+    const result = await httpPostJsonDetailed(endpoint, body, {});
+    const parsed = safeJson(result.text || "");
+    const text =
+      parsed?.candidates?.[0]?.content?.parts?.[0]?.text ||
+      parsed?.candidates?.[0]?.content?.text ||
+      "";
+    if (!result.ok) {
+      return {
+        ok: false,
+        provider: providerName,
+        model: modelName,
+        statusCode: result.statusCode,
+        latencyMs: result.latencyMs,
+        errorCode: result.errorCode || "http_error",
+        errorMessage: result.errorMessage || "request_failed"
+      };
+    }
+    if (!text || !text.toString().trim()) {
+      return {
+        ok: false,
+        provider: providerName,
+        model: modelName,
+        statusCode: result.statusCode,
+        latencyMs: result.latencyMs,
+        errorCode: "invalid_response",
+        errorMessage: "empty_content"
+      };
+    }
+    return {
+      ok: true,
+      provider: providerName,
+      model: modelName,
+      statusCode: result.statusCode,
+      latencyMs: result.latencyMs,
+      errorCode: "",
+      errorMessage: ""
+    };
+  }
+  const apiStyle = normalizeApiStyle(apiStyleRaw) || resolveApiStyle(providerName, modelName);
+  const endpoint = apiStyle === "responses" ? `${baseUrlValue}/v1/responses` : `${baseUrlValue}${openAiPath(providerName)}`;
+  const body = mergeRequestExtras(
+    apiStyle === "responses"
+      ? {
+          model: modelName,
+          input: [{ role: "user", content: "Return exactly: pong" }],
+          temperature: 0
+        }
+      : {
+          model: modelName,
+          temperature: 0,
+          messages: [{ role: "user", content: "Return exactly: pong" }]
+        },
+    extraBody
+  );
+  const result = await httpPostJsonDetailed(endpoint, body, {
+    Authorization: `Bearer ${apiKeyValue}`
+  });
+  const parsed = safeJson(result.text || "");
+  const text = apiStyle === "responses" ? extractResponsesText(parsed) : parsed?.choices?.[0]?.message?.content || "";
+  if (!result.ok) {
+    return {
+      ok: false,
+      provider: providerName,
+      model: modelName,
+      statusCode: result.statusCode,
+      latencyMs: result.latencyMs,
+      errorCode: result.errorCode || "http_error",
+      errorMessage: result.errorMessage || "request_failed"
+    };
+  }
+  if (!text || !text.toString().trim()) {
+    return {
+      ok: false,
+      provider: providerName,
+      model: modelName,
+      statusCode: result.statusCode,
+      latencyMs: result.latencyMs,
+      errorCode: "invalid_response",
+      errorMessage: "empty_content"
+    };
+  }
+  return {
+    ok: true,
+    provider: providerName,
+    model: modelName,
+    statusCode: result.statusCode,
+    latencyMs: result.latencyMs,
+    errorCode: "",
+    errorMessage: ""
+  };
 }
 
 /**
@@ -2921,12 +3659,38 @@ function executeScriptWithContent(scriptContent, content) {
  * 5. 更新元数据并生成数字签名
  */
 async function applyScriptUpdate(scriptName, content, previousContent, options = {}) {
+  const traceIssueIds = Array.from(
+    new Set(
+      [
+        ...(Array.isArray(options.issueIds) ? options.issueIds : []),
+        ...(Array.isArray(options.context?.issueIds) ? options.context.issueIds : []),
+        options.context?.issueId || "",
+        options.issueId || ""
+      ]
+        .map((item) => (item || "").toString().trim())
+        .filter(Boolean)
+    )
+  );
   const validation = validateScriptStructure(content);
   if (!validation.ok) {
+    await appendRepairIssueTraceBatch(traceIssueIds, {
+      stage: "CANDIDATE_TEST_RESULT",
+      level: "error",
+      message: `候选脚本校验失败：${validation.reason || "validation_failed"}`,
+      source: "script_apply",
+      meta: { scriptName: sanitizeScriptName(scriptName), ok: false, step: "validation" }
+    });
     return { ok: false, reason: validation.reason, failureType: "validation" };
   }
   const replay = await runOfflineReplay(content);
   if (!replay.ok) {
+    await appendRepairIssueTraceBatch(traceIssueIds, {
+      stage: "CANDIDATE_TEST_RESULT",
+      level: "error",
+      message: `离线回放失败：${replay.reason || "offline_replay_failed"}`,
+      source: "script_apply",
+      meta: { scriptName: sanitizeScriptName(scriptName), ok: false, step: "offline_replay" }
+    });
     return { ok: false, reason: replay.reason || "离线回放失败", failureType: "replay" };
   }
   if (previousContent && hashText(previousContent) === hashText(content)) {
@@ -2975,6 +3739,13 @@ async function applyScriptUpdate(scriptName, content, previousContent, options =
       validate: { ok: true },
       replay: { ok: true }
     });
+    await appendRepairIssueTraceBatch(traceIssueIds, {
+      stage: "PENDING_RELEASE",
+      level: "info",
+      message: "候选脚本已保存到 pending，等待人工发布",
+      source: "script_apply",
+      meta: { scriptName: sanitizeScriptName(scriptName), releaseStage }
+    });
     return { ok: true, pending: true, releaseStage };
   }
   const fullPath = buildScriptPath(scriptName);
@@ -3005,15 +3776,43 @@ async function applyScriptUpdate(scriptName, content, previousContent, options =
       validate: { ok: true },
       replay: { ok: true }
     });
+    const publishStage =
+      releaseStage === "rollback" ? "ROLLED_BACK" : releaseStage === "disabled" ? "DISABLED" : "PUBLISHED";
+    await appendRepairIssueTraceBatch(traceIssueIds, {
+      stage: publishStage,
+      level: "info",
+      message:
+        publishStage === "ROLLED_BACK"
+          ? "脚本已回滚发布"
+          : publishStage === "DISABLED"
+            ? "脚本版本已禁用"
+            : "脚本已发布",
+      source: "script_apply",
+      meta: { scriptName: sanitizeScriptName(scriptName), releaseStage }
+    });
     return { ok: true };
   } catch (error) {
     if (previousContent) {
       try {
         await fs.writeFile(fullPath, previousContent, "utf-8");
       } catch {
+        await appendRepairIssueTraceBatch(traceIssueIds, {
+          stage: "CANDIDATE_TEST_RESULT",
+          level: "error",
+          message: "脚本写入失败且回滚失败",
+          source: "script_apply",
+          meta: { scriptName: sanitizeScriptName(scriptName), ok: false, step: "rollback" }
+        });
         return { ok: false, reason: "脚本写入失败且回滚失败", failureType: "rollback" };
       }
     }
+    await appendRepairIssueTraceBatch(traceIssueIds, {
+      stage: "CANDIDATE_TEST_RESULT",
+      level: "error",
+      message: `脚本写入失败：${error?.message || "write_failed"}`,
+      source: "script_apply",
+      meta: { scriptName: sanitizeScriptName(scriptName), ok: false, step: "write" }
+    });
     return { ok: false, reason: error?.message || "脚本写入失败", failureType: "write" };
   }
 }
@@ -5516,6 +6315,57 @@ async function httpPostJson(url, body, headers) {
   } finally {
     clearTimeout(timeout);
   }
+}
+
+async function httpPostJsonDetailed(url, body, headers) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const startedAt = Date.now();
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...headers
+      },
+      body: JSON.stringify(body || {}),
+      signal: controller.signal
+    });
+    const text = await response.text();
+    return {
+      ok: response.ok,
+      statusCode: Number(response.status || 0),
+      text,
+      latencyMs: Date.now() - startedAt,
+      errorCode: response.ok ? "" : "http_error",
+      errorMessage: response.ok ? "" : extractModelErrorMessage(text)
+    };
+  } catch (error) {
+    const aborted = error?.name === "AbortError";
+    return {
+      ok: false,
+      statusCode: 0,
+      text: "",
+      latencyMs: Date.now() - startedAt,
+      errorCode: aborted ? "timeout" : "network_error",
+      errorMessage: aborted ? "request_timeout" : error?.message || "network_error"
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function extractModelErrorMessage(rawText) {
+  const parsed = safeJson(rawText || "");
+  const message =
+    parsed?.error?.message ||
+    parsed?.error?.msg ||
+    parsed?.message ||
+    parsed?.msg ||
+    parsed?.detail ||
+    "";
+  if (message) return message.toString().slice(0, 300);
+  return (rawText || "").toString().slice(0, 300);
 }
 
 /**

@@ -36,6 +36,17 @@ const scriptModalSource = document.getElementById("scriptModalSource");
 const repairIssueMeta = document.getElementById("repairIssueMeta");
 const repairIssueTableBody = document.querySelector("#repairIssueTable tbody");
 const repairIssueDetail = document.getElementById("repairIssueDetail");
+const repairIssueTimeline = document.getElementById("repairIssueTimeline");
+const repairIssueDetailMeta = document.getElementById("repairIssueDetailMeta");
+const repairIssueSelected = document.getElementById("repairIssueSelected");
+const repairIssueLogStage = document.getElementById("repairIssueLogStage");
+const repairIssueLogLevel = document.getElementById("repairIssueLogLevel");
+const repairIssueLogReloadBtn = document.getElementById("repairIssueLogReloadBtn");
+const repairIssueRetryBtn = document.getElementById("repairIssueRetryBtn");
+const testSummaryConfigBtn = document.getElementById("testSummaryConfigBtn");
+const testSummaryConfigResult = document.getElementById("testSummaryConfigResult");
+const testScriptConfigBtn = document.getElementById("testScriptConfigBtn");
+const testScriptConfigResult = document.getElementById("testScriptConfigResult");
 const createUserBtn = document.getElementById("createUserBtn");
 const newUserNameInput = document.getElementById("newUserName");
 const newUserPasswordInput = document.getElementById("newUserPassword");
@@ -65,6 +76,7 @@ let scriptModalState = {
   selectedHistoryKey: "",
   currentMeta: null
 };
+let activeRepairIssueId = "";
 
 const navItems = document.querySelectorAll(".nav-item");
 const pageSections = document.querySelectorAll(".page-section");
@@ -626,10 +638,74 @@ async function loadConfig() {
         scriptBaseUrlEl.dataset.lastDefault = d;
         scriptBaseUrlEl.dataset.autoManaged = current === "" || current === d ? "1" : "0";
       }
+      if (testSummaryConfigResult) testSummaryConfigResult.textContent = "-";
+      if (testScriptConfigResult) testScriptConfigResult.textContent = "-";
     }
   } catch (e) {
     console.error("Failed to load config", e);
     showToast("error", "加载配置失败", e?.message || "网络错误");
+  }
+}
+
+function buildModelTestPayload(target) {
+  const summary = target === "summary";
+  return {
+    target: summary ? "model1" : "model2",
+    provider: document.getElementById(summary ? "conf_summaryProviderRaw" : "conf_scriptProviderRaw").value,
+    model: document.getElementById(summary ? "conf_summaryModelRaw" : "conf_scriptModelRaw").value,
+    apiKey: document.getElementById(summary ? "conf_summaryApiKey" : "conf_scriptApiKey").value,
+    baseUrl: document.getElementById(summary ? "conf_summaryBaseUrl" : "conf_scriptBaseUrl").value,
+    apiStyle: document.getElementById(summary ? "conf_summaryApiStyleRaw" : "conf_scriptApiStyleRaw").value,
+    extraBody: document.getElementById(summary ? "conf_summaryRequestExtraJson" : "conf_scriptRequestExtraJson").value
+  };
+}
+
+function renderModelTestResult(target, data) {
+  const resultEl = target === "summary" ? testSummaryConfigResult : testScriptConfigResult;
+  if (!resultEl) return;
+  if (!data) {
+    resultEl.textContent = "测试失败";
+    return;
+  }
+  if (data.ok) {
+    resultEl.textContent = `可用 · ${data.statusCode || 200} · ${Number(data.latencyMs || 0)}ms`;
+  } else {
+    resultEl.textContent = `失败 · ${data.statusCode || 0} · ${data.errorCode || "unknown"} · ${
+      data.errorMessage || "-"
+    }`;
+  }
+}
+
+async function runModelConnectionTest(target) {
+  const btn = target === "summary" ? testSummaryConfigBtn : testScriptConfigBtn;
+  if (!btn) return;
+  const payload = buildModelTestPayload(target);
+  const originalText = btn.textContent;
+  btn.textContent = "测试中...";
+  btn.disabled = true;
+  renderModelTestResult(target, null);
+  try {
+    const result = await postWithAuth("/api/v1/admin/config/test", payload);
+    if (result.code !== 200) {
+      throw new Error(result.msg || "测试接口失败");
+    }
+    renderModelTestResult(target, result.data || {});
+    if (result.data?.ok) {
+      showToast("info", "模型测试成功", `${result.data.provider}/${result.data.model} 可用`);
+    } else {
+      showToast("warning", "模型测试失败", result.data?.errorMessage || result.data?.errorCode || "未知错误");
+    }
+  } catch (error) {
+    renderModelTestResult(target, {
+      ok: false,
+      statusCode: 0,
+      errorCode: "request_failed",
+      errorMessage: error?.message || "网络错误"
+    });
+    showToast("error", "模型测试失败", error?.message || "网络错误");
+  } finally {
+    btn.textContent = originalText;
+    btn.disabled = false;
   }
 }
 
@@ -687,6 +763,16 @@ document.getElementById("saveConfigBtn").addEventListener("click", async () => {
     btn.disabled = false;
   }
 });
+if (testSummaryConfigBtn) {
+  testSummaryConfigBtn.addEventListener("click", async () => {
+    await runModelConnectionTest("summary");
+  });
+}
+if (testScriptConfigBtn) {
+  testScriptConfigBtn.addEventListener("click", async () => {
+    await runModelConnectionTest("script");
+  });
+}
 
 const systemTypeLabels = {
   zhengfang: "正方",
@@ -1018,17 +1104,25 @@ function renderFailureSummary(failures) {
     .join("");
 }
 
-async function fetchWithAuth(requestPath) {
+async function fetchWithAuth(requestPath, init = {}) {
   const token = getToken();
+  const headers = {
+    ...(init.headers || {}),
+    Authorization: `Bearer ${token}`
+  };
   const res = await fetch(requestPath, {
-    headers: {
-      Authorization: `Bearer ${token}`
-    }
+    ...init,
+    headers
   });
   if (res.status === 401) {
     throw new Error("unauthorized");
   }
-  return res.json();
+  const text = await res.text();
+  try {
+    return text ? JSON.parse(text) : {};
+  } catch {
+    throw new Error(text || `unexpected_response_${res.status}`);
+  }
 }
 
 async function postWithAuth(requestPath, payload) {
@@ -1714,7 +1808,7 @@ function renderRepairIssuesTable(list) {
           <td>${escapeHtml(formatFailureType(item.failureType || "unknown"))}</td>
           <td>${escapeHtml(item.sampleCount || 0)}</td>
           <td>${escapeHtml(item.userCount || 0)}</td>
-          <td>${escapeHtml(item.status || "open")}</td>
+          <td>${escapeHtml(item.status || "open")} / ${escapeHtml(item.currentStage || "-")}</td>
           <td>${escapeHtml(formatTime(item.lastSeenAt || item.updatedAt))}</td>
           <td>
             <button class="btn secondary compact" type="button" data-action="detail" data-issue="${encodeURIComponent(issueId)}">详情</button>
@@ -1726,11 +1820,91 @@ function renderRepairIssuesTable(list) {
     .join("");
 }
 
+function formatRepairIssueMeta(issue) {
+  const info = issue || {};
+  return `Issue: ${info.issueId || "-"} | 状态: ${info.status || "open"} | 阶段: ${
+    info.currentStage || "-"
+  } | 最近步骤: ${formatTime(info.lastStepAt || info.updatedAt || 0)} | 最近错误: ${
+    info.lastErrorMessage || "-"
+  } | 样本: ${Number(info.sampleCount || 0)} | 影响用户: ${Number(info.userCount || 0)}`;
+}
+
+function renderRepairTimeline(list) {
+  if (!repairIssueTimeline) return;
+  const items = Array.isArray(list) ? list : [];
+  if (!items.length) {
+    repairIssueTimeline.textContent = "暂无时间线";
+    return;
+  }
+  repairIssueTimeline.textContent = items
+    .map((item) => {
+      const ts = formatTime(item?.ts || 0);
+      const stage = (item?.stage || "").toString();
+      const msg = (item?.message || "").toString();
+      const source = (item?.source || "").toString();
+      return `[${ts}] ${stage} | ${source || "-"} | ${msg || "-"}`;
+    })
+    .join("\n");
+}
+
+function renderRepairLogs(data) {
+  if (!repairIssueDetail) return;
+  const list = Array.isArray(data?.list) ? data.list : [];
+  if (!list.length) {
+    repairIssueDetail.textContent = "暂无日志";
+    return;
+  }
+  repairIssueDetail.textContent = list
+    .map((item) => {
+      const ts = formatTime(item?.ts || 0);
+      const stage = (item?.stage || "").toString();
+      const level = (item?.level || "info").toString();
+      const source = (item?.source || "").toString();
+      const actor = (item?.actor || "").toString();
+      const durationMs = Number(item?.durationMs || 0);
+      const message = (item?.message || "").toString();
+      const meta = item?.meta ? ` | meta=${JSON.stringify(item.meta)}` : "";
+      return `[${ts}] [${level}] ${stage} | ${source || "-"} | ${actor || "-"} | ${durationMs}ms | ${message}${meta}`;
+    })
+    .join("\n");
+}
+
+async function loadRepairIssueTimeline(issueId) {
+  const result = await fetchWithAuth(`/api/v1/admin/repair/issues/${encodeURIComponent(issueId)}/timeline?limit=200`);
+  if (result.code !== 200) {
+    throw new Error(result.msg || "时间线加载失败");
+  }
+  renderRepairTimeline(result?.data?.list || []);
+}
+
+async function loadRepairIssueLogs(issueId) {
+  const params = new URLSearchParams();
+  params.set("limit", "200");
+  const stage = repairIssueLogStage?.value || "";
+  const level = repairIssueLogLevel?.value || "";
+  if (stage) params.set("stage", stage);
+  if (level) params.set("level", level);
+  const result = await fetchWithAuth(`/api/v1/admin/repair/issues/${encodeURIComponent(issueId)}/logs?${params.toString()}`);
+  if (result.code !== 200) {
+    throw new Error(result.msg || "日志加载失败");
+  }
+  renderRepairLogs(result?.data || {});
+}
+
 async function loadRepairIssueDetail(issueId) {
   if (!repairIssueDetail) return;
+  activeRepairIssueId = (issueId || "").toString();
+  if (repairIssueSelected) repairIssueSelected.value = activeRepairIssueId;
+  if (repairIssueDetailMeta) repairIssueDetailMeta.textContent = "加载中...";
   repairIssueDetail.textContent = "加载中...";
+  if (repairIssueTimeline) repairIssueTimeline.textContent = "加载中...";
   const result = await fetchWithAuth(`/api/v1/admin/repair/issues/${encodeURIComponent(issueId)}`);
-  repairIssueDetail.textContent = JSON.stringify(result.data || {}, null, 2);
+  const detail = result.data || {};
+  if (repairIssueDetailMeta) {
+    repairIssueDetailMeta.textContent = formatRepairIssueMeta(detail.issue || {});
+  }
+  await loadRepairIssueTimeline(issueId);
+  await loadRepairIssueLogs(issueId);
 }
 
 async function runRepairIssueReplay(issueId) {
@@ -1741,8 +1915,39 @@ async function runRepairIssueReplay(issueId) {
     headers: { "Content-Type": "application/json" },
     body: "{}"
   });
-  repairIssueDetail.textContent = JSON.stringify(result.data || result, null, 2);
+  if (result.code !== 200) {
+    throw new Error(result.msg || "回放测试失败");
+  }
+  renderRepairLogs({
+    list: [
+      {
+        ts: Date.now(),
+        stage: "REPLAY_RESULT",
+        level: result?.data?.ok ? "info" : "error",
+        source: "admin_run_test",
+        actor: result?.data?.testedBy || "-",
+        durationMs: 0,
+        message: result?.data?.ok ? "回放测试通过" : `回放测试失败：${result?.data?.reason || "unknown"}`,
+        meta: result?.data || {}
+      }
+    ]
+  });
   await loadRepairIssuesPage();
+  await loadRepairIssueDetail(issueId);
+}
+
+async function retryRepairIssueFromAdmin(issueId) {
+  const result = await fetchWithAuth(`/api/v1/admin/repair/issues/${encodeURIComponent(issueId)}/retry`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}"
+  });
+  if (result.code !== 200) {
+    throw new Error(result.msg || "重试失败");
+  }
+  showToast("info", "已触发重试", "失败样本已重新进入修复队列");
+  await loadRepairIssuesPage();
+  await loadRepairIssueDetail(issueId);
 }
 
 function escapeCsv(value) {
@@ -1906,6 +2111,45 @@ if (repairIssueTableBody) {
     } catch (err) {
       repairIssueDetail.textContent = `操作失败：${err?.message || ""}`;
     }
+  });
+}
+if (repairIssueLogReloadBtn) {
+  repairIssueLogReloadBtn.addEventListener("click", async () => {
+    if (!activeRepairIssueId) {
+      showToast("warning", "未选择 Issue", "请先在列表中选择一条 Issue");
+      return;
+    }
+    try {
+      await loadRepairIssueTimeline(activeRepairIssueId);
+      await loadRepairIssueLogs(activeRepairIssueId);
+    } catch (err) {
+      showToast("error", "刷新日志失败", err?.message || "网络错误");
+    }
+  });
+}
+if (repairIssueRetryBtn) {
+  repairIssueRetryBtn.addEventListener("click", async () => {
+    if (!activeRepairIssueId) {
+      showToast("warning", "未选择 Issue", "请先在列表中选择一条 Issue");
+      return;
+    }
+    try {
+      await retryRepairIssueFromAdmin(activeRepairIssueId);
+    } catch (err) {
+      showToast("error", "重试失败", err?.message || "网络错误");
+    }
+  });
+}
+if (repairIssueLogStage) {
+  repairIssueLogStage.addEventListener("change", async () => {
+    if (!activeRepairIssueId) return;
+    await loadRepairIssueLogs(activeRepairIssueId);
+  });
+}
+if (repairIssueLogLevel) {
+  repairIssueLogLevel.addEventListener("change", async () => {
+    if (!activeRepairIssueId) return;
+    await loadRepairIssueLogs(activeRepairIssueId);
   });
 }
 exportBtn.addEventListener("click", () => {

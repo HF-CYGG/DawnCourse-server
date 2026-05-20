@@ -173,6 +173,10 @@
                   <label>扩展请求体 (JSON)</label>
                   <textarea id="conf_summaryRequestExtraJson" placeholder='如: {"response_format": {"type": "json_object"}}'></textarea>
                 </div>
+                <div class="config-actions">
+                  <button class="btn secondary" id="testSummaryConfigBtn" type="button">测试模型 1</button>
+                  <span class="muted" id="testSummaryConfigResult">-</span>
+                </div>
               </div>
 
               <div class="config-group">
@@ -211,6 +215,10 @@
                 <div class="config-row">
                   <label>扩展请求体 (JSON)</label>
                   <textarea id="conf_scriptRequestExtraJson" placeholder='如: {"response_format": {"type": "json_object"}}'></textarea>
+                </div>
+                <div class="config-actions">
+                  <button class="btn secondary" id="testScriptConfigBtn" type="button">测试模型 2</button>
+                  <span class="muted" id="testScriptConfigResult">-</span>
                 </div>
               </div>
 
@@ -351,7 +359,55 @@
             </section>
             <section class="mb-24">
               <h3 class="section-title">Issue 详情</h3>
-              <pre class="code-block" id="repairIssueDetail">选择一条 Issue 查看详情。</pre>
+              <div class="filter-bar mb-24">
+                <div class="filters">
+                  <div class="filter">
+                    <label>当前 Issue</label>
+                    <input id="repairIssueSelected" type="text" readonly placeholder="未选择">
+                  </div>
+                  <div class="filter">
+                    <label>日志阶段</label>
+                    <select id="repairIssueLogStage">
+                      <option value="">全部阶段</option>
+                      <option value="REPORT_RECEIVED">REPORT_RECEIVED</option>
+                      <option value="ISSUE_MERGED">ISSUE_MERGED</option>
+                      <option value="QUEUED">QUEUED</option>
+                      <option value="REPLAY_RUNNING">REPLAY_RUNNING</option>
+                      <option value="REPLAY_RESULT">REPLAY_RESULT</option>
+                      <option value="CANDIDATE_TEST_RUNNING">CANDIDATE_TEST_RUNNING</option>
+                      <option value="CANDIDATE_TEST_RESULT">CANDIDATE_TEST_RESULT</option>
+                      <option value="PENDING_RELEASE">PENDING_RELEASE</option>
+                      <option value="PUBLISHED">PUBLISHED</option>
+                      <option value="ROLLED_BACK">ROLLED_BACK</option>
+                      <option value="DISABLED">DISABLED</option>
+                    </select>
+                  </div>
+                  <div class="filter">
+                    <label>日志级别</label>
+                    <select id="repairIssueLogLevel">
+                      <option value="">全部级别</option>
+                      <option value="info">info</option>
+                      <option value="warning">warning</option>
+                      <option value="error">error</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="actions">
+                  <button class="btn secondary" id="repairIssueLogReloadBtn" type="button">刷新日志</button>
+                  <button class="btn secondary" id="repairIssueRetryBtn" type="button">重试修复</button>
+                </div>
+              </div>
+              <div class="muted mb-24" id="repairIssueDetailMeta">选择一条 Issue 查看详情。</div>
+              <section class="split">
+                <div>
+                  <h3 class="section-title">阶段时间线</h3>
+                  <pre class="code-block" id="repairIssueTimeline">暂无时间线</pre>
+                </div>
+                <div>
+                  <h3 class="section-title">步骤日志</h3>
+                  <pre class="code-block" id="repairIssueDetail">选择一条 Issue 查看日志。</pre>
+                </div>
+              </section>
             </section>
           </div>
 

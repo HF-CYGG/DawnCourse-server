@@ -33,6 +33,9 @@ const scriptModalHistory = document.getElementById("scriptModalHistory");
 const scriptModalCode = document.getElementById("scriptModalCode");
 const scriptModalClose = document.getElementById("scriptModalClose");
 const scriptModalSource = document.getElementById("scriptModalSource");
+const repairIssueMeta = document.getElementById("repairIssueMeta");
+const repairIssueTableBody = document.querySelector("#repairIssueTable tbody");
+const repairIssueDetail = document.getElementById("repairIssueDetail");
 const createUserBtn = document.getElementById("createUserBtn");
 const newUserNameInput = document.getElementById("newUserName");
 const newUserPasswordInput = document.getElementById("newUserPassword");
@@ -361,6 +364,7 @@ navItems.forEach((item) => {
         page.classList.add("active");
         if (target === "page-config") loadConfig();
         if (target === "page-scripts") loadScriptsPage();
+        if (target === "page-repair-issues") loadRepairIssuesPage();
         if (target === "page-users") loadUsersPage();
         if (target === "page-runtime-logs") loadRuntimeLogs();
       } else {
@@ -1676,6 +1680,71 @@ function applyFilters() {
   renderPullScriptStats(currentData);
 }
 
+async function loadRepairIssuesPage() {
+  if (!repairIssueTableBody) return;
+  repairIssueMeta.textContent = "加载中...";
+  repairIssueTableBody.innerHTML = `<tr><td colspan="11" class="muted">加载中...</td></tr>`;
+  try {
+    const result = await fetchWithAuth("/api/admin/repair/issues");
+    const list = result.data?.list || [];
+    repairIssueMeta.textContent = `共 ${list.length} 条，最后刷新 ${formatTime(Date.now())}`;
+    renderRepairIssuesTable(list);
+  } catch (e) {
+    repairIssueMeta.textContent = "加载失败";
+    repairIssueTableBody.innerHTML = `<tr><td colspan="11" class="muted">加载失败：${escapeHtml(e?.message || "")}</td></tr>`;
+  }
+}
+
+function renderRepairIssuesTable(list) {
+  if (!repairIssueTableBody) return;
+  if (!list.length) {
+    repairIssueTableBody.innerHTML = `<tr><td colspan="11" class="muted">暂无 Repair Issue</td></tr>`;
+    return;
+  }
+  repairIssueTableBody.innerHTML = list
+    .map((item) => {
+      const issueId = item.issueId || "";
+      return `
+        <tr>
+          <td>${escapeHtml(issueId)}</td>
+          <td>${escapeHtml(item.schoolName || item.schoolId || "-")}</td>
+          <td>${escapeHtml(formatSystemType(item.schoolSystemType || "unknown"))}</td>
+          <td>${escapeHtml(item.affectedScriptId || "-")}</td>
+          <td>${escapeHtml(item.affectedVersion || 0)}</td>
+          <td>${escapeHtml(formatFailureType(item.failureType || "unknown"))}</td>
+          <td>${escapeHtml(item.sampleCount || 0)}</td>
+          <td>${escapeHtml(item.userCount || 0)}</td>
+          <td>${escapeHtml(item.status || "open")}</td>
+          <td>${escapeHtml(formatTime(item.lastSeenAt || item.updatedAt))}</td>
+          <td>
+            <button class="btn secondary compact" type="button" data-action="detail" data-issue="${encodeURIComponent(issueId)}">详情</button>
+            <button class="btn secondary compact" type="button" data-action="run-test" data-issue="${encodeURIComponent(issueId)}">复现</button>
+          </td>
+        </tr>
+      `;
+    })
+    .join("");
+}
+
+async function loadRepairIssueDetail(issueId) {
+  if (!repairIssueDetail) return;
+  repairIssueDetail.textContent = "加载中...";
+  const result = await fetchWithAuth(`/api/admin/repair/issues/${encodeURIComponent(issueId)}`);
+  repairIssueDetail.textContent = JSON.stringify(result.data || {}, null, 2);
+}
+
+async function runRepairIssueReplay(issueId) {
+  if (!repairIssueDetail) return;
+  repairIssueDetail.textContent = "测试中...";
+  const result = await fetchWithAuth(`/api/admin/repair/issues/${encodeURIComponent(issueId)}/run-test`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}"
+  });
+  repairIssueDetail.textContent = JSON.stringify(result.data || result, null, 2);
+  await loadRepairIssuesPage();
+}
+
 function escapeCsv(value) {
   const text = `${value ?? ""}`;
   if (text.includes('"') || text.includes(",") || text.includes("\n")) {
@@ -1812,6 +1881,8 @@ refreshBtn.addEventListener("click", async () => {
   const activePageId = getActivePageId();
   if (activePageId === "page-scripts") {
     await loadScriptsPage();
+  } else if (activePageId === "page-repair-issues") {
+    await loadRepairIssuesPage();
   } else if (activePageId === "page-users") {
     await loadUsersPage();
   } else if (activePageId === "page-runtime-logs") {
@@ -1820,6 +1891,23 @@ refreshBtn.addEventListener("click", async () => {
     await refreshData();
   }
 });
+if (repairIssueTableBody) {
+  repairIssueTableBody.addEventListener("click", async (e) => {
+    const button = e.target.closest("button[data-action]");
+    if (!button) return;
+    const issueId = decodeURIComponent(button.dataset.issue || "");
+    if (!issueId) return;
+    try {
+      if (button.dataset.action === "detail") {
+        await loadRepairIssueDetail(issueId);
+      } else if (button.dataset.action === "run-test") {
+        await runRepairIssueReplay(issueId);
+      }
+    } catch (err) {
+      repairIssueDetail.textContent = `操作失败：${err?.message || ""}`;
+    }
+  });
+}
 exportBtn.addEventListener("click", () => {
   exportCsv();
 });

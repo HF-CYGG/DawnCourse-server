@@ -38,6 +38,8 @@ services:
   llm-backend:
     # LLM 异步解析服务
     build: ./llm-backend
+    env_file:
+      - .env
     environment:
       # 模型 1（总结）配置
       LLM_SUMMARY_PROVIDER: gpt
@@ -72,7 +74,6 @@ services:
       LLM_SCRIPT_COST_PER_CALL: 0
       LLM_PARSE_COST_PER_CALL: 0
       SCRIPT_SIGN_KEY: ""
-      SCRIPT_SIGN_PRIVATE_KEY: ""
       SCHOOL_METRICS_FILE: /shared/parsers/metrics/school_metrics.txt
       METRICS_FLUSH_MS: 5000
       ADMIN_SESSION_TTL_MS: 43200000

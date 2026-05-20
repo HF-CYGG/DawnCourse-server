@@ -20,6 +20,9 @@
           <div class="nav-item" data-target="page-scripts">
             脚本发布
           </div>
+          <div class="nav-item" data-target="page-repair-issues">
+            Repair Issues
+          </div>
           <div class="nav-item" data-target="page-config">
             模型配置
           </div>
@@ -320,6 +323,35 @@
                 </thead>
                 <tbody></tbody>
               </table>
+            </section>
+          </div>
+
+          <div id="page-repair-issues" class="page-section">
+            <section class="mb-24">
+              <h3 class="section-title">Repair Issue 列表</h3>
+              <div class="muted mb-24" id="repairIssueMeta">等待加载...</div>
+              <table class="table" id="repairIssueTable">
+                <thead>
+                  <tr>
+                    <th>Issue</th>
+                    <th>学校</th>
+                    <th>系统</th>
+                    <th>脚本</th>
+                    <th>版本</th>
+                    <th>失败类型</th>
+                    <th>样本</th>
+                    <th>用户</th>
+                    <th>状态</th>
+                    <th>最近出现</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </section>
+            <section class="mb-24">
+              <h3 class="section-title">Issue 详情</h3>
+              <pre class="code-block" id="repairIssueDetail">选择一条 Issue 查看详情。</pre>
             </section>
           </div>
 

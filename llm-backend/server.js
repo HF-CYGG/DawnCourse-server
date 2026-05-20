@@ -105,7 +105,7 @@ let scriptUsageUrl = (process.env.LLM_SCRIPT_USAGE_URL || "").trim();
 let summaryCostUrl = (process.env.LLM_SUMMARY_COST_URL || "").trim();
 let scriptCostUrl = (process.env.LLM_SCRIPT_COST_URL || "").trim();
 const scriptSignKey = process.env.SCRIPT_SIGN_KEY || "";
-const scriptSignPrivateKey = process.env.SCRIPT_SIGN_PRIVATE_KEY || "";
+const scriptSignPrivateKey = normalizePemEnv(process.env.SCRIPT_SIGN_PRIVATE_KEY || "");
 const schoolMetricsFile =
   process.env.SCHOOL_METRICS_FILE || path.join(scriptOutputDir, "metrics", "school_metrics.txt");
 const metricsFlushMs = Number(process.env.METRICS_FLUSH_MS || 5000);
@@ -426,6 +426,10 @@ const server = http.createServer((req, res) => {
     }
     return sendJson(res, 200, { code: 200, data: meta });
   }
+  if (req.method === "GET" && url.pathname === "/api/v1/scripts/manifest") {
+    const manifest = await buildScriptManifest(req);
+    return sendJson(res, 200, manifest);
+  }
   if (req.method === "POST" && url.pathname === "/api/v1/script_feedback") {
     const bodyText = await readBody(req, maxContentLength);
     if (bodyText == null) {
@@ -465,6 +469,28 @@ const server = http.createServer((req, res) => {
       attemptedParsers
     });
     return sendJson(res, 200, { code: 200, msg: "ok" });
+  }
+  if (req.method === "POST" && url.pathname === "/api/v1/parse/report") {
+    const bodyText = await readBody(req, maxContentLength);
+    if (bodyText == null) {
+      return sendJson(res, 413, { code: 413, msg: "请求体过大" });
+    }
+    if (!redisReady) {
+      return sendJson(res, 503, { code: 503, msg: "Redis 未连接" });
+    }
+    const body = safeJson(bodyText) || {};
+    const sample = body?.sanitizedSample || null;
+    const sampleContent = (sample?.content || "").toString();
+    const hasConsent = sample?.hasUserConsent === true;
+    if (sampleContent && !hasConsent) {
+      return sendJson(res, 400, { code: 400, msg: "样本内容必须经用户同意后上传" });
+    }
+    const result = await recordParseReport(body);
+    return sendJson(res, 200, {
+      accepted: true,
+      issueId: result.issueId || "",
+      cloudFallbackAvailable: true
+    });
   }
   if (req.method === "POST" && url.pathname === "/api/v1/script_pull") {
     const bodyText = await readBody(req, maxContentLength);
@@ -714,6 +740,75 @@ const server = http.createServer((req, res) => {
     }
     const data = await buildAdminDashboardData();
     return sendJson(res, 200, { code: 200, data });
+  }
+  if (req.method === "GET" && url.pathname === "/api/admin/repair/issues") {
+    const auth = await requireAdminAuth(req);
+    if (!auth.ok) {
+      return sendJson(res, 401, { code: 401, msg: "未登录" });
+    }
+    const list = await listRepairIssues(Number(url.searchParams.get("limit") || 100));
+    return sendJson(res, 200, { code: 200, data: { list } });
+  }
+  if (req.method === "GET" && /^\/api\/admin\/repair\/issues\/[^/]+$/.test(url.pathname)) {
+    const auth = await requireAdminAuth(req);
+    if (!auth.ok) {
+      return sendJson(res, 401, { code: 401, msg: "未登录" });
+    }
+    const issueId = decodeURIComponent(url.pathname.split("/").pop() || "");
+    const detail = await getRepairIssueDetail(issueId);
+    if (!detail) {
+      return sendJson(res, 404, { code: 404, msg: "Issue 不存在" });
+    }
+    return sendJson(res, 200, { code: 200, data: detail });
+  }
+  if (req.method === "POST" && /^\/api\/admin\/repair\/issues\/[^/]+\/run-test$/.test(url.pathname)) {
+    const auth = await requireAdminAuth(req);
+    if (!auth.ok) {
+      return sendJson(res, 401, { code: 401, msg: "未登录" });
+    }
+    const issueId = decodeURIComponent(url.pathname.split("/").slice(-2)[0] || "");
+    const result = await runRepairIssueTest(issueId, auth.username);
+    if (!result.ok) {
+      return sendJson(res, result.code || 400, { code: result.code || 400, msg: result.reason || "测试失败" });
+    }
+    return sendJson(res, 200, { code: 200, data: result });
+  }
+  if (req.method === "POST" && url.pathname === "/api/admin/scripts/releases") {
+    const auth = await requireAdminAuth(req);
+    if (!auth.ok) {
+      return sendJson(res, 401, { code: 401, msg: "未登录" });
+    }
+    const bodyText = await readBody(req, maxContentLength);
+    if (bodyText == null) {
+      return sendJson(res, 413, { code: 413, msg: "请求体过大" });
+    }
+    const body = safeJson(bodyText) || {};
+    const scriptName = sanitizeScriptName(body?.name || body?.scriptName || "");
+    const content = (body?.content || "").toString();
+    const releaseStage = normalizeReleaseStage(body?.releaseStage || body?.status || "pending");
+    if (!scriptName || !content) {
+      return sendJson(res, 400, { code: 400, msg: "缺少脚本名或内容" });
+    }
+    const previousContent = await readScript(scriptName);
+    const previousMeta = await getScriptMeta(scriptName);
+    const result = await applyScriptUpdate(scriptName, content, previousContent, {
+      previousMeta,
+      forceRelease: releaseStage !== "pending",
+      releaseStage,
+      appliedBy: auth.username,
+      actionType: `admin_release_${releaseStage}`,
+      context: {
+        releaseId: (body?.releaseId || "").toString(),
+        changelog: (body?.changelog || "").toString(),
+        targetSchoolSystemTypes: Array.isArray(body?.targetSchoolSystemTypes) ? body.targetSchoolSystemTypes : [],
+        targetSchoolIds: Array.isArray(body?.targetSchoolIds) ? body.targetSchoolIds : []
+      }
+    });
+    if (!result.ok) {
+      return sendJson(res, 400, { code: 400, msg: result.reason || "发布失败", data: result });
+    }
+    const meta = await getScriptMeta(scriptName);
+    return sendJson(res, 200, { code: 200, data: { meta, result } });
   }
   // ---------------------------------------------------------------------------
   // [管理后台接口] 晋升灰度脚本 (Pending -> Active/Canary)
@@ -973,6 +1068,7 @@ const server = http.createServer((req, res) => {
       : [];
     const clientVersion = (body?.clientVersion || body?.client_version || "").toString();
     const parseSessionId = (body?.parseSessionId || body?.parse_session_id || "").toString().trim();
+    const issueId = (body?.issueId || body?.issue_id || "").toString().trim();
     const userConsent = body?.userConsent === true || body?.consent === true;
     // content 不能为空
     if (!content) {
@@ -1056,6 +1152,7 @@ const server = http.createServer((req, res) => {
       schoolSystemSource: classification.schoolSystemSource,
       clientVersion,
       parseSessionId,
+      issueId,
       attemptedParsers
     });
     if (parseProviderReady) {
@@ -1081,6 +1178,7 @@ const server = http.createServer((req, res) => {
           schoolSystemSource: classification.schoolSystemSource,
           clientVersion,
           parseSessionId,
+          issueId,
           attemptedParsers
         });
       });
@@ -1102,6 +1200,7 @@ const server = http.createServer((req, res) => {
         schoolSystemSource: classification.schoolSystemSource,
         clientVersion,
         parseSessionId,
+        issueId,
         attemptedParsers
       });
       schedulePendingParseProcessing();
@@ -1121,6 +1220,7 @@ const server = http.createServer((req, res) => {
         schoolSystemSource: classification.schoolSystemSource,
         clientVersion,
         parseSessionId,
+        issueId,
         attemptedParsers
       });
     }
@@ -1182,6 +1282,348 @@ const server = http.createServer((req, res) => {
 server.listen(port, () => {
   console.log(`llm-backend listening on ${port}`);
 });
+
+async function buildScriptManifest(req) {
+  const now = Date.now();
+  const baseUrl = getPublicBaseUrl(req);
+  const scripts = await listManifestScripts(baseUrl);
+  const payload = {
+    manifestVersion: now,
+    generatedAt: now,
+    minClientVersionCode: 0,
+    scripts
+  };
+  const signed = signScript(JSON.stringify(payload));
+  return { ...payload, signature: signed.signature, alg: signed.alg };
+}
+
+function getPublicBaseUrl(req) {
+  const configured = (process.env.PUBLIC_BASE_URL || "").trim();
+  if (configured) return configured.replace(/\/+$/, "") + "/";
+  const proto = (req.headers["x-forwarded-proto"] || "https").toString().split(",")[0].trim() || "https";
+  const host = (req.headers["x-forwarded-host"] || req.headers.host || "").toString().split(",")[0].trim();
+  return `${proto}://${host}/`;
+}
+
+async function listManifestScripts(baseUrl) {
+  const entries = [];
+  await collectManifestScripts(entries, baseUrl, scriptOutputDir, "parsers");
+  await collectManifestScripts(entries, baseUrl, path.join(scriptOutputDir, "js"), "js");
+  return entries.sort((a, b) => {
+    const categoryOrder = a.category.localeCompare(b.category);
+    if (categoryOrder !== 0) return categoryOrder;
+    return a.name.localeCompare(b.name);
+  });
+}
+
+async function collectManifestScripts(entries, baseUrl, dir, category) {
+  let files = [];
+  try {
+    files = await fs.readdir(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const file of files) {
+    if (!file.isFile() || !file.name.endsWith(".js")) continue;
+    const name = sanitizeScriptName(file.name);
+    const fullPath = path.join(dir, name);
+    const content = await readTextIfExists(fullPath);
+    if (!content) continue;
+    const meta = category === "parsers" ? await getScriptMeta(name) : await readCategoryScriptMeta(dir, name);
+    const contentHash = hashText(content);
+    const signed = meta?.signature ? { signature: meta.signature, alg: meta.alg || "rsa-sha256" } : signScript(content);
+    const version = Number(meta?.version || 1);
+    entries.push({
+      scriptId: `${category}.${name.replace(/\.js$/i, "")}`,
+      category,
+      name,
+      version,
+      releaseId: (meta?.releaseId || meta?.release_id || `rel_${version}`).toString(),
+      channel: normalizeReleaseStage(meta?.releaseStage || meta?.release_stage || "active"),
+      url: `${baseUrl}scripts/${category}/${encodeURIComponent(name)}`,
+      metaUrl: `${baseUrl}scripts/${category}/${encodeURIComponent(buildScriptMetaFileName(name))}`,
+      sha256: meta?.sha256 || contentHash,
+      signature: signed.signature || "",
+      alg: signed.alg || "",
+      priority: Number(meta?.priority || 0),
+      schoolSystemTypes: normalizeManifestArray(meta?.schoolSystemTypes || meta?.school_system_types),
+      schoolIds: normalizeManifestArray(meta?.schoolIds || meta?.school_ids),
+      rolloutPercent: Number(meta?.rolloutPercent ?? meta?.rollout_percent ?? 100),
+      killSwitch: meta?.killSwitch === true || meta?.disabled === true,
+      minAppVersionCode: Number(meta?.minAppVersionCode || meta?.min_app_version_code || 0),
+      maxAppVersionCode: Number(meta?.maxAppVersionCode || meta?.max_app_version_code || 0) || null,
+      parserApiVersion: Number(meta?.parserApiVersion || meta?.parser_api_version || 1),
+      dependencies: Array.isArray(meta?.dependencies) ? meta.dependencies : [],
+      changelog: (meta?.changelog || "").toString()
+    });
+  }
+}
+
+async function readCategoryScriptMeta(dir, scriptName) {
+  const raw = await readTextIfExists(path.join(dir, buildScriptMetaFileName(scriptName)));
+  return raw ? safeJson(raw) : null;
+}
+
+function normalizeManifestArray(value) {
+  if (Array.isArray(value)) return value.map((item) => item.toString()).filter(Boolean);
+  if (typeof value === "string" && value.trim()) {
+    return value.split(",").map((item) => item.trim()).filter(Boolean);
+  }
+  return [];
+}
+
+function normalizePemEnv(value) {
+  const text = (value || "").toString().trim();
+  if (!text) return "";
+  return text.replace(/\\n/g, "\n");
+}
+
+async function recordParseReport(body) {
+  const session = body?.session || {};
+  const parseSessionId = (session.parseSessionId || session.parse_session_id || "").toString().trim();
+  if (!parseSessionId) return { issueId: "" };
+  const now = Date.now();
+  const attempts = Array.isArray(body?.attempts) ? body.attempts.slice(0, 20) : [];
+  const pageFingerprint = body?.pageFingerprint || body?.page_fingerprint || null;
+  const sanitizedSample = body?.sanitizedSample || body?.sanitized_sample || null;
+  const finalSuccess = body?.finalSuccess === true || body?.final_success === true;
+  const finalFailureType = normalizeParseFailureType(body?.finalFailureType || body?.final_failure_type || "");
+  const storedSession = {
+    parseSessionId,
+    appVersionCode: Number(session.appVersionCode || session.app_version_code || 0),
+    appVersionName: (session.appVersionName || session.app_version_name || "").toString(),
+    installBucketIdHash: (session.installBucketIdHash || session.install_bucket_id_hash || "").toString(),
+    schoolId: (session.schoolId || session.school_id || "").toString(),
+    schoolName: (session.schoolName || session.school_name || "").toString(),
+    schoolSystemType: normalizeReportSchoolSystemType(session.schoolSystemType || session.school_system_type || ""),
+    importSource: (session.importSource || session.import_source || "UNKNOWN").toString(),
+    sourceUrlHost: (session.sourceUrlHost || session.source_url_host || "").toString(),
+    pageFingerprintHash: hashText(JSON.stringify(pageFingerprint || {})),
+    finalSuccess,
+    finalFailureType,
+    createdAt: Number(session.startedAt || session.started_at || now),
+    updatedAt: now
+  };
+  await redisClient.set(buildParseSessionKey(parseSessionId), JSON.stringify(storedSession), { PX: queueItemTtlMs });
+  if (attempts.length > 0) {
+    const attemptKey = buildParserAttemptsKey(parseSessionId);
+    await redisClient.del(attemptKey);
+    await redisClient.rPush(attemptKey, attempts.map((item) => JSON.stringify(normalizeParserAttempt(item))));
+    await redisClient.expire(attemptKey, Math.ceil(queueItemTtlMs / 1000));
+  }
+  if (finalSuccess) return { issueId: "" };
+  const failedAttempt = attempts.find((item) => item && item.success !== true) || attempts[0] || {};
+  const issue = await upsertRepairIssue({
+    session: storedSession,
+    pageFingerprint,
+    attempt: normalizeParserAttempt(failedAttempt),
+    finalFailureType,
+    parseSessionId
+  });
+  if (sanitizedSample?.content && sanitizedSample?.hasUserConsent === true) {
+    await saveFailureSample(issue.issueId, {
+      parseSessionId,
+      content: sanitizedSample.content.toString(),
+      contentSha256: (sanitizedSample.contentSha256 || "").toString() || hashText(sanitizedSample.content.toString()),
+      sanitizerVersion: Number(sanitizedSample.sanitizerVersion || 0),
+      pageFingerprint,
+      schoolId: storedSession.schoolId,
+      schoolSystemType: storedSession.schoolSystemType,
+      sourceUrlHost: storedSession.sourceUrlHost,
+      createdAt: now
+    });
+  }
+  return { issueId: issue.issueId };
+}
+
+function normalizeParserAttempt(item) {
+  return {
+    parserName: sanitizeScriptName(item?.parserName || item?.parser_name || ""),
+    category: (item?.category || "parsers").toString(),
+    parserVersion: Number(item?.parserVersion || item?.parser_version || 0),
+    releaseId: (item?.releaseId || item?.release_id || "").toString(),
+    scriptSource: (item?.scriptSource || item?.script_source || "").toString(),
+    scriptSha256: (item?.scriptSha256 || item?.script_sha256 || "").toString(),
+    durationMs: Number(item?.durationMs || item?.duration_ms || 0),
+    success: item?.success === true,
+    resultCount: Number(item?.resultCount || item?.result_count || 0),
+    failureType: normalizeParseFailureType(item?.failureType || item?.failure_type || ""),
+    safeErrorCode: (item?.safeErrorCode || item?.safe_error_code || "").toString(),
+    schemaValid: item?.schemaValid === true || item?.schema_valid === true,
+    confidence: Number(item?.confidence || 0)
+  };
+}
+
+async function upsertRepairIssue({ session, pageFingerprint, attempt, finalFailureType, parseSessionId }) {
+  const failureType = normalizeParseFailureType(attempt.failureType || finalFailureType || "unknown");
+  const issueKey = [
+    session.schoolSystemType || "unknown",
+    session.sourceUrlHost || "unknown",
+    session.pageFingerprintHash || hashText(JSON.stringify(pageFingerprint || {})),
+    attempt.parserName || "unknown.js",
+    attempt.parserVersion || 0,
+    failureType
+  ].join("|");
+  const issueId = `issue_${hashText(issueKey).slice(0, 16)}`;
+  const key = buildRepairIssueKey(issueId);
+  const previousRaw = await redisClient.get(key);
+  const previous = previousRaw ? safeJson(previousRaw) : null;
+  const now = Date.now();
+  const issue = {
+    issueId,
+    issueKey,
+    schoolId: session.schoolId || "",
+    schoolName: session.schoolName || "",
+    schoolSystemType: session.schoolSystemType || "unknown",
+    sourceUrlHost: session.sourceUrlHost || "",
+    pageFingerprintHash: session.pageFingerprintHash || "",
+    affectedScriptId: attempt.parserName || "",
+    affectedVersion: Number(attempt.parserVersion || 0),
+    failureType,
+    sampleCount: Number(previous?.sampleCount || 0),
+    userCount: Number(previous?.userCount || 0),
+    priority: previous?.priority || "P2",
+    status: previous?.status || "open",
+    lastParseSessionId: parseSessionId,
+    lastAttempt: attempt,
+    createdAt: Number(previous?.createdAt || now),
+    updatedAt: now,
+    lastSeenAt: now
+  };
+  await redisClient.sAdd("repair:issue:ids", issueId);
+  const seenKey = buildRepairIssueSessionsKey(issueId);
+  const added = await redisClient.sAdd(seenKey, parseSessionId);
+  await redisClient.expire(seenKey, Math.ceil(queueItemTtlMs / 1000));
+  if (added) issue.userCount += 1;
+  await redisClient.set(key, JSON.stringify(issue));
+  return issue;
+}
+
+async function saveFailureSample(issueId, sample) {
+  const sampleId = `sample_${hashText(`${issueId}:${sample.parseSessionId}:${sample.contentSha256}`).slice(0, 16)}`;
+  await redisClient.set(buildFailureSampleKey(sampleId), JSON.stringify({ sampleId, issueId, ...sample }), {
+    PX: queueItemTtlMs
+  });
+  await redisClient.sAdd(buildRepairIssueSamplesKey(issueId), sampleId);
+  const issueRaw = await redisClient.get(buildRepairIssueKey(issueId));
+  const issue = issueRaw ? safeJson(issueRaw) : null;
+  if (issue) {
+    issue.sampleCount = Number(issue.sampleCount || 0) + 1;
+    issue.updatedAt = Date.now();
+    await redisClient.set(buildRepairIssueKey(issueId), JSON.stringify(issue));
+  }
+}
+
+async function listRepairIssues(limit = 100) {
+  if (!redisReady) return [];
+  const ids = await redisClient.sMembers("repair:issue:ids");
+  const items = [];
+  for (const issueId of ids) {
+    const raw = await redisClient.get(buildRepairIssueKey(issueId));
+    const issue = raw ? safeJson(raw) : null;
+    if (issue) items.push(issue);
+  }
+  return items.sort((a, b) => Number(b.lastSeenAt || 0) - Number(a.lastSeenAt || 0)).slice(0, limit);
+}
+
+async function getRepairIssueDetail(issueId) {
+  const raw = await redisClient.get(buildRepairIssueKey(issueId));
+  const issue = raw ? safeJson(raw) : null;
+  if (!issue) return null;
+  const sampleIds = await redisClient.sMembers(buildRepairIssueSamplesKey(issueId));
+  const samples = [];
+  for (const sampleId of sampleIds.slice(0, 20)) {
+    const sampleRaw = await redisClient.get(buildFailureSampleKey(sampleId));
+    const sample = sampleRaw ? safeJson(sampleRaw) : null;
+    if (sample) {
+      samples.push({
+        ...sample,
+        contentPreview: (sample.content || "").toString().slice(0, 4000)
+      });
+    }
+  }
+  const attempts = issue.lastParseSessionId ? await readParserAttempts(issue.lastParseSessionId) : [];
+  return { issue, samples, attempts };
+}
+
+async function readParserAttempts(parseSessionId) {
+  const list = await redisClient.lRange(buildParserAttemptsKey(parseSessionId), 0, 50);
+  return list.map((item) => safeJson(item)).filter(Boolean);
+}
+
+async function runRepairIssueTest(issueId, username) {
+  const detail = await getRepairIssueDetail(issueId);
+  if (!detail) return { ok: false, code: 404, reason: "issue_not_found" };
+  const scriptName = detail.issue?.affectedScriptId || "";
+  const script = await readScript(scriptName);
+  if (!script) return { ok: false, code: 404, reason: "script_not_found" };
+  const submissions = detail.samples
+    .filter((item) => item.content)
+    .map((item) => ({ content: item.content, hash: item.contentSha256 || item.sampleId }));
+  if (submissions.length === 0) return { ok: false, code: 400, reason: "sample_not_found" };
+  const replay = runSubmissionReplay(script, submissions);
+  const result = {
+    ok: replay.ok,
+    reason: replay.reason || "",
+    testedAt: Date.now(),
+    testedBy: username,
+    sampleCount: submissions.length
+  };
+  const issueRaw = await redisClient.get(buildRepairIssueKey(issueId));
+  const issue = issueRaw ? safeJson(issueRaw) : null;
+  if (issue) {
+    issue.lastReplay = result;
+    issue.updatedAt = Date.now();
+    await redisClient.set(buildRepairIssueKey(issueId), JSON.stringify(issue));
+  }
+  return result;
+}
+
+function normalizeReportSchoolSystemType(value) {
+  const raw = (value || "").toString().trim().toLowerCase();
+  if (raw === "zf" || raw === "zhengfang") return "zhengfang";
+  if (raw === "qiangzhi") return "qiangzhi";
+  if (raw === "kingosoft") return "kingosoft";
+  if (raw === "qidi") return "qidi";
+  if (raw === "chaoxing") return "chaoxing";
+  return raw || "unknown";
+}
+
+function normalizeParseFailureType(value) {
+  const raw = (value || "").toString().trim().toLowerCase();
+  const map = {
+    parser_empty_result: "parser_empty",
+    script_execution_exception: "parser_crash",
+    unsupported_page: "unsupported_format",
+    page_not_loaded: "extractor_empty",
+    unknown: "unknown"
+  };
+  return map[raw] || raw || "unknown";
+}
+
+function buildParseSessionKey(parseSessionId) {
+  return `parse:session:${parseSessionId}`;
+}
+
+function buildParserAttemptsKey(parseSessionId) {
+  return `parser:attempts:${parseSessionId}`;
+}
+
+function buildRepairIssueKey(issueId) {
+  return `repair:issue:${issueId}`;
+}
+
+function buildRepairIssueSessionsKey(issueId) {
+  return `repair:issue:sessions:${issueId}`;
+}
+
+function buildRepairIssueSamplesKey(issueId) {
+  return `repair:issue:samples:${issueId}`;
+}
+
+function buildFailureSampleKey(sampleId) {
+  return `failure:sample:${sampleId}`;
+}
 
 /**
  * 将提交内容加入学校队列
@@ -3563,7 +4005,8 @@ async function buildAdminDashboardData() {
     usageScript,
     scriptParseFeedback,
     scriptSessionFeedback,
-    scriptPullStats
+    scriptPullStats,
+    repairIssues
   ] =
     await Promise.all([
       getMetricsSnapshot(),
@@ -3575,7 +4018,8 @@ async function buildAdminDashboardData() {
       getUsageSnapshot("script"),
       getScriptFeedbackSummary(),
       getScriptSessionSummary(),
-      getScriptPullSummary()
+      getScriptPullSummary(),
+      listRepairIssues(100)
     ]);
   const schoolQueues = {};
   let totalQueueLength = 0;
@@ -3618,6 +4062,7 @@ async function buildAdminDashboardData() {
     scriptParseFeedback,
     scriptSessionFeedback,
     scriptPullStats,
+    repairIssues,
     modelUsage: {
       summary: usageSummary,
       script: usageScript

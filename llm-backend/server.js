@@ -127,6 +127,11 @@ const degradeHighCostEnabled = process.env.DEGRADE_HIGH_COST === "true";
 const issueClusterSimilarity = Number(process.env.ISSUE_CLUSTER_SIMILARITY || 0.45);
 // 管理后台会话有效期（默认 12 小时）
 const adminSessionTtlMs = Number(process.env.ADMIN_SESSION_TTL_MS || 12 * 60 * 60 * 1000);
+const adminEventTokenTtlMs = Number(process.env.ADMIN_EVENT_TOKEN_TTL_MS || 10 * 60 * 1000);
+const adminLoginRateLimitPerMin = Number(process.env.ADMIN_LOGIN_RATE_LIMIT_PER_MIN || 12);
+const adminApiRateLimitPerMin = Number(process.env.ADMIN_API_RATE_LIMIT_PER_MIN || 240);
+const adminWriteRateLimitPerMin = Number(process.env.ADMIN_WRITE_RATE_LIMIT_PER_MIN || 80);
+const adminEventRateLimitPerMin = Number(process.env.ADMIN_EVENT_RATE_LIMIT_PER_MIN || 30);
 const adminLocalMode = process.env.ADMIN_LOCAL_MODE === "true";
 const currentFilePath = fileURLToPath(import.meta.url);
 const currentDirPath = path.dirname(currentFilePath);
@@ -523,6 +528,11 @@ const server = http.createServer((req, res) => {
   // [管理后台接口] 登录
   // ---------------------------------------------------------------------------
   if (req.method === "POST" && url.pathname === "/api/v1/admin/login") {
+    const clientIp = getClientIp(req);
+    const loginAllowed = await checkNamedRateLimit(`admin-login:${clientIp}`, adminLoginRateLimitPerMin);
+    if (!loginAllowed) {
+      return sendJson(res, 429, { code: 429, msg: "登录尝试过于频繁，请稍后再试" });
+    }
     const bodyText = await readBody(req, maxContentLength);
     if (bodyText == null) {
       return sendJson(res, 413, { code: 413, msg: "请求体过大" });
@@ -560,13 +570,33 @@ const server = http.createServer((req, res) => {
     if (!auth.ok) {
       return sendJson(res, 401, { code: 401, msg: "未登录" });
     }
+    const allowed = await checkAdminRequestRateLimit(req, auth, { scope: "read", action: "session" });
+    if (!allowed) {
+      return sendJson(res, 429, { code: 429, msg: "请求过于频繁" });
+    }
     return sendJson(res, 200, { code: 200, data: { username: auth.username } });
   }
-  if (req.method === "GET" && url.pathname === "/api/v1/admin/events") {
-    const token = (url.searchParams.get("token") || "").trim();
-    const auth = await requireAdminAuthByToken(token);
+  if (req.method === "POST" && url.pathname === "/api/v1/admin/events/token") {
+    const auth = await requireAdminAuth(req);
     if (!auth.ok) {
       return sendJson(res, 401, { code: 401, msg: "未登录" });
+    }
+    const allowed = await checkAdminRequestRateLimit(req, auth, { scope: "event", action: "event_token" });
+    if (!allowed) {
+      return sendJson(res, 429, { code: 429, msg: "请求过于频繁" });
+    }
+    const eventToken = await createAdminEventToken(auth.username, auth.token);
+    return sendJson(res, 200, { code: 200, data: { token: eventToken, expiresInMs: adminEventTokenTtlMs } });
+  }
+  if (req.method === "GET" && url.pathname === "/api/v1/admin/events") {
+    const token = (url.searchParams.get("streamToken") || url.searchParams.get("token") || "").trim();
+    const auth = await requireAdminEventAuth(token);
+    if (!auth.ok) {
+      return sendJson(res, 401, { code: 401, msg: "未登录" });
+    }
+    const allowed = await checkAdminRequestRateLimit(req, auth, { scope: "event", action: "events" });
+    if (!allowed) {
+      return sendJson(res, 429, { code: 429, msg: "请求过于频繁" });
     }
     res.writeHead(200, {
       "Content-Type": "text/event-stream; charset=utf-8",
@@ -738,6 +768,10 @@ const server = http.createServer((req, res) => {
     const auth = await requireAdminAuth(req);
     if (!auth.ok) {
       return sendJson(res, 401, { code: 401, msg: "未登录" });
+    }
+    const allowed = await checkAdminRequestRateLimit(req, auth, { scope: "read", action: "data" });
+    if (!allowed) {
+      return sendJson(res, 429, { code: 429, msg: "请求过于频繁" });
     }
     const data = await buildAdminDashboardData();
     return sendJson(res, 200, { code: 200, data });
@@ -1084,6 +1118,10 @@ const server = http.createServer((req, res) => {
     if (!auth.ok) {
       return sendJson(res, 401, { code: 401, msg: "未登录" });
     }
+    const allowed = await checkAdminRequestRateLimit(req, auth, { scope: "write", action: "config_save" });
+    if (!allowed) {
+      return sendJson(res, 429, { code: 429, msg: "请求过于频繁" });
+    }
     if (adminLocalMode) {
       return sendJson(res, 400, { code: 400, msg: "本地调试模式不支持修改配置" });
     }
@@ -1133,6 +1171,10 @@ const server = http.createServer((req, res) => {
     const auth = await requireAdminAuth(req);
     if (!auth.ok) {
       return sendJson(res, 401, { code: 401, msg: "未登录" });
+    }
+    const allowed = await checkAdminRequestRateLimit(req, auth, { scope: "write", action: "config_test" });
+    if (!allowed) {
+      return sendJson(res, 429, { code: 429, msg: "请求过于频繁" });
     }
     const bodyText = await readBody(req, maxContentLength);
     if (!bodyText) return sendJson(res, 400, { code: 400, msg: "无效请求体" });
@@ -1221,17 +1263,29 @@ const server = http.createServer((req, res) => {
     const safeContent = sanitizeContent(content);
     const inferredSchoolName =
       schoolNameInput || extractSchoolNameFromContent(content) || extractSchoolNameFromContent(safeContent) || "";
-    const schoolId = await resolveSchoolIdByName(schoolIdInput, inferredSchoolName);
+    const schoolIdFromName = await resolveSchoolIdByName(schoolIdInput, inferredSchoolName);
     const schoolName = inferredSchoolName || "";
     const clientIp = getClientIp(req);
-    const rateAllowed = await checkRateLimit(clientIp, schoolId);
+    const candidateUrls = extractCandidateUrls(content, safeContent, sourceUrl);
+    const classification = await resolveSubmissionClassification({
+      content: safeContent,
+      sourceUrl,
+      failureTypeInput,
+      schoolSystemTypeInput,
+      attemptedParsers,
+      scriptName
+    });
+    const queueSchoolId =
+      schoolIdFromName ||
+      buildFallbackSchoolId(classification.schoolSystemType, sourceUrl, schoolName);
+    const rateAllowed = await checkRateLimit(clientIp, queueSchoolId);
     if (!rateAllowed) {
       return sendJson(res, 429, { code: 429, msg: "请求过于频繁" });
     }
     const contentHash = hashText(safeContent);
     const scriptHash = scriptName ? hashText(await readScript(scriptName)) : "";
     const idempotentKey = buildIdempotentKey({
-      schoolId,
+      schoolId: queueSchoolId,
       scriptName,
       contentHash,
       scriptHash,
@@ -1245,21 +1299,12 @@ const server = http.createServer((req, res) => {
           code: 200,
           msg: "ok",
           taskId: existingTaskId,
-          schoolId: existingTask.schoolId || schoolId,
+          schoolId: existingTask.schoolId || queueSchoolId,
           schoolName: existingTask.schoolName || schoolName,
           schoolSystemType: existingTask.schoolSystemType || "unknown"
         });
       }
     }
-    const candidateUrls = extractCandidateUrls(content, safeContent, sourceUrl);
-    const classification = await resolveSubmissionClassification({
-      content: safeContent,
-      sourceUrl,
-      failureTypeInput,
-      schoolSystemTypeInput,
-      attemptedParsers,
-      scriptName
-    });
     if (!issueId && parseSessionId) {
       const mappedIssueId = await redisClient.get(buildParseSessionIssueKey(parseSessionId));
       if (mappedIssueId) {
@@ -1267,8 +1312,8 @@ const server = http.createServer((req, res) => {
       }
     }
     const schoolSystemType = classification.schoolSystemType;
-    if (schoolId) {
-      await saveSchoolInfo(schoolId, schoolName, schoolSystemType, candidateUrls, {
+    if (queueSchoolId) {
+      await saveSchoolInfo(queueSchoolId, schoolName || extractHost(sourceUrl), schoolSystemType, candidateUrls, {
         systemSource: classification.schoolSystemSource
       });
     }
@@ -1280,7 +1325,7 @@ const server = http.createServer((req, res) => {
       result: null,
       createdAt: Date.now(),
       pendingReason: parseProviderReady ? "" : "provider_not_ready",
-      schoolId,
+      schoolId: queueSchoolId,
       schoolName,
       schoolSystemType,
       sourceUrl,
@@ -1305,14 +1350,14 @@ const server = http.createServer((req, res) => {
         source: "parse_task",
         meta: {
           taskId,
-          schoolId,
+          schoolId: queueSchoolId,
           scriptName: sanitizeScriptName(scriptName || ""),
           parseSessionId
         }
       });
     }
     if (parseProviderReady) {
-      runTask(taskId, safeContent, schoolId).catch(async () => {
+        runTask(taskId, safeContent, queueSchoolId).catch(async () => {
         const existing = (await getTask(taskId)) || {};
         await saveTask(taskId, {
           ...existing,
@@ -1320,8 +1365,8 @@ const server = http.createServer((req, res) => {
           result: null,
           createdAt: existing.createdAt || Date.now(),
           completedAt: Date.now(),
-          schoolId,
-          schoolName,
+            schoolId: queueSchoolId,
+            schoolName,
           schoolSystemType,
           sourceUrl,
           scriptName,
@@ -1342,7 +1387,7 @@ const server = http.createServer((req, res) => {
       await enqueuePendingParseTask({
         taskId,
         content: safeContent,
-        schoolId,
+        schoolId: queueSchoolId,
         schoolName,
         schoolSystemType,
         sourceUrl,
@@ -1361,8 +1406,8 @@ const server = http.createServer((req, res) => {
       });
       schedulePendingParseProcessing();
     }
-    if (schoolId) {
-      await enqueueSchoolSubmission(schoolId, safeContent, scriptName, {
+    if (queueSchoolId) {
+      await enqueueSchoolSubmission(queueSchoolId, safeContent, scriptName, {
         schoolName,
         schoolSystemType,
         sourceUrl,
@@ -1385,7 +1430,7 @@ const server = http.createServer((req, res) => {
       code: 200,
       msg: parseProviderReady ? "ok" : "accepted_pending_model_key",
       taskId,
-      schoolId,
+      schoolId: queueSchoolId,
       schoolName,
       schoolSystemType,
       parseProviderReady
@@ -1544,16 +1589,22 @@ async function recordParseReport(body) {
   const sanitizedSample = body?.sanitizedSample || body?.sanitized_sample || null;
   const finalSuccess = body?.finalSuccess === true || body?.final_success === true;
   const finalFailureType = normalizeParseFailureType(body?.finalFailureType || body?.final_failure_type || "");
+  const reportedSchoolName = (session.schoolName || session.school_name || "").toString();
+  const reportedSourceUrlHost = (session.sourceUrlHost || session.source_url_host || "").toString();
+  const reportedSchoolSystemType = normalizeReportSchoolSystemType(session.schoolSystemType || session.school_system_type || "");
+  const resolvedSchoolId =
+    (session.schoolId || session.school_id || "").toString() ||
+    buildFallbackSchoolId(reportedSchoolSystemType, reportedSourceUrlHost, reportedSchoolName);
   const storedSession = {
     parseSessionId,
     appVersionCode: Number(session.appVersionCode || session.app_version_code || 0),
     appVersionName: (session.appVersionName || session.app_version_name || "").toString(),
     installBucketIdHash: (session.installBucketIdHash || session.install_bucket_id_hash || "").toString(),
-    schoolId: (session.schoolId || session.school_id || "").toString(),
-    schoolName: (session.schoolName || session.school_name || "").toString(),
-    schoolSystemType: normalizeReportSchoolSystemType(session.schoolSystemType || session.school_system_type || ""),
+    schoolId: resolvedSchoolId,
+    schoolName: reportedSchoolName || reportedSourceUrlHost,
+    schoolSystemType: reportedSchoolSystemType,
     importSource: (session.importSource || session.import_source || "UNKNOWN").toString(),
-    sourceUrlHost: (session.sourceUrlHost || session.source_url_host || "").toString(),
+    sourceUrlHost: reportedSourceUrlHost,
     pageFingerprintHash: hashText(JSON.stringify(pageFingerprint || {})),
     finalSuccess,
     finalFailureType,
@@ -4454,6 +4505,15 @@ function getClientIp(req) {
   return req.socket?.remoteAddress || "unknown";
 }
 
+async function checkNamedRateLimit(key, limitPerMin) {
+  if (!redisReady || !key || limitPerMin <= 0) return true;
+  const count = await redisClient.incr(key);
+  if (count === 1) {
+    await redisClient.expire(key, 60);
+  }
+  return count <= limitPerMin;
+}
+
 /**
  * 全局速率限制器
  * 对同 IP 和同学校 ID 分别进行请求速率限制，避免恶意攻击或重试风暴打挂服务端
@@ -4474,6 +4534,15 @@ async function checkRateLimit(ip, schoolId) {
     if (schoolCount > rateLimitSchoolPerMin) return false;
   }
   return true;
+}
+
+function buildFallbackSchoolId(schoolSystemType, sourceUrlOrHost, schoolName) {
+  const directName = normalizeSchoolNameFull(schoolName);
+  if (directName) return directName;
+  const normalizedType = normalizeReportSchoolSystemType(schoolSystemType || "") || "unknown";
+  const host = extractHost(sourceUrlOrHost || "") || (sourceUrlOrHost || "").toString().trim().toLowerCase();
+  if (!host) return "";
+  return `host_${normalizedType}_${host.replace(/[^a-z0-9.-]+/gi, "_")}`;
 }
 
 /**
@@ -5150,6 +5219,21 @@ async function deleteAdminSession(token) {
   await redisClient.del(buildAdminSessionKey(token));
 }
 
+async function createAdminEventToken(username, sessionToken) {
+  const token = crypto.randomUUID();
+  const payload = {
+    username: (username || "").toString(),
+    sessionToken: (sessionToken || "").toString(),
+    createdAt: Date.now()
+  };
+  if (adminLocalMode) {
+    adminLocalSessions.set(buildAdminEventTokenKey(token), { ...payload, expiresAt: Date.now() + adminEventTokenTtlMs });
+    return token;
+  }
+  await redisClient.set(buildAdminEventTokenKey(token), JSON.stringify(payload), { PX: adminEventTokenTtlMs });
+  return token;
+}
+
 /**
  * 从请求中校验管理后台登录态
  */
@@ -5185,6 +5269,47 @@ async function requireAdminAuthByToken(token) {
   const username = await redisClient.get(buildAdminSessionKey(normalized));
   if (!username) return { ok: false };
   return { ok: true, username, token: normalized };
+}
+
+async function requireAdminEventAuth(token) {
+  const normalized = (token || "").trim();
+  if (!normalized) return { ok: false };
+  const key = buildAdminEventTokenKey(normalized);
+  if (adminLocalMode) {
+    const session = adminLocalSessions.get(key);
+    if (!session) return { ok: false };
+    if (session.expiresAt <= Date.now()) {
+      adminLocalSessions.delete(key);
+      return { ok: false };
+    }
+    const parentSession = adminLocalSessions.get(session.sessionToken || "");
+    if (!parentSession || parentSession.expiresAt <= Date.now()) {
+      adminLocalSessions.delete(key);
+      return { ok: false };
+    }
+    return { ok: true, username: session.username, token: session.sessionToken, eventToken: normalized };
+  }
+  const raw = await redisClient.get(key);
+  const payload = raw ? safeJson(raw) : null;
+  if (!payload?.sessionToken || !payload?.username) return { ok: false };
+  const username = await redisClient.get(buildAdminSessionKey(payload.sessionToken));
+  if (!username || username !== payload.username) return { ok: false };
+  return { ok: true, username: payload.username, token: payload.sessionToken, eventToken: normalized };
+}
+
+async function checkAdminRequestRateLimit(req, auth, options = {}) {
+  if (!redisReady) return true;
+  const scope = (options.scope || "read").toString();
+  const action = (options.action || "generic").toString();
+  const clientIp = getClientIp(req);
+  const identity = auth?.username || auth?.token || clientIp || "unknown";
+  const limit =
+    scope === "write"
+      ? adminWriteRateLimitPerMin
+      : scope === "event"
+        ? adminEventRateLimitPerMin
+        : adminApiRateLimitPerMin;
+  return await checkNamedRateLimit(`admin:${scope}:${action}:${identity}:${clientIp}`, limit);
 }
 
 /**
@@ -6180,6 +6305,10 @@ function buildAdminSessionKey(token) {
   return `admin:session:${token}`;
 }
 
+function buildAdminEventTokenKey(token) {
+  return `admin:event:${token}`;
+}
+
 function buildScriptHistoryKey(scriptName) {
   const safeName = sanitizeScriptName(scriptName);
   return `script:history:${safeName}`;
@@ -6898,11 +7027,20 @@ function readBody(req, maxLen) {
   });
 }
 
+function buildSecurityHeaders(extra = {}) {
+  return {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    ...extra
+  };
+}
+
 /**
  * 返回 JSON 响应
  */
 function sendJson(res, status, body) {
-  res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
+  res.writeHead(status, buildSecurityHeaders({ "Content-Type": "application/json; charset=utf-8" }));
   res.end(JSON.stringify(body));
 }
 
@@ -6910,12 +7048,12 @@ function sendJson(res, status, body) {
  * 返回 HTML 响应
  */
 function sendHtml(res, status, body) {
-  res.writeHead(status, { "Content-Type": "text/html; charset=utf-8" });
+  res.writeHead(status, buildSecurityHeaders({ "Content-Type": "text/html; charset=utf-8" }));
   res.end(body);
 }
 
 function sendText(res, status, body) {
-  res.writeHead(status, { "Content-Type": "text/plain; version=0.0.4; charset=utf-8" });
+  res.writeHead(status, buildSecurityHeaders({ "Content-Type": "text/plain; version=0.0.4; charset=utf-8" }));
   res.end(body);
 }
 
@@ -6961,6 +7099,7 @@ async function sendAdminStaticFile(res, relPath) {
     return sendText(res, 404, "Not Found");
   }
   res.writeHead(200, {
+    ...buildSecurityHeaders(),
     "Content-Type": contentTypeByExt(path.extname(filePath).toLowerCase()),
     "Cache-Control": "no-store"
   });

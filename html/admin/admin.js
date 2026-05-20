@@ -77,6 +77,7 @@ let scriptModalState = {
   currentMeta: null
 };
 let activeRepairIssueId = "";
+let activeEventStreamToken = "";
 
 const navItems = document.querySelectorAll(".nav-item");
 const pageSections = document.querySelectorAll(".page-section");
@@ -117,7 +118,7 @@ async function performLogin() {
     const result = await res.json();
     setToken(result.data.token);
     overlay.style.display = "none";
-    connectAdminEvents();
+    await connectAdminEvents();
     await refreshData();
   } catch {
     setLoginHint("网络异常，请稍后重试", "error");
@@ -263,6 +264,7 @@ function closeAdminEvents() {
     eventSource.close();
   } catch {}
   eventSource = null;
+  activeEventStreamToken = "";
 }
 
 function shouldToastEventLog(entry) {
@@ -284,11 +286,27 @@ function shouldToastEventLog(entry) {
   return true;
 }
 
-function connectAdminEvents() {
+async function connectAdminEvents() {
   const token = getToken();
   if (!token) return;
   closeAdminEvents();
-  eventSource = new EventSource(`/api/v1/admin/events?token=${encodeURIComponent(token)}`);
+  let streamToken = "";
+  try {
+    const result = await postWithAuth("/api/v1/admin/events/token", {});
+    if (result.code !== 200 || !result?.data?.token) {
+      throw new Error(result.msg || "无法创建事件令牌");
+    }
+    streamToken = result.data.token;
+    activeEventStreamToken = streamToken;
+  } catch (error) {
+    const now = Date.now();
+    if (now - lastEventStreamWarnAt >= 15000) {
+      lastEventStreamWarnAt = now;
+      showToast("warning", "事件流未连接", error?.message || "无法创建事件令牌");
+    }
+    return;
+  }
+  eventSource = new EventSource(`/api/v1/admin/events?streamToken=${encodeURIComponent(streamToken)}`);
   eventSource.addEventListener("log", (event) => {
     try {
       const entry = JSON.parse(event.data || "{}");
@@ -307,6 +325,7 @@ function connectAdminEvents() {
   eventSource.addEventListener("hello", () => {});
   eventSource.addEventListener("ping", () => {});
   eventSource.onerror = () => {
+    if (activeEventStreamToken !== streamToken) return;
     const now = Date.now();
     if (now - lastEventStreamWarnAt < 15000) return;
     lastEventStreamWarnAt = now;
@@ -2049,7 +2068,7 @@ async function checkSession() {
   try {
     await fetchWithAuth("/api/v1/admin/session");
     overlay.style.display = "none";
-    connectAdminEvents();
+    await connectAdminEvents();
     await refreshData();
   } catch {
     overlay.style.display = "flex";
@@ -2350,7 +2369,7 @@ logoutBtn.addEventListener("click", async () => {
 checkSession();
 
 setInterval(async () => {
-  if (overlay.style.display === "none") {
+  if (overlay.style.display === "none" && document.visibilityState === "visible") {
     try {
       const activePageId = getActivePageId();
       if (activePageId === "page-scripts") {

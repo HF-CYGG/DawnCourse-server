@@ -439,6 +439,9 @@ header .meta {
   grid-template-columns: 1.4fr 1fr;
   gap: 16px;
 }
+.split > div {
+  min-width: 0;
+}
 @media (max-width: 960px) {
   .split {
     grid-template-columns: 1fr;
@@ -941,7 +944,7 @@ input:checked + .slider:before {
 }
 .timeline-item {
   display: grid;
-  grid-template-columns: auto 1fr;
+  grid-template-columns: 110px minmax(0, 1fr);
   gap: 10px;
   padding: 10px 0;
   border-bottom: 1px solid rgba(43, 48, 59, 0.6);
@@ -970,6 +973,7 @@ input:checked + .slider:before {
 .timeline-main {
   font-size: 12px;
   line-height: 1.45;
+  min-width: 0;
   word-break: break-word;
 }
 .timeline-message {
@@ -1007,7 +1011,7 @@ input:checked + .slider:before {
 }
 .log-table table {
   width: 100%;
-  min-width: 1160px;
+  min-width: 920px;
   border-collapse: collapse;
   table-layout: fixed;
 }

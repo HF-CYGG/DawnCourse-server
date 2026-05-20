@@ -2037,6 +2037,21 @@ function formatRepairModelRoleLabel(role) {
 function formatRepairActionLabel(action) {
   const key = (action || "").toString().trim();
   const map = {
+    summarize_submissions: "模型1总结中",
+    summarize_submissions_single: "模型1逐条总结中",
+    generate_patch_guidance: "模型1指令生成中",
+    generate_patch_guidance_single: "模型1逐条指令生成中",
+    generate_candidate_script: "模型2修复中",
+    generate_candidate_script_single: "模型2逐条修复中",
+    replay_candidate_script: "候选脚本验证中",
+    replay_candidate_script_single: "逐条候选脚本验证中"
+  };
+  return map[key] || key;
+}
+
+function formatRepairHighLevelActionLabel(action) {
+  const key = (action || "").toString().trim();
+  const map = {
     summarize_submissions: "模型1处理中",
     summarize_submissions_single: "模型1处理中",
     generate_patch_guidance: "模型1处理中",
@@ -2044,9 +2059,9 @@ function formatRepairActionLabel(action) {
     generate_candidate_script: "模型2修复中",
     generate_candidate_script_single: "模型2修复中",
     replay_candidate_script: "候选脚本验证中",
-    replay_candidate_script_single: "逐条候选脚本验证中"
+    replay_candidate_script_single: "候选脚本验证中"
   };
-  return map[key] || key;
+  return map[key] || "";
 }
 
 function formatRepairOperationalStageLabel(stage) {
@@ -2071,15 +2086,8 @@ function buildRepairTraceContext(meta) {
   const info = meta && typeof meta === "object" ? meta : {};
   const parts = [];
   const modelRole = formatRepairModelRoleLabel(info.modelRole);
-  const actionLabel = formatRepairActionLabel(info.action);
   const modelText = [info.provider, info.model].filter(Boolean).join(" / ");
-  if (modelRole && actionLabel) {
-    parts.push(`${modelRole} · ${actionLabel}`);
-  } else if (modelRole) {
-    parts.push(modelRole);
-  } else if (actionLabel) {
-    parts.push(actionLabel);
-  }
+  if (modelRole) parts.push(modelRole);
   if (modelText) parts.push(modelText);
   if (info.scriptName) parts.push(`脚本 ${info.scriptName}`);
   if (Number(info.previousVersion || 0) > 0) parts.push(`基于 v${Number(info.previousVersion || 0)}`);
@@ -2104,8 +2112,8 @@ function buildRepairTraceDisplay(item) {
 }
 
 function resolveCurrentOperationalTitle(stage, currentEntry) {
-  const actionTitle = formatRepairActionLabel(currentEntry?.meta?.action || "");
-  if (actionTitle === "模型1处理中" || actionTitle === "模型2修复中") {
+  const actionTitle = formatRepairHighLevelActionLabel(currentEntry?.meta?.action || "");
+  if (actionTitle) {
     return actionTitle;
   }
   return formatRepairOperationalStageLabel(stage || "") || stage || "-";

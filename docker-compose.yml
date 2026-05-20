@@ -11,8 +11,8 @@ services:
     environment:
       LLM_BACKEND_UPSTREAM: llm-backend:8080
     volumes:
-      - parsers-data:/shared/parsers
-      - parsers-data:/var/log/nginx
+      - ./data/parsers:/shared/parsers
+      - ./data/nginx:/var/log/nginx
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
       - ./html:/usr/share/nginx/html:ro
       - ./version.json:/usr/share/nginx/html/version.json:ro
@@ -79,7 +79,7 @@ services:
       ADMIN_SESSION_TTL_MS: 43200000
       BACKEND_MIRROR_LOG_FILE: /shared/parsers/llm-backend.log
     volumes:
-      - parsers-data:/shared/parsers
+      - ./data/parsers:/shared/parsers
       - ./html/scripts:/shared/scripts:ro
     restart: ${RESTART_POLICY:-no}
     depends_on:
@@ -100,8 +100,9 @@ services:
   redis:
     image: redis:7-alpine
     restart: ${RESTART_POLICY:-no}
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--save", "60", "1"]
     volumes:
-      - redis-data:/data
+      - ./data/redis:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -110,10 +111,6 @@ services:
       start_period: 5s
     networks:
       - dawn-net
-
-volumes:
-  redis-data:
-  parsers-data:
 
 networks:
   dawn-net:

@@ -47,8 +47,12 @@ const redisConnectMaxAttempts = Math.max(1, Number(process.env.REDIS_CONNECT_MAX
 const scriptOutputDir = process.env.SCRIPT_OUTPUT_DIR || "/shared/parsers";
 // 老版本脚本目录（支持逗号分隔多个目录），用于升级时回退读取与自动迁移
 const legacyScriptOutputDirs = parseCommaList(
-  process.env.LEGACY_SCRIPT_OUTPUT_DIRS || "/shared/scripts"
+  process.env.LEGACY_SCRIPT_OUTPUT_DIRS || "/shared/scripts/parsers,/shared/scripts/js"
 );
+const submissionArchiveDir =
+  (process.env.SUBMISSION_ARCHIVE_DIR || path.join(scriptOutputDir, "submissions")).toString().trim();
+const parseReportArchiveDir =
+  (process.env.PARSE_REPORT_ARCHIVE_DIR || path.join(scriptOutputDir, "parse_reports")).toString().trim();
 // 同一学校触发脚本修复的最小提交数
 const minQueueSize = Number(process.env.MIN_QUEUE_SIZE || 3);
 // 同一学校合并窗口（毫秒）
@@ -491,6 +495,7 @@ const server = http.createServer((req, res) => {
     if (sampleContent && !hasConsent) {
       return sendJson(res, 400, { code: 400, msg: "样本内容必须经用户同意后上传" });
     }
+    await persistParseReportSnapshot(body);
     const result = await recordParseReport(body);
     return sendJson(res, 200, {
       accepted: true,
@@ -1329,6 +1334,25 @@ const server = http.createServer((req, res) => {
         systemSource: classification.schoolSystemSource
       });
     }
+    await persistSubmissionSnapshot({
+      schoolId: queueSchoolId,
+      schoolName,
+      schoolSystemType,
+      sourceUrl,
+      scriptName,
+      scriptVersion,
+      scriptSource,
+      failureType: failureTypeInput,
+      classifiedFailureType: classification.failureType,
+      failureCategory: classification.failureCategory,
+      failureSource: classification.failureSource,
+      clientVersion,
+      parseSessionId,
+      issueId,
+      attemptedParsers,
+      contentHash,
+      content: safeContent
+    });
     // 生成任务并进入异步处理
     const taskId = crypto.randomUUID();
     const parseProviderReady = isParseProviderReady();
@@ -3432,6 +3456,70 @@ async function readTextIfExists(filePath) {
   } catch {
     return null;
   }
+}
+
+function safePathSegment(value) {
+  const text = (value || "").toString().trim();
+  if (!text) return "unknown";
+  const cleaned = text.replace(/[^a-z0-9._-]+/gi, "_").replace(/^_+|_+$/g, "");
+  return cleaned || "unknown";
+}
+
+async function writeJsonIfAbsent(filePath, data) {
+  try {
+    if (await fileExists(filePath)) return;
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    const text = JSON.stringify(data);
+    await fs.writeFile(filePath, text, "utf-8");
+  } catch {
+    // ignore
+  }
+}
+
+async function appendJsonLine(filePath, data) {
+  try {
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    const line = `${JSON.stringify(data)}\n`;
+    await fs.appendFile(filePath, line, "utf-8");
+  } catch {
+    // ignore
+  }
+}
+
+async function persistSubmissionSnapshot(payload) {
+  const now = Date.now();
+  const day = new Date(now).toISOString().slice(0, 10);
+  const schoolId = safePathSegment(payload?.schoolId);
+  const contentHash = safePathSegment(payload?.contentHash);
+  const folder = path.join(submissionArchiveDir, schoolId, day);
+  const filePath = path.join(folder, `${contentHash}.json`);
+  await writeJsonIfAbsent(filePath, {
+    receivedAt: now,
+    schoolId: (payload?.schoolId || "").toString(),
+    schoolName: (payload?.schoolName || "").toString(),
+    schoolSystemType: (payload?.schoolSystemType || "").toString(),
+    sourceUrl: (payload?.sourceUrl || "").toString(),
+    scriptName: sanitizeScriptName(payload?.scriptName || ""),
+    scriptVersion: Number(payload?.scriptVersion || 0),
+    scriptSource: (payload?.scriptSource || "").toString(),
+    failureType: (payload?.failureType || "").toString(),
+    classifiedFailureType: (payload?.classifiedFailureType || "").toString(),
+    failureCategory: (payload?.failureCategory || "").toString(),
+    failureSource: (payload?.failureSource || "").toString(),
+    clientVersion: (payload?.clientVersion || "").toString(),
+    parseSessionId: (payload?.parseSessionId || "").toString(),
+    issueId: (payload?.issueId || "").toString(),
+    attemptedParsers: Array.isArray(payload?.attemptedParsers) ? payload.attemptedParsers : [],
+    contentHash: (payload?.contentHash || "").toString(),
+    content: (payload?.content || "").toString()
+  });
+}
+
+async function persistParseReportSnapshot(body) {
+  const now = Date.now();
+  const day = new Date(now).toISOString().slice(0, 10);
+  const filePath = path.join(parseReportArchiveDir, `${day}.jsonl`);
+  await appendJsonLine(filePath, { receivedAt: now, body });
 }
 
 /**

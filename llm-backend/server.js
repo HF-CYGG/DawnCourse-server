@@ -741,7 +741,7 @@ const server = http.createServer((req, res) => {
     const data = await buildAdminDashboardData();
     return sendJson(res, 200, { code: 200, data });
   }
-  if (req.method === "GET" && url.pathname === "/api/admin/repair/issues") {
+  if (req.method === "GET" && (url.pathname === "/api/admin/repair/issues" || url.pathname === "/api/v1/admin/repair/issues")) {
     const auth = await requireAdminAuth(req);
     if (!auth.ok) {
       return sendJson(res, 401, { code: 401, msg: "未登录" });
@@ -749,7 +749,7 @@ const server = http.createServer((req, res) => {
     const list = await listRepairIssues(Number(url.searchParams.get("limit") || 100));
     return sendJson(res, 200, { code: 200, data: { list } });
   }
-  if (req.method === "GET" && /^\/api\/admin\/repair\/issues\/[^/]+$/.test(url.pathname)) {
+  if (req.method === "GET" && /^\/api(?:\/v1)?\/admin\/repair\/issues\/[^/]+$/.test(url.pathname)) {
     const auth = await requireAdminAuth(req);
     if (!auth.ok) {
       return sendJson(res, 401, { code: 401, msg: "未登录" });
@@ -761,7 +761,7 @@ const server = http.createServer((req, res) => {
     }
     return sendJson(res, 200, { code: 200, data: detail });
   }
-  if (req.method === "POST" && /^\/api\/admin\/repair\/issues\/[^/]+\/run-test$/.test(url.pathname)) {
+  if (req.method === "POST" && /^\/api(?:\/v1)?\/admin\/repair\/issues\/[^/]+\/run-test$/.test(url.pathname)) {
     const auth = await requireAdminAuth(req);
     if (!auth.ok) {
       return sendJson(res, 401, { code: 401, msg: "未登录" });
@@ -773,7 +773,7 @@ const server = http.createServer((req, res) => {
     }
     return sendJson(res, 200, { code: 200, data: result });
   }
-  if (req.method === "POST" && url.pathname === "/api/admin/scripts/releases") {
+  if (req.method === "POST" && (url.pathname === "/api/admin/scripts/releases" || url.pathname === "/api/v1/admin/scripts/releases")) {
     const auth = await requireAdminAuth(req);
     if (!auth.ok) {
       return sendJson(res, 401, { code: 401, msg: "未登录" });

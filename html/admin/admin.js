@@ -1685,7 +1685,7 @@ async function loadRepairIssuesPage() {
   repairIssueMeta.textContent = "加载中...";
   repairIssueTableBody.innerHTML = `<tr><td colspan="11" class="muted">加载中...</td></tr>`;
   try {
-    const result = await fetchWithAuth("/api/admin/repair/issues");
+    const result = await fetchWithAuth("/api/v1/admin/repair/issues");
     const list = result.data?.list || [];
     repairIssueMeta.textContent = `共 ${list.length} 条，最后刷新 ${formatTime(Date.now())}`;
     renderRepairIssuesTable(list);
@@ -1729,14 +1729,14 @@ function renderRepairIssuesTable(list) {
 async function loadRepairIssueDetail(issueId) {
   if (!repairIssueDetail) return;
   repairIssueDetail.textContent = "加载中...";
-  const result = await fetchWithAuth(`/api/admin/repair/issues/${encodeURIComponent(issueId)}`);
+  const result = await fetchWithAuth(`/api/v1/admin/repair/issues/${encodeURIComponent(issueId)}`);
   repairIssueDetail.textContent = JSON.stringify(result.data || {}, null, 2);
 }
 
 async function runRepairIssueReplay(issueId) {
   if (!repairIssueDetail) return;
   repairIssueDetail.textContent = "测试中...";
-  const result = await fetchWithAuth(`/api/admin/repair/issues/${encodeURIComponent(issueId)}/run-test`, {
+  const result = await fetchWithAuth(`/api/v1/admin/repair/issues/${encodeURIComponent(issueId)}/run-test`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: "{}"

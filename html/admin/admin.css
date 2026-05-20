@@ -902,6 +902,20 @@ input:checked + .slider:before {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.progress-step .detail {
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text);
+  white-space: normal;
+  word-break: break-word;
+}
+.progress-step .submeta {
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--muted);
+  white-space: normal;
+  word-break: break-word;
+}
 .progress-step.completed .dot {
   background: rgba(51, 214, 159, 0.9);
 }
@@ -949,10 +963,17 @@ input:checked + .slider:before {
   font-size: 11px;
   color: var(--accent);
 }
+.timeline-raw-stage {
+  font-size: 10px;
+  color: var(--muted);
+}
 .timeline-main {
   font-size: 12px;
   line-height: 1.45;
   word-break: break-word;
+}
+.timeline-message {
+  color: var(--text);
 }
 .timeline-source {
   font-size: 11px;
@@ -986,7 +1007,9 @@ input:checked + .slider:before {
 }
 .log-table table {
   width: 100%;
+  min-width: 1160px;
   border-collapse: collapse;
+  table-layout: fixed;
 }
 .log-table th,
 .log-table td {
@@ -1003,6 +1026,36 @@ input:checked + .slider:before {
   color: var(--muted);
   z-index: 1;
 }
+.log-table .log-col-time {
+  width: 140px;
+}
+.log-table .log-col-level {
+  width: 76px;
+}
+.log-table .log-col-stage {
+  width: 190px;
+}
+.log-table .log-col-source {
+  width: 180px;
+}
+.log-table .log-col-actor {
+  width: 130px;
+}
+.log-table .log-col-message {
+  width: auto;
+}
+.log-main-text {
+  color: var(--text);
+  line-height: 1.4;
+}
+.log-sub-text {
+  margin-top: 4px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
 .log-msg {
   white-space: pre-wrap;
   word-break: break-word;
@@ -1010,12 +1063,18 @@ input:checked + .slider:before {
 .log-msg.nowrap {
   white-space: pre;
 }
+.log-context {
+  margin-top: 6px;
+}
 .repair-log-meta {
   margin-top: 6px;
   color: var(--muted);
   font-size: 11px;
   white-space: pre-wrap;
   word-break: break-word;
+}
+.log-table details {
+  margin-top: 8px;
 }
 .log-row:hover td {
   background: rgba(91, 157, 255, 0.08);

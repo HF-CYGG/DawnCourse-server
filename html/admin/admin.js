@@ -191,14 +191,14 @@ const pageTitle = document.getElementById("pageTitle");
 
 // 修复流水线阶段顺序：用于进度条与时间线可视化展示
 const REPAIR_STAGE_FLOW = [
-  { stage: "REPORT_RECEIVED", label: "收到上报" },
-  { stage: "ISSUE_MERGED", label: "聚合去重" },
-  { stage: "QUEUED", label: "进入队列" },
-  { stage: "REPLAY_RUNNING", label: "复现中" },
-  { stage: "REPLAY_RESULT", label: "复现结果" },
-  { stage: "CANDIDATE_TEST_RUNNING", label: "候选测试" },
-  { stage: "CANDIDATE_TEST_RESULT", label: "候选结果" },
-  { stage: "PENDING_RELEASE", label: "待发布" },
+  { stage: "REPORT_RECEIVED", label: "收到失败上报" },
+  { stage: "ISSUE_MERGED", label: "归并修复问题" },
+  { stage: "QUEUED", label: "排队等待修复" },
+  { stage: "REPLAY_RUNNING", label: "问题复现中" },
+  { stage: "REPLAY_RESULT", label: "问题复现结果" },
+  { stage: "CANDIDATE_TEST_RUNNING", label: "自动修复处理中" },
+  { stage: "CANDIDATE_TEST_RESULT", label: "自动修复结果" },
+  { stage: "PENDING_RELEASE", label: "待人工发布" },
   { stage: "PUBLISHED", label: "已发布" },
   { stage: "ROLLED_BACK", label: "已回滚" },
   { stage: "DISABLED", label: "已禁用" }
@@ -2013,6 +2013,104 @@ function formatRepairStageLabel(stage) {
   return item ? `${item.label}（${item.stage}）` : key || "-";
 }
 
+function formatRepairSourceLabel(source) {
+  const key = (source || "").toString().trim();
+  const map = {
+    parse_report: "客户端失败上报",
+    parse_task: "云端兜底解析",
+    school_queue: "修复队列",
+    queue_processor: "自动修复流程",
+    admin_retry: "管理员重试",
+    admin_force_repair: "管理员立即修复",
+    admin_replay: "管理员复现"
+  };
+  return map[key] || key || "-";
+}
+
+function formatRepairModelRoleLabel(role) {
+  const key = (role || "").toString().trim();
+  if (key === "summary") return "模型 1";
+  if (key === "script_repair") return "模型 2";
+  return "";
+}
+
+function formatRepairActionLabel(action) {
+  const key = (action || "").toString().trim();
+  const map = {
+    summarize_submissions: "模型1处理中",
+    summarize_submissions_single: "模型1处理中",
+    generate_patch_guidance: "模型1处理中",
+    generate_patch_guidance_single: "模型1处理中",
+    generate_candidate_script: "模型2修复中",
+    generate_candidate_script_single: "模型2修复中",
+    replay_candidate_script: "候选脚本验证中",
+    replay_candidate_script_single: "逐条候选脚本验证中"
+  };
+  return map[key] || key;
+}
+
+function formatRepairOperationalStageLabel(stage) {
+  const key = (stage || "").toString().trim();
+  const map = {
+    REPORT_RECEIVED: "收到失败上报",
+    ISSUE_MERGED: "已归并到修复问题",
+    QUEUED: "排队等待修复",
+    REPLAY_RUNNING: "问题复现中",
+    REPLAY_RESULT: "问题复现结果",
+    CANDIDATE_TEST_RUNNING: "自动修复处理中",
+    CANDIDATE_TEST_RESULT: "自动修复结果",
+    PENDING_RELEASE: "待人工发布",
+    PUBLISHED: "已发布",
+    ROLLED_BACK: "已回滚",
+    DISABLED: "已禁用"
+  };
+  return map[key] || "";
+}
+
+function buildRepairTraceContext(meta) {
+  const info = meta && typeof meta === "object" ? meta : {};
+  const parts = [];
+  const modelRole = formatRepairModelRoleLabel(info.modelRole);
+  const actionLabel = formatRepairActionLabel(info.action);
+  const modelText = [info.provider, info.model].filter(Boolean).join(" / ");
+  if (modelRole && actionLabel) {
+    parts.push(`${modelRole} · ${actionLabel}`);
+  } else if (modelRole) {
+    parts.push(modelRole);
+  } else if (actionLabel) {
+    parts.push(actionLabel);
+  }
+  if (modelText) parts.push(modelText);
+  if (info.scriptName) parts.push(`脚本 ${info.scriptName}`);
+  if (Number(info.previousVersion || 0) > 0) parts.push(`基于 v${Number(info.previousVersion || 0)}`);
+  if (Number(info.sampleCount || 0) > 0) parts.push(`样本 ${Number(info.sampleCount || 0)}`);
+  return parts.join(" · ");
+}
+
+function buildRepairTraceDisplay(item) {
+  const message = (item?.message || "").toString().trim();
+  const actionTitle = formatRepairActionLabel(item?.meta?.action || "");
+  const stageTitle = formatRepairOperationalStageLabel(item?.stage || "");
+  const sourceLabel = formatRepairSourceLabel(item?.source || "");
+  const context = buildRepairTraceContext(item?.meta || {});
+  const title =
+    item?.level === "error" && message
+      ? message
+      : actionTitle || stageTitle || message || formatRepairStageLabel(item?.stage || "");
+  return {
+    title,
+    subtitle: [sourceLabel, context, message && message !== title ? message : ""].filter(Boolean).join(" · ")
+  };
+}
+
+function resolveCurrentOperationalTitle(stage, currentEntry) {
+  const actionTitle = formatRepairActionLabel(currentEntry?.meta?.action || "");
+  if (actionTitle === "模型1处理中" || actionTitle === "模型2修复中") {
+    return actionTitle;
+  }
+  return formatRepairOperationalStageLabel(stage || "") || stage || "-";
+}
+
 function getRepairStageIndex(stage) {
   const key = (stage || "").toString().trim();
   return REPAIR_STAGE_FLOW.findIndex((it) => it.stage === key);
@@ -2035,12 +2133,16 @@ function renderRepairProgress(issue, timelineItems) {
 
   const timelineList = Array.isArray(timelineItems) ? timelineItems : [];
   const stageTimeMap = new Map();
+  const stageEntryMap = new Map();
   for (const item of timelineList) {
     const key = (item?.stage || "").toString();
     const ts = Number(item?.ts || 0);
     if (!key || !ts) continue;
     const existing = stageTimeMap.get(key) || 0;
-    if (ts > existing) stageTimeMap.set(key, ts);
+    if (ts > existing) {
+      stageTimeMap.set(key, ts);
+      stageEntryMap.set(key, item);
+    }
   }
 
   const firstTs = timelineList.reduce((min, item) => {
@@ -2051,7 +2153,9 @@ function renderRepairProgress(issue, timelineItems) {
   const lastTs = timelineList.reduce((max, item) => Math.max(max, Number(item?.ts || 0)), 0);
   const durationText = firstTs && lastTs ? formatDuration(lastTs - firstTs) : "-";
 
-  const statusText = `${info.status || "open"} / ${info.currentStage || "-"}`;
+  const statusText = `${formatRepairOperationalStageLabel(info.currentStage || "") || info.currentStage || "-"} · ${
+    info.status || "open"
+  }`;
   repairIssueProgressStageBadge.textContent = statusText;
   repairIssueProgressStageBadge.classList.remove("success", "warning", "danger");
   if (["PUBLISHED"].includes(info.currentStage)) {
@@ -2064,7 +2168,14 @@ function renderRepairProgress(issue, timelineItems) {
 
   if (repairIssueProgressHint) {
     const percent = Math.round(((normalizedStageIndex + 1) / REPAIR_STAGE_FLOW.length) * 100);
-    repairIssueProgressHint.textContent = `进度 ${percent}% · 修复耗时 ${durationText}`;
+    const currentEntry =
+      stageEntryMap.get(stage) || timelineList[timelineList.length - 1] || null;
+    const currentDisplay = buildRepairTraceDisplay(currentEntry);
+    const operationalTitle = resolveCurrentOperationalTitle(stage, currentEntry);
+    repairIssueProgressStageBadge.textContent = `${operationalTitle} · ${info.status || "open"}`;
+    repairIssueProgressHint.textContent = currentDisplay.title
+      ? `进度 ${percent}% · 修复耗时 ${durationText} · 当前动作：${currentDisplay.title}`
+      : `进度 ${percent}% · 修复耗时 ${durationText}`;
   }
 
   repairIssueProgressMetrics.innerHTML = [
@@ -2077,6 +2188,8 @@ function renderRepairProgress(issue, timelineItems) {
 
   repairIssueProgressSteps.innerHTML = REPAIR_STAGE_FLOW.map((step, idx) => {
     const ts = stageTimeMap.get(step.stage) || 0;
+    const entry = stageEntryMap.get(step.stage) || null;
+    const display = buildRepairTraceDisplay(entry);
     const meta = ts ? formatTime(ts) : "未发生";
     const classes = ["progress-step"];
     if (idx < normalizedStageIndex) classes.push("completed");
@@ -2088,6 +2201,8 @@ function renderRepairProgress(issue, timelineItems) {
         <div class="content">
           <div class="stage">${escapeHtml(step.label)}</div>
           <div class="meta">${escapeHtml(step.stage)} · ${escapeHtml(meta)}</div>
+          <div class="detail">${escapeHtml(display.title || "等待执行")}</div>
+          <div class="submeta">${escapeHtml(display.subtitle || "")}</div>
         </div>
       </div>
     `;
@@ -2105,17 +2220,17 @@ function renderRepairTimelineList(list) {
     .map((item) => {
       const ts = formatTime(item?.ts || 0);
       const stage = (item?.stage || "").toString();
-      const msg = (item?.message || "").toString();
-      const source = (item?.source || "").toString();
+      const display = buildRepairTraceDisplay(item);
       return `
         <div class="timeline-item">
           <div class="timeline-side">
             <div class="timeline-time">${escapeHtml(ts)}</div>
-            <div class="timeline-stage">${escapeHtml(stage || "-")}</div>
+            <div class="timeline-stage">${escapeHtml(formatRepairStageLabel(stage || "-"))}</div>
+            <div class="timeline-raw-stage">${escapeHtml(stage || "-")}</div>
           </div>
           <div class="timeline-main">
-            <div>${escapeHtml(msg || "-")}</div>
-            <div class="timeline-source">${escapeHtml(source || "-")}</div>
+            <div class="timeline-message">${escapeHtml(display.title || "-")}</div>
+            <div class="timeline-source">${escapeHtml(display.subtitle || "-")}</div>
           </div>
         </div>
       `;
@@ -2170,11 +2285,12 @@ function renderRepairLogsTable(list) {
     .map((item) => {
       const ts = formatTime(item?.ts || 0);
       const stage = (item?.stage || "").toString();
+      const stageLabel = formatRepairStageLabel(stage);
       const level = (item?.level || "info").toString();
       const source = (item?.source || "").toString();
       const actor = (item?.actor || "").toString();
       const durationMs = Number(item?.durationMs || 0);
-      const message = (item?.message || "").toString();
+      const display = buildRepairTraceDisplay(item);
       const meta = item?.meta ? JSON.stringify(item.meta, null, 2) : "";
       const levelClass = level === "error" ? "danger" : level === "warning" ? "warning" : "";
       const metaHtml = meta
@@ -2182,13 +2298,23 @@ function renderRepairLogsTable(list) {
         : "";
       return `
         <tr class="log-row">
-          <td style="white-space: nowrap;">${escapeHtml(ts)}</td>
-          <td><span class="badge ${levelClass}">${escapeHtml(level)}</span></td>
-          <td style="white-space: nowrap;">${escapeHtml(stage)}</td>
-          <td style="white-space: nowrap;">${escapeHtml(source || "-")}</td>
-          <td style="white-space: nowrap;">${escapeHtml(actor || "-")} · ${escapeHtml(durationMs)}ms</td>
-          <td>
-            <div class="log-msg ${wrapEnabled ? "" : "nowrap"}">${escapeHtml(message || "-")}</div>
+          <td class="log-col-time">${escapeHtml(ts)}</td>
+          <td class="log-col-level"><span class="badge ${levelClass}">${escapeHtml(level)}</span></td>
+          <td class="log-col-stage">
+            <div class="log-main-text">${escapeHtml(stageLabel)}</div>
+            <div class="log-sub-text">${escapeHtml(stage)}</div>
+          </td>
+          <td class="log-col-source">
+            <div class="log-main-text">${escapeHtml(formatRepairSourceLabel(source || "-"))}</div>
+            <div class="log-sub-text">${escapeHtml(source || "-")}</div>
+          </td>
+          <td class="log-col-actor">
+            <div class="log-main-text">${escapeHtml(actor || "-")}</div>
+            <div class="log-sub-text">${escapeHtml(durationMs)}ms</div>
+          </td>
+          <td class="log-col-message">
+            <div class="log-msg ${wrapEnabled ? "" : "nowrap"}">${escapeHtml(display.title || "-")}</div>
+            <div class="log-sub-text log-context">${escapeHtml(display.subtitle || "")}</div>
             ${metaHtml}
           </td>
         </tr>
@@ -2196,15 +2322,23 @@ function renderRepairLogsTable(list) {
     })
     .join("");
   repairIssueLogTable.innerHTML = `
-    <table>
+    <table class="repair-log-table">
+      <colgroup>
+        <col class="log-col-time">
+        <col class="log-col-level">
+        <col class="log-col-stage">
+        <col class="log-col-source">
+        <col class="log-col-actor">
+        <col class="log-col-message">
+      </colgroup>
       <thead>
         <tr>
-          <th style="min-width: 120px;">时间</th>
-          <th style="min-width: 70px;">级别</th>
-          <th style="min-width: 160px;">阶段</th>
-          <th style="min-width: 140px;">来源</th>
-          <th style="min-width: 160px;">操作者/耗时</th>
-          <th>内容</th>
+          <th class="log-col-time">时间</th>
+          <th class="log-col-level">级别</th>
+          <th class="log-col-stage">阶段</th>
+          <th class="log-col-source">来源</th>
+          <th class="log-col-actor">操作者/耗时</th>
+          <th class="log-col-message">内容</th>
         </tr>
       </thead>
       <tbody>

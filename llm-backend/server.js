@@ -1667,13 +1667,15 @@ async function recordParseReport(body) {
     await redisClient.expire(attemptKey, Math.ceil(queueItemTtlMs / 1000));
   }
   if (finalSuccess) return { issueId: "" };
+  const existingIssueId = (await redisClient.get(buildParseSessionIssueKey(parseSessionId)))?.toString().trim() || "";
   const failedAttempt = attempts.find((item) => item && item.success !== true) || attempts[0] || {};
   const issue = await upsertRepairIssue({
     session: storedSession,
     pageFingerprint,
     attempt: normalizeParserAttempt(failedAttempt),
     finalFailureType,
-    parseSessionId
+    parseSessionId,
+    preferredIssueId: existingIssueId
   });
   await redisClient.set(buildParseSessionIssueKey(parseSessionId), issue.issueId, { PX: queueItemTtlMs });
   await appendRepairIssueTrace(issue.issueId, {
@@ -1748,9 +1750,10 @@ function normalizeParserAttempt(item) {
   };
 }
 
-async function upsertRepairIssue({ session, pageFingerprint, attempt, finalFailureType, parseSessionId }) {
+async function upsertRepairIssue({ session, pageFingerprint, attempt, finalFailureType, parseSessionId, preferredIssueId }) {
   const failureType = normalizeParseFailureType(attempt.failureType || finalFailureType || "unknown");
-  const issueKey = [
+  const preferredId = (preferredIssueId || "").toString().trim();
+  const calculatedIssueKey = [
     session.schoolSystemType || "unknown",
     session.sourceUrlHost || "unknown",
     session.pageFingerprintHash || hashText(JSON.stringify(pageFingerprint || {})),
@@ -1758,21 +1761,23 @@ async function upsertRepairIssue({ session, pageFingerprint, attempt, finalFailu
     attempt.parserVersion || 0,
     failureType
   ].join("|");
-  const issueId = `issue_${hashText(issueKey).slice(0, 16)}`;
+  const calculatedIssueId = `issue_${hashText(calculatedIssueKey).slice(0, 16)}`;
+  const issueId = preferredId || calculatedIssueId;
   const key = buildRepairIssueKey(issueId);
   const previousRaw = await redisClient.get(key);
   const previous = previousRaw ? safeJson(previousRaw) : null;
+  const issueKey = previous?.issueKey || calculatedIssueKey;
   const now = Date.now();
   const issue = {
     issueId,
     issueKey,
-    schoolId: session.schoolId || "",
-    schoolName: session.schoolName || "",
-    schoolSystemType: session.schoolSystemType || "unknown",
-    sourceUrlHost: session.sourceUrlHost || "",
-    pageFingerprintHash: session.pageFingerprintHash || "",
-    affectedScriptId: attempt.parserName || "",
-    affectedVersion: Number(attempt.parserVersion || 0),
+    schoolId: previous?.schoolId || session.schoolId || "",
+    schoolName: previous?.schoolName || session.schoolName || "",
+    schoolSystemType: previous?.schoolSystemType || session.schoolSystemType || "unknown",
+    sourceUrlHost: previous?.sourceUrlHost || session.sourceUrlHost || "",
+    pageFingerprintHash: previous?.pageFingerprintHash || session.pageFingerprintHash || "",
+    affectedScriptId: previous?.affectedScriptId || attempt.parserName || "",
+    affectedVersion: Number(previous?.affectedVersion || attempt.parserVersion || 0),
     failureType,
     sampleCount: Number(previous?.sampleCount || 0),
     userCount: Number(previous?.userCount || 0),
@@ -2659,9 +2664,69 @@ async function processQueueCluster(schoolId, items, normalizedIssues, state, now
     return { state: refreshed, applied: true };
   }
   const mergedText = items.map((item, index) => `【提交 ${index + 1}】\n${item.content}`).join("\n");
+  await appendRepairIssueTraceBatch(issueIds, {
+    stage: "CANDIDATE_TEST_RUNNING",
+    level: "info",
+    message: "开始汇总失败样本（模型 1）",
+    source: "queue_processor",
+    meta: {
+      schoolId,
+      sampleCount: Array.isArray(items) ? items.length : 0,
+      modelRole: "summary",
+      provider: summaryProvider,
+      model: summaryModel,
+      action: "summarize_submissions"
+    }
+  });
   const summary = await summarizeSubmissions(mergedText, schoolId);
-  if (!summary) return { state, applied: false };
+  if (!summary) {
+    await appendRepairIssueTraceBatch(issueIds, {
+      stage: "CANDIDATE_TEST_RESULT",
+      level: "error",
+      message: "模型 1 汇总失败，未生成结构总结",
+      source: "queue_processor",
+      meta: {
+        schoolId,
+        modelRole: "summary",
+        provider: summaryProvider,
+        model: summaryModel,
+        action: "summarize_submissions",
+        ok: false
+      }
+    });
+    return { state, applied: false };
+  }
+  await appendRepairIssueTraceBatch(issueIds, {
+    stage: "CANDIDATE_TEST_RUNNING",
+    level: "info",
+    message: "模型 1 汇总完成，开始生成修复指令",
+    source: "queue_processor",
+    meta: {
+      schoolId,
+      modelRole: "summary",
+      provider: summaryProvider,
+      model: summaryModel,
+      action: "generate_patch_guidance",
+      ok: true
+    }
+  });
   const patchGuidance = await generatePatchGuidance(summary, schoolId);
+  await appendRepairIssueTraceBatch(issueIds, {
+    stage: "CANDIDATE_TEST_RUNNING",
+    level: patchGuidance ? "info" : "warning",
+    message: patchGuidance
+      ? "修复指令生成完成，准备调用模型 2 生成候选脚本"
+      : "修复指令为空，仍继续调用模型 2 生成候选脚本",
+    source: "queue_processor",
+    meta: {
+      schoolId,
+      modelRole: "summary",
+      provider: summaryProvider,
+      model: summaryModel,
+      action: "generate_patch_guidance",
+      ok: Boolean(patchGuidance)
+    }
+  });
   const summaryHash = hashText(summary);
   const issueCategories = Array.from(
     new Set((normalizedIssues || []).map((item) => (item?.category || "").toString()).filter(Boolean))
@@ -2693,19 +2758,56 @@ async function processQueueCluster(schoolId, items, normalizedIssues, state, now
   const previousScript = await readScript(scriptName);
   const previousMeta = await getScriptMeta(scriptName);
   await setSchoolPhase(schoolId, "REPAIRING");
-  const generatedScript = await generateParserScript(summary, patchGuidance, previousScript, schoolId);
-  if (!generatedScript) return { state, applied: false };
-  const replayStart = Date.now();
   await appendRepairIssueTraceBatch(issueIds, {
     stage: "CANDIDATE_TEST_RUNNING",
     level: "info",
-    message: "开始候选脚本回放验证",
+    message: "模型 2 正在生成候选脚本",
     source: "queue_processor",
     meta: {
       schoolId,
       scriptName,
       previousVersion: Number(previousMeta?.version || 0),
-      sampleCount: Array.isArray(items) ? items.length : 0
+      modelRole: "script_repair",
+      provider: scriptProvider,
+      model: scriptModel,
+      action: "generate_candidate_script"
+    }
+  });
+  const generatedScript = await generateParserScript(summary, patchGuidance, previousScript, schoolId);
+  if (!generatedScript) {
+    await appendRepairIssueTraceBatch(issueIds, {
+      stage: "CANDIDATE_TEST_RESULT",
+      level: "error",
+      message: "模型 2 生成候选脚本失败",
+      source: "queue_processor",
+      meta: {
+        schoolId,
+        scriptName,
+        previousVersion: Number(previousMeta?.version || 0),
+        modelRole: "script_repair",
+        provider: scriptProvider,
+        model: scriptModel,
+        action: "generate_candidate_script",
+        ok: false
+      }
+    });
+    return { state, applied: false };
+  }
+  const replayStart = Date.now();
+  await appendRepairIssueTraceBatch(issueIds, {
+    stage: "CANDIDATE_TEST_RUNNING",
+    level: "info",
+    message: "模型 2 候选脚本已生成，开始回放验证",
+    source: "queue_processor",
+    meta: {
+      schoolId,
+      scriptName,
+      previousVersion: Number(previousMeta?.version || 0),
+      sampleCount: Array.isArray(items) ? items.length : 0,
+      modelRole: "script_repair",
+      provider: scriptProvider,
+      model: scriptModel,
+      action: "replay_candidate_script"
     }
   });
   const submissionReplay = runSubmissionReplay(generatedScript, items);
@@ -2797,28 +2899,127 @@ async function processQueueCluster(schoolId, items, normalizedIssues, state, now
  */
 async function processIndividualSummaries(schoolId, queue, issueIds = []) {
   const summaries = [];
+  await appendRepairIssueTraceBatch(issueIds, {
+    stage: "CANDIDATE_TEST_RUNNING",
+    level: "info",
+    message: "开始逐条汇总失败样本（模型 1）",
+    source: "queue_processor",
+    meta: {
+      schoolId,
+      sampleCount: Array.isArray(queue) ? queue.length : 0,
+      modelRole: "summary",
+      provider: summaryProvider,
+      model: summaryModel,
+      action: "summarize_submissions_single"
+    }
+  });
   for (const item of queue) {
     const summary = await summarizeSubmissions(item.content, schoolId);
     if (summary) summaries.push(summary);
   }
-  if (summaries.length === 0) return;
+  if (summaries.length === 0) {
+    await appendRepairIssueTraceBatch(issueIds, {
+      stage: "CANDIDATE_TEST_RESULT",
+      level: "error",
+      message: "逐条汇总失败，未生成可用总结",
+      source: "queue_processor",
+      meta: {
+        schoolId,
+        modelRole: "summary",
+        provider: summaryProvider,
+        model: summaryModel,
+        action: "summarize_submissions_single",
+        ok: false
+      }
+    });
+    return;
+  }
   const mergedSummary = summaries.map((text, index) => `【总结 ${index + 1}】\n${text}`).join("\n");
   const scriptName = resolveScriptName(schoolId, queue);
   const previousScript = await readScript(scriptName);
   const previousMeta = await getScriptMeta(scriptName);
-  const patchGuidance = await generatePatchGuidance(mergedSummary, schoolId);
-  const generatedScript = await generateParserScript(mergedSummary, patchGuidance, previousScript, schoolId);
-  if (!generatedScript) return;
-  const replayStart = Date.now();
   await appendRepairIssueTraceBatch(issueIds, {
     stage: "CANDIDATE_TEST_RUNNING",
     level: "info",
-    message: "开始逐条修复候选脚本回放验证",
+    message: "逐条汇总完成，开始生成修复指令",
     source: "queue_processor",
     meta: {
       schoolId,
       scriptName,
-      sampleCount: Array.isArray(queue) ? queue.length : 0
+      modelRole: "summary",
+      provider: summaryProvider,
+      model: summaryModel,
+      action: "generate_patch_guidance_single",
+      ok: true
+    }
+  });
+  const patchGuidance = await generatePatchGuidance(mergedSummary, schoolId);
+  await appendRepairIssueTraceBatch(issueIds, {
+    stage: "CANDIDATE_TEST_RUNNING",
+    level: patchGuidance ? "info" : "warning",
+    message: patchGuidance
+      ? "逐条修复指令生成完成，准备调用模型 2"
+      : "逐条修复指令为空，仍继续调用模型 2",
+    source: "queue_processor",
+    meta: {
+      schoolId,
+      scriptName,
+      modelRole: "summary",
+      provider: summaryProvider,
+      model: summaryModel,
+      action: "generate_patch_guidance_single",
+      ok: Boolean(patchGuidance)
+    }
+  });
+  await appendRepairIssueTraceBatch(issueIds, {
+    stage: "CANDIDATE_TEST_RUNNING",
+    level: "info",
+    message: "模型 2 正在生成逐条修复候选脚本",
+    source: "queue_processor",
+    meta: {
+      schoolId,
+      scriptName,
+      previousVersion: Number(previousMeta?.version || 0),
+      modelRole: "script_repair",
+      provider: scriptProvider,
+      model: scriptModel,
+      action: "generate_candidate_script_single"
+    }
+  });
+  const generatedScript = await generateParserScript(mergedSummary, patchGuidance, previousScript, schoolId);
+  if (!generatedScript) {
+    await appendRepairIssueTraceBatch(issueIds, {
+      stage: "CANDIDATE_TEST_RESULT",
+      level: "error",
+      message: "模型 2 生成逐条修复候选脚本失败",
+      source: "queue_processor",
+      meta: {
+        schoolId,
+        scriptName,
+        previousVersion: Number(previousMeta?.version || 0),
+        modelRole: "script_repair",
+        provider: scriptProvider,
+        model: scriptModel,
+        action: "generate_candidate_script_single",
+        ok: false
+      }
+    });
+    return;
+  }
+  const replayStart = Date.now();
+  await appendRepairIssueTraceBatch(issueIds, {
+    stage: "CANDIDATE_TEST_RUNNING",
+    level: "info",
+    message: "模型 2 逐条修复候选脚本已生成，开始回放验证",
+    source: "queue_processor",
+    meta: {
+      schoolId,
+      scriptName,
+      sampleCount: Array.isArray(queue) ? queue.length : 0,
+      modelRole: "script_repair",
+      provider: scriptProvider,
+      model: scriptModel,
+      action: "replay_candidate_script_single"
     }
   });
   const submissionReplay = runSubmissionReplay(generatedScript, queue);

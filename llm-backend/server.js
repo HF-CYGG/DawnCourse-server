@@ -2776,10 +2776,7 @@ async function callOpenAICompatible(systemPrompt, userPrompt, options = {}) {
   if (!requestApiKey) return null;
   const apiStyle =
     normalizeApiStyle(options.apiStyle) || resolveApiStyle(requestProvider, requestModel);
-  const endpoint =
-    apiStyle === "responses"
-      ? `${requestBaseUrl}/v1/responses`
-      : `${requestBaseUrl}${openAiPath(requestProvider)}`;
+  const endpoint = buildOpenAICompatibleEndpoint(requestBaseUrl, requestProvider, apiStyle);
   const baseBody =
     apiStyle === "responses"
       ? {
@@ -2933,7 +2930,7 @@ async function testModelConnectivity(config = {}) {
     };
   }
   const apiStyle = normalizeApiStyle(apiStyleRaw) || resolveApiStyle(providerName, modelName);
-  const endpoint = apiStyle === "responses" ? `${baseUrlValue}/v1/responses` : `${baseUrlValue}${openAiPath(providerName)}`;
+  const endpoint = buildOpenAICompatibleEndpoint(baseUrlValue, providerName, apiStyle);
   const body = mergeRequestExtras(
     apiStyle === "responses"
       ? {
@@ -6477,7 +6474,8 @@ function normalizeModelName(name) {
   const raw = String(name).trim();
   if (!raw) return "";
   let value = raw.toLowerCase().replace(/[\s_]+/g, "-");
-  value = value.replace(/(glm|deepseek|qwen|gemini|gpt)(\d)/g, "$1-$2");
+  // Qwen 在线模型常见命名为 qwen2.5-* / qwen3.6-*，不应强制改写为 qwen-2.5-*。
+  value = value.replace(/(glm|deepseek|gemini|gpt)(\d)/g, "$1-$2");
   value = value.replace(/(\d)(codex)/g, "$1-codex");
   value = value.replace(/(\d)(mini|nano|flash|pro|turbo|lite)/g, "$1-$2");
   value = value.replace(/-+codex/g, "-codex");
@@ -6997,6 +6995,19 @@ function defaultBaseUrl(p) {
 function openAiPath(p) {
   if (p === "glm") return "/chat/completions";
   return "/v1/chat/completions";
+}
+
+/**
+ * 构造 OpenAI 兼容接口地址，自动避免 /v1 重复拼接：
+ * - baseUrl=.../compatible-mode/v1 + /v1/chat/completions => .../compatible-mode/v1/chat/completions
+ */
+function buildOpenAICompatibleEndpoint(baseUrl, providerName, apiStyle) {
+  const base = (baseUrl || "").toString().trim().replace(/\/+$/, "");
+  const path = apiStyle === "responses" ? "/v1/responses" : openAiPath(providerName);
+  if (base.toLowerCase().endsWith("/v1") && path.toLowerCase().startsWith("/v1/")) {
+    return `${base}${path.slice(3)}`;
+  }
+  return `${base}${path}`;
 }
 
 /**

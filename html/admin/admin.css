@@ -769,6 +769,54 @@ input:checked + .slider:before {
   border-radius: 8px;
   font-size: 12px;
 }
+.dropdown {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+.dropdown-menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 8px);
+  min-width: 180px;
+  background: rgba(23, 26, 33, 0.98);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.45);
+  padding: 6px;
+  display: none;
+  z-index: 5;
+}
+.dropdown.open .dropdown-menu {
+  display: block;
+}
+.dropdown-item {
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text);
+  padding: 10px 10px;
+  border-radius: 10px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.dropdown-item:hover {
+  background: rgba(91, 157, 255, 0.12);
+  border-color: rgba(91, 157, 255, 0.25);
+}
+.dropdown-item.danger {
+  color: rgba(255, 107, 107, 0.95);
+}
+.dropdown-item.danger:hover {
+  background: rgba(255, 107, 107, 0.12);
+  border-color: rgba(255, 107, 107, 0.25);
+}
+.dropdown-sep {
+  height: 1px;
+  background: rgba(43, 48, 59, 0.85);
+  margin: 6px 4px;
+}
 .hidden {
   display: none !important;
 }

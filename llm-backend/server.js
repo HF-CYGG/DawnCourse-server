@@ -865,6 +865,18 @@ const server = http.createServer((req, res) => {
     }
     return sendJson(res, 200, { code: 200, data: result });
   }
+  if (req.method === "POST" && /^\/api(?:\/v1)?\/admin\/repair\/issues\/[^/]+\/delete$/.test(url.pathname)) {
+    const auth = await requireAdminAuth(req);
+    if (!auth.ok) {
+      return sendJson(res, 401, { code: 401, msg: "未登录" });
+    }
+    const issueId = decodeURIComponent(url.pathname.split("/").slice(-2)[0] || "");
+    const result = await deleteRepairIssue(issueId, auth.username);
+    if (!result.ok) {
+      return sendJson(res, result.code || 400, { code: result.code || 400, msg: result.reason || "删除失败" });
+    }
+    return sendJson(res, 200, { code: 200, data: result });
+  }
   if (req.method === "POST" && (url.pathname === "/api/admin/scripts/releases" || url.pathname === "/api/v1/admin/scripts/releases")) {
     const auth = await requireAdminAuth(req);
     if (!auth.ok) {
@@ -2262,6 +2274,52 @@ async function forceRepairIssue(issueId, username) {
   } finally {
     await releaseSchoolLease(lockKey, lockToken, lease.renewTimer);
   }
+}
+
+async function deleteRepairIssue(issueId, username) {
+  if (!redisReady) return { ok: false, code: 503, reason: "redis_unavailable" };
+  const normalizedIssueId = (issueId || "").toString().trim();
+  if (!normalizedIssueId.startsWith("issue_")) {
+    return { ok: false, code: 400, reason: "invalid_issue_id" };
+  }
+  const key = buildRepairIssueKey(normalizedIssueId);
+  const raw = await redisClient.get(key);
+  const issue = raw ? safeJson(raw) : null;
+  if (!issue) return { ok: false, code: 404, reason: "issue_not_found" };
+
+  const sampleSetKey = buildRepairIssueSamplesKey(normalizedIssueId);
+  const sessionSetKey = buildRepairIssueSessionsKey(normalizedIssueId);
+  const timelineKey = buildRepairIssueTimelineKey(normalizedIssueId);
+  const logsKey = buildRepairIssueLogsKey(normalizedIssueId);
+
+  const sampleIds = await redisClient.sMembers(sampleSetKey);
+  const sessionIds = await redisClient.sMembers(sessionSetKey);
+  const delKeys = [];
+  for (const sampleId of sampleIds.slice(0, 2000)) {
+    delKeys.push(buildFailureSampleKey(sampleId));
+  }
+  for (const parseSessionId of sessionIds.slice(0, 5000)) {
+    delKeys.push(buildParseSessionIssueKey(parseSessionId));
+  }
+  delKeys.push(sampleSetKey, sessionSetKey, timelineKey, logsKey, key);
+
+  const chunks = [];
+  for (let i = 0; i < delKeys.length; i += 500) {
+    chunks.push(delKeys.slice(i, i + 500));
+  }
+  for (const chunk of chunks) {
+    await redisClient.del(chunk);
+  }
+  await redisClient.sRem("repair:issue:ids", normalizedIssueId);
+  pushAdminLog("warning", "已删除 Repair Issue", {
+    issueId: normalizedIssueId,
+    actor: username || "admin",
+    schoolId: issue.schoolId || "",
+    scriptName: issue.affectedScriptId || "",
+    deletedSamples: sampleIds.length,
+    deletedSessions: sessionIds.length
+  });
+  return { ok: true, issueId: normalizedIssueId };
 }
 
 function normalizeIssueIdList(value) {

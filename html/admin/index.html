@@ -401,9 +401,18 @@
                     <input id="repairIssueFollowLogs" type="checkbox" checked>
                     自动滚动
                   </label>
-                  <button class="btn secondary" id="repairIssueCopySummaryBtn" type="button">复制摘要</button>
                   <button class="btn secondary" id="repairIssueLogReloadBtn" type="button">刷新日志</button>
-                  <button class="btn secondary" id="repairIssueRetryBtn" type="button">重试修复</button>
+                  <div class="dropdown" id="repairIssueActions">
+                    <button class="btn" id="repairIssueActionsBtn" type="button">更多操作</button>
+                    <div class="dropdown-menu" id="repairIssueActionsMenu">
+                      <button class="dropdown-item" type="button" data-action="issue-copy-summary">复制摘要</button>
+                      <button class="dropdown-item" type="button" data-action="issue-run-test">复现</button>
+                      <button class="dropdown-item" type="button" data-action="issue-retry">重试修复</button>
+                      <button class="dropdown-item danger" type="button" data-action="issue-force-repair">立即修复</button>
+                      <div class="dropdown-sep"></div>
+                      <button class="dropdown-item danger" type="button" data-action="issue-delete">删除 Issue</button>
+                    </div>
+                  </div>
                 </div>
               </div>
               <div class="muted mb-24" id="repairIssueDetailMeta">选择一条 Issue 查看详情。</div>
@@ -567,4 +576,3 @@
     </div>
   </body>
 </html>
-

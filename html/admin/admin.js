@@ -42,11 +42,11 @@ const repairIssueSelected = document.getElementById("repairIssueSelected");
 const repairIssueLogStage = document.getElementById("repairIssueLogStage");
 const repairIssueLogLevel = document.getElementById("repairIssueLogLevel");
 const repairIssueLogReloadBtn = document.getElementById("repairIssueLogReloadBtn");
-const repairIssueRetryBtn = document.getElementById("repairIssueRetryBtn");
-let repairIssueForceBtn = document.getElementById("repairIssueForceBtn");
 const repairIssueAutoRefresh = document.getElementById("repairIssueAutoRefresh");
 const repairIssueFollowLogs = document.getElementById("repairIssueFollowLogs");
-const repairIssueCopySummaryBtn = document.getElementById("repairIssueCopySummaryBtn");
+const repairIssueActions = document.getElementById("repairIssueActions");
+const repairIssueActionsBtn = document.getElementById("repairIssueActionsBtn");
+const repairIssueActionsMenu = document.getElementById("repairIssueActionsMenu");
 const repairIssueProgressStageBadge = document.getElementById("repairIssueProgressStageBadge");
 const repairIssueProgressHint = document.getElementById("repairIssueProgressHint");
 const repairIssueProgressMetrics = document.getElementById("repairIssueProgressMetrics");
@@ -96,14 +96,17 @@ let repairIssueTimelineCache = [];
 let repairIssueLogsCache = [];
 let repairIssueAutoRefreshTimer = null;
 
-if (!repairIssueForceBtn && repairIssueRetryBtn?.parentElement) {
-  repairIssueForceBtn = document.createElement("button");
-  repairIssueForceBtn.className = "btn";
-  repairIssueForceBtn.id = "repairIssueForceBtn";
-  repairIssueForceBtn.type = "button";
-  repairIssueForceBtn.textContent = "立即修复";
-  repairIssueRetryBtn.parentElement.appendChild(repairIssueForceBtn);
+function closeAllDropdowns() {
+  document.querySelectorAll(".dropdown.open").forEach((el) => el.classList.remove("open"));
 }
+
+document.addEventListener("click", (e) => {
+  const inside = e.target.closest(".dropdown");
+  if (!inside) closeAllDropdowns();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") closeAllDropdowns();
+});
 
 const navItems = document.querySelectorAll(".nav-item");
 const pageSections = document.querySelectorAll(".page-section");
@@ -1908,24 +1911,28 @@ function renderRepairIssuesTable(list) {
           <td>${escapeHtml(formatTime(item.lastSeenAt || item.updatedAt))}</td>
           <td>
             <button class="btn secondary compact" type="button" data-action="detail" data-issue="${encodeURIComponent(issueId)}">详情</button>
-            <button class="btn secondary compact" type="button" data-action="run-test" data-issue="${encodeURIComponent(issueId)}">复现</button>
+            <div class="dropdown">
+              <button class="btn secondary compact" type="button" data-action="row-menu" data-issue="${encodeURIComponent(
+                issueId
+              )}">操作</button>
+              <div class="dropdown-menu">
+                <button class="dropdown-item" type="button" data-action="run-test" data-issue="${encodeURIComponent(
+                  issueId
+                )}">复现</button>
+                <button class="dropdown-item" type="button" data-action="force-repair" data-issue="${encodeURIComponent(
+                  issueId
+                )}">立即修复</button>
+                <div class="dropdown-sep"></div>
+                <button class="dropdown-item danger" type="button" data-action="delete-issue" data-issue="${encodeURIComponent(
+                  issueId
+                )}">删除 Issue</button>
+              </div>
+            </div>
           </td>
         </tr>
       `;
     })
     .join("");
-  repairIssueTableBody.querySelectorAll('button[data-action="run-test"]').forEach((button) => {
-    const issueId = button.dataset.issue || "";
-    const cell = button.parentElement;
-    if (!cell || cell.querySelector('button[data-action="force-repair"]')) return;
-    const forceButton = document.createElement("button");
-    forceButton.className = "btn compact";
-    forceButton.type = "button";
-    forceButton.dataset.action = "force-repair";
-    forceButton.dataset.issue = issueId;
-    forceButton.textContent = "立即修复";
-    cell.appendChild(forceButton);
-  });
 }
 
 function formatRepairIssueMeta(issue) {
@@ -2315,6 +2322,46 @@ async function forceRepairIssueFromAdmin(issueId) {
   await loadRepairIssueDetail(issueId);
 }
 
+async function deleteRepairIssueFromAdmin(issueId) {
+  const ok = window.confirm(
+    `确认删除 Issue？\n\n${issueId}\n\n删除后将清理该 Issue 的日志、时间线与样本索引，且不可恢复。`
+  );
+  if (!ok) return;
+  stopRepairIssueAutoRefresh();
+  const result = await fetchWithAuth(`/api/v1/admin/repair/issues/${encodeURIComponent(issueId)}/delete`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}"
+  });
+  if (result.code !== 200) {
+    throw new Error(result.msg || "删除失败");
+  }
+  showToast("info", "已删除", "该 Issue 已删除");
+  await loadRepairIssuesPage();
+  if (activeRepairIssueId === issueId) {
+    activeRepairIssueId = "";
+    repairIssueDetailCache = null;
+    repairIssueTimelineCache = [];
+    repairIssueLogsCache = [];
+    if (repairIssueSelected) repairIssueSelected.value = "";
+    if (repairIssueDetailMeta) repairIssueDetailMeta.textContent = "选择一条 Issue 查看详情。";
+    if (repairIssueTimelineList) repairIssueTimelineList.innerHTML = `<div class="muted">暂无时间线</div>`;
+    if (repairIssueDetail) {
+      repairIssueDetail.textContent = "选择一条 Issue 查看日志。";
+      repairIssueDetail.classList.remove("hidden");
+    }
+    if (repairIssueTimeline) {
+      repairIssueTimeline.textContent = "暂无时间线";
+      repairIssueTimeline.classList.remove("hidden");
+    }
+    if (repairIssueLogTable) repairIssueLogTable.innerHTML = "";
+    if (repairIssueProgressStageBadge) repairIssueProgressStageBadge.textContent = "-";
+    if (repairIssueProgressHint) repairIssueProgressHint.textContent = "选择 Issue 后展示修复进度";
+    if (repairIssueProgressMetrics) repairIssueProgressMetrics.innerHTML = "";
+    if (repairIssueProgressSteps) repairIssueProgressSteps.innerHTML = "";
+  }
+}
+
 function escapeCsv(value) {
   const text = `${value ?? ""}`;
   if (text.includes('"') || text.includes(",") || text.includes("\n")) {
@@ -2465,15 +2512,27 @@ if (repairIssueTableBody) {
   repairIssueTableBody.addEventListener("click", async (e) => {
     const button = e.target.closest("button[data-action]");
     if (!button) return;
+    const action = (button.dataset.action || "").toString();
+    if (action === "row-menu") {
+      const dropdown = button.closest(".dropdown");
+      if (!dropdown) return;
+      const nextOpen = !dropdown.classList.contains("open");
+      closeAllDropdowns();
+      if (nextOpen) dropdown.classList.add("open");
+      return;
+    }
     const issueId = decodeURIComponent(button.dataset.issue || "");
     if (!issueId) return;
     try {
-      if (button.dataset.action === "detail") {
+      closeAllDropdowns();
+      if (action === "detail") {
         await loadRepairIssueDetail(issueId);
-      } else if (button.dataset.action === "run-test") {
+      } else if (action === "run-test") {
         await runRepairIssueReplay(issueId);
-      } else if (button.dataset.action === "force-repair") {
+      } else if (action === "force-repair") {
         await forceRepairIssueFromAdmin(issueId);
+      } else if (action === "delete-issue") {
+        await deleteRepairIssueFromAdmin(issueId);
       }
     } catch (err) {
       repairIssueDetail.textContent = `操作失败：${err?.message || ""}`;
@@ -2494,29 +2553,45 @@ if (repairIssueLogReloadBtn) {
     }
   });
 }
-if (repairIssueRetryBtn) {
-  repairIssueRetryBtn.addEventListener("click", async () => {
-    if (!activeRepairIssueId) {
-      showToast("warning", "未选择 Issue", "请先在列表中选择一条 Issue");
-      return;
-    }
-    try {
-      await retryRepairIssueFromAdmin(activeRepairIssueId);
-    } catch (err) {
-      showToast("error", "重试失败", err?.message || "网络错误");
-    }
+if (repairIssueActionsBtn && repairIssueActions) {
+  repairIssueActionsBtn.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const nextOpen = !repairIssueActions.classList.contains("open");
+    closeAllDropdowns();
+    if (nextOpen) repairIssueActions.classList.add("open");
   });
 }
-if (repairIssueForceBtn) {
-  repairIssueForceBtn.addEventListener("click", async () => {
+if (repairIssueActionsMenu) {
+  repairIssueActionsMenu.addEventListener("click", async (e) => {
+    const btn = e.target.closest("button[data-action]");
+    if (!btn) return;
+    const action = (btn.dataset.action || "").toString();
+    closeAllDropdowns();
     if (!activeRepairIssueId) {
       showToast("warning", "未选择 Issue", "请先在列表中选择一条 Issue");
       return;
     }
     try {
-      await forceRepairIssueFromAdmin(activeRepairIssueId);
+      if (action === "issue-copy-summary") {
+        const meta = (repairIssueDetailMeta?.textContent || "").toString();
+        if (!meta.trim()) {
+          showToast("warning", "暂无摘要", "请先选择一条 Issue");
+          return;
+        }
+        await copyText(meta);
+        showToast("info", "已复制", "Issue 摘要已复制到剪贴板");
+      } else if (action === "issue-run-test") {
+        await runRepairIssueReplay(activeRepairIssueId);
+      } else if (action === "issue-retry") {
+        await retryRepairIssueFromAdmin(activeRepairIssueId);
+      } else if (action === "issue-force-repair") {
+        await forceRepairIssueFromAdmin(activeRepairIssueId);
+      } else if (action === "issue-delete") {
+        await deleteRepairIssueFromAdmin(activeRepairIssueId);
+      }
     } catch (err) {
-      showToast("error", "立即修复失败", err?.message || "网络错误");
+      showToast("error", "操作失败", err?.message || "网络错误");
     }
   });
 }
@@ -2533,21 +2608,6 @@ if (repairIssueFollowLogs) {
   repairIssueFollowLogs.addEventListener("change", () => {
     if (repairIssueFollowLogs.checked) {
       renderRepairLogsTable(repairIssueLogsCache);
-    }
-  });
-}
-if (repairIssueCopySummaryBtn) {
-  repairIssueCopySummaryBtn.addEventListener("click", async () => {
-    const meta = (repairIssueDetailMeta?.textContent || "").toString();
-    if (!meta.trim()) {
-      showToast("warning", "暂无摘要", "请先选择一条 Issue");
-      return;
-    }
-    try {
-      await copyText(meta);
-      showToast("info", "已复制", "Issue 摘要已复制到剪贴板");
-    } catch (e) {
-      showToast("error", "复制失败", e?.message || "浏览器不支持剪贴板");
     }
   });
 }

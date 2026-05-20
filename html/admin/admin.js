@@ -98,6 +98,10 @@ let repairIssueAutoRefreshTimer = null;
 
 function closeAllDropdowns() {
   document.querySelectorAll(".dropdown.open").forEach((el) => el.classList.remove("open"));
+  if (floatingMenu) {
+    floatingMenu.remove();
+    floatingMenu = null;
+  }
 }
 
 document.addEventListener("click", (e) => {
@@ -107,6 +111,79 @@ document.addEventListener("click", (e) => {
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") closeAllDropdowns();
 });
+window.addEventListener("scroll", () => closeAllDropdowns(), true);
+window.addEventListener("resize", () => closeAllDropdowns(), true);
+
+let floatingMenu = null;
+
+function buildIssueActionsMenuHtml(mode) {
+  const items = [];
+  if (mode === "detail") {
+    items.push(`<button class="dropdown-item" type="button" data-action="issue-copy-summary">复制摘要</button>`);
+  }
+  items.push(`<button class="dropdown-item" type="button" data-action="issue-run-test">复现</button>`);
+  items.push(`<button class="dropdown-item" type="button" data-action="issue-retry">重试修复</button>`);
+  items.push(`<button class="dropdown-item danger" type="button" data-action="issue-force-repair">立即修复</button>`);
+  items.push(`<div class="dropdown-sep"></div>`);
+  items.push(`<button class="dropdown-item danger" type="button" data-action="issue-delete">删除 Issue</button>`);
+  return items.join("");
+}
+
+function openFloatingMenu(anchorEl, { mode, issueId }) {
+  closeAllDropdowns();
+  if (!anchorEl) return;
+  const el = document.createElement("div");
+  el.className = "dropdown-menu dropdown-float";
+  el.dataset.mode = (mode || "row").toString();
+  el.dataset.issueId = (issueId || "").toString();
+  el.innerHTML = buildIssueActionsMenuHtml(el.dataset.mode);
+  document.body.appendChild(el);
+  floatingMenu = el;
+
+  const rect = anchorEl.getBoundingClientRect();
+  const menuRect = el.getBoundingClientRect();
+  const padding = 10;
+  const maxLeft = Math.max(padding, window.innerWidth - menuRect.width - padding);
+  const left = Math.min(Math.max(padding, rect.right - menuRect.width), maxLeft);
+  const maxTop = Math.max(padding, window.innerHeight - menuRect.height - padding);
+  const preferBelow = rect.bottom + 8 + menuRect.height <= window.innerHeight - padding;
+  const top = preferBelow ? rect.bottom + 8 : Math.min(Math.max(padding, rect.top - 8 - menuRect.height), maxTop);
+  el.style.left = `${Math.round(left)}px`;
+  el.style.top = `${Math.round(top)}px`;
+
+  el.addEventListener("click", async (e) => {
+    const btn = e.target.closest("button[data-action]");
+    if (!btn) return;
+    const action = (btn.dataset.action || "").toString();
+    const activeId = (el.dataset.issueId || "").toString();
+    closeAllDropdowns();
+    if (!activeId) {
+      showToast("warning", "未选择 Issue", "请先选择一条 Issue");
+      return;
+    }
+    try {
+      if (action === "issue-copy-summary") {
+        const meta = (repairIssueDetailMeta?.textContent || "").toString();
+        if (!meta.trim()) {
+          showToast("warning", "暂无摘要", "请先选择一条 Issue");
+          return;
+        }
+        await copyText(meta);
+        showToast("info", "已复制", "Issue 摘要已复制到剪贴板");
+      } else if (action === "issue-run-test") {
+        await runRepairIssueReplay(activeId);
+      } else if (action === "issue-retry") {
+        await retryRepairIssueFromAdmin(activeId);
+      } else if (action === "issue-force-repair") {
+        await forceRepairIssueFromAdmin(activeId);
+      } else if (action === "issue-delete") {
+        await deleteRepairIssueFromAdmin(activeId);
+      }
+    } catch (err) {
+      showToast("error", "操作失败", err?.message || "网络错误");
+    }
+  });
+}
 
 const navItems = document.querySelectorAll(".nav-item");
 const pageSections = document.querySelectorAll(".page-section");
@@ -1911,23 +1988,9 @@ function renderRepairIssuesTable(list) {
           <td>${escapeHtml(formatTime(item.lastSeenAt || item.updatedAt))}</td>
           <td>
             <button class="btn secondary compact" type="button" data-action="detail" data-issue="${encodeURIComponent(issueId)}">详情</button>
-            <div class="dropdown">
-              <button class="btn secondary compact" type="button" data-action="row-menu" data-issue="${encodeURIComponent(
-                issueId
-              )}">操作</button>
-              <div class="dropdown-menu">
-                <button class="dropdown-item" type="button" data-action="run-test" data-issue="${encodeURIComponent(
-                  issueId
-                )}">复现</button>
-                <button class="dropdown-item" type="button" data-action="force-repair" data-issue="${encodeURIComponent(
-                  issueId
-                )}">立即修复</button>
-                <div class="dropdown-sep"></div>
-                <button class="dropdown-item danger" type="button" data-action="delete-issue" data-issue="${encodeURIComponent(
-                  issueId
-                )}">删除 Issue</button>
-              </div>
-            </div>
+            <button class="btn secondary compact" type="button" data-action="row-menu" data-issue="${encodeURIComponent(
+              issueId
+            )}">操作</button>
           </td>
         </tr>
       `;
@@ -2514,11 +2577,9 @@ if (repairIssueTableBody) {
     if (!button) return;
     const action = (button.dataset.action || "").toString();
     if (action === "row-menu") {
-      const dropdown = button.closest(".dropdown");
-      if (!dropdown) return;
-      const nextOpen = !dropdown.classList.contains("open");
-      closeAllDropdowns();
-      if (nextOpen) dropdown.classList.add("open");
+      const issueId = decodeURIComponent(button.dataset.issue || "");
+      if (!issueId) return;
+      openFloatingMenu(button, { mode: "row", issueId });
       return;
     }
     const issueId = decodeURIComponent(button.dataset.issue || "");
@@ -2527,12 +2588,6 @@ if (repairIssueTableBody) {
       closeAllDropdowns();
       if (action === "detail") {
         await loadRepairIssueDetail(issueId);
-      } else if (action === "run-test") {
-        await runRepairIssueReplay(issueId);
-      } else if (action === "force-repair") {
-        await forceRepairIssueFromAdmin(issueId);
-      } else if (action === "delete-issue") {
-        await deleteRepairIssueFromAdmin(issueId);
       }
     } catch (err) {
       repairIssueDetail.textContent = `操作失败：${err?.message || ""}`;
@@ -2557,42 +2612,11 @@ if (repairIssueActionsBtn && repairIssueActions) {
   repairIssueActionsBtn.addEventListener("click", (e) => {
     e.preventDefault();
     e.stopPropagation();
-    const nextOpen = !repairIssueActions.classList.contains("open");
-    closeAllDropdowns();
-    if (nextOpen) repairIssueActions.classList.add("open");
-  });
-}
-if (repairIssueActionsMenu) {
-  repairIssueActionsMenu.addEventListener("click", async (e) => {
-    const btn = e.target.closest("button[data-action]");
-    if (!btn) return;
-    const action = (btn.dataset.action || "").toString();
-    closeAllDropdowns();
     if (!activeRepairIssueId) {
       showToast("warning", "未选择 Issue", "请先在列表中选择一条 Issue");
       return;
     }
-    try {
-      if (action === "issue-copy-summary") {
-        const meta = (repairIssueDetailMeta?.textContent || "").toString();
-        if (!meta.trim()) {
-          showToast("warning", "暂无摘要", "请先选择一条 Issue");
-          return;
-        }
-        await copyText(meta);
-        showToast("info", "已复制", "Issue 摘要已复制到剪贴板");
-      } else if (action === "issue-run-test") {
-        await runRepairIssueReplay(activeRepairIssueId);
-      } else if (action === "issue-retry") {
-        await retryRepairIssueFromAdmin(activeRepairIssueId);
-      } else if (action === "issue-force-repair") {
-        await forceRepairIssueFromAdmin(activeRepairIssueId);
-      } else if (action === "issue-delete") {
-        await deleteRepairIssueFromAdmin(activeRepairIssueId);
-      }
-    } catch (err) {
-      showToast("error", "操作失败", err?.message || "网络错误");
-    }
+    openFloatingMenu(repairIssueActionsBtn, { mode: "detail", issueId: activeRepairIssueId });
   });
 }
 if (repairIssueAutoRefresh) {

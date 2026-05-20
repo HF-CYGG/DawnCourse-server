@@ -787,6 +787,13 @@ input:checked + .slider:before {
   display: none;
   z-index: 5;
 }
+.dropdown-menu.dropdown-float {
+  position: fixed;
+  right: auto;
+  top: auto;
+  display: block;
+  z-index: 9999;
+}
 .dropdown.open .dropdown-menu {
   display: block;
 }

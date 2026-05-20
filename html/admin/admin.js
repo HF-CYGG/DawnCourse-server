@@ -43,6 +43,7 @@ const repairIssueLogStage = document.getElementById("repairIssueLogStage");
 const repairIssueLogLevel = document.getElementById("repairIssueLogLevel");
 const repairIssueLogReloadBtn = document.getElementById("repairIssueLogReloadBtn");
 const repairIssueRetryBtn = document.getElementById("repairIssueRetryBtn");
+let repairIssueForceBtn = document.getElementById("repairIssueForceBtn");
 const testSummaryConfigBtn = document.getElementById("testSummaryConfigBtn");
 const testSummaryConfigResult = document.getElementById("testSummaryConfigResult");
 const testScriptConfigBtn = document.getElementById("testScriptConfigBtn");
@@ -78,6 +79,15 @@ let scriptModalState = {
 };
 let activeRepairIssueId = "";
 let activeEventStreamToken = "";
+
+if (!repairIssueForceBtn && repairIssueRetryBtn?.parentElement) {
+  repairIssueForceBtn = document.createElement("button");
+  repairIssueForceBtn.className = "btn";
+  repairIssueForceBtn.id = "repairIssueForceBtn";
+  repairIssueForceBtn.type = "button";
+  repairIssueForceBtn.textContent = "立即修复";
+  repairIssueRetryBtn.parentElement.appendChild(repairIssueForceBtn);
+}
 
 const navItems = document.querySelectorAll(".nav-item");
 const pageSections = document.querySelectorAll(".page-section");
@@ -1837,6 +1847,18 @@ function renderRepairIssuesTable(list) {
       `;
     })
     .join("");
+  repairIssueTableBody.querySelectorAll('button[data-action="run-test"]').forEach((button) => {
+    const issueId = button.dataset.issue || "";
+    const cell = button.parentElement;
+    if (!cell || cell.querySelector('button[data-action="force-repair"]')) return;
+    const forceButton = document.createElement("button");
+    forceButton.className = "btn compact";
+    forceButton.type = "button";
+    forceButton.dataset.action = "force-repair";
+    forceButton.dataset.issue = issueId;
+    forceButton.textContent = "立即修复";
+    cell.appendChild(forceButton);
+  });
 }
 
 function formatRepairIssueMeta(issue) {
@@ -1965,6 +1987,20 @@ async function retryRepairIssueFromAdmin(issueId) {
     throw new Error(result.msg || "重试失败");
   }
   showToast("info", "已触发重试", "失败样本已重新进入修复队列");
+  await loadRepairIssuesPage();
+  await loadRepairIssueDetail(issueId);
+}
+
+async function forceRepairIssueFromAdmin(issueId) {
+  const result = await fetchWithAuth(`/api/v1/admin/repair/issues/${encodeURIComponent(issueId)}/force-repair`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}"
+  });
+  if (result.code !== 200) {
+    throw new Error(result.msg || "立即修复失败");
+  }
+  showToast("info", "已触发立即修复", "该 Issue 已直接进入修复流水线，并忽略最小样本数限制");
   await loadRepairIssuesPage();
   await loadRepairIssueDetail(issueId);
 }
@@ -2126,6 +2162,8 @@ if (repairIssueTableBody) {
         await loadRepairIssueDetail(issueId);
       } else if (button.dataset.action === "run-test") {
         await runRepairIssueReplay(issueId);
+      } else if (button.dataset.action === "force-repair") {
+        await forceRepairIssueFromAdmin(issueId);
       }
     } catch (err) {
       repairIssueDetail.textContent = `操作失败：${err?.message || ""}`;
@@ -2156,6 +2194,19 @@ if (repairIssueRetryBtn) {
       await retryRepairIssueFromAdmin(activeRepairIssueId);
     } catch (err) {
       showToast("error", "重试失败", err?.message || "网络错误");
+    }
+  });
+}
+if (repairIssueForceBtn) {
+  repairIssueForceBtn.addEventListener("click", async () => {
+    if (!activeRepairIssueId) {
+      showToast("warning", "鏈€夋嫨 Issue", "璇峰厛鍦ㄥ垪琛ㄤ腑閫夋嫨涓€鏉?Issue");
+      return;
+    }
+    try {
+      await forceRepairIssueFromAdmin(activeRepairIssueId);
+    } catch (err) {
+      showToast("error", "立即修复失败", err?.message || "缃戠粶閿欒");
     }
   });
 }

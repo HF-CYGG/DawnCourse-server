@@ -848,6 +848,18 @@ const server = http.createServer((req, res) => {
     }
     return sendJson(res, 200, { code: 200, data: result });
   }
+  if (req.method === "POST" && /^\/api(?:\/v1)?\/admin\/repair\/issues\/[^/]+\/force-repair$/.test(url.pathname)) {
+    const auth = await requireAdminAuth(req);
+    if (!auth.ok) {
+      return sendJson(res, 401, { code: 401, msg: "未登录" });
+    }
+    const issueId = decodeURIComponent(url.pathname.split("/").slice(-2)[0] || "");
+    const result = await forceRepairIssue(issueId, auth.username);
+    if (!result.ok) {
+      return sendJson(res, result.code || 400, { code: result.code || 400, msg: result.reason || "立即修复失败" });
+    }
+    return sendJson(res, 200, { code: 200, data: result });
+  }
   if (req.method === "POST" && (url.pathname === "/api/admin/scripts/releases" || url.pathname === "/api/v1/admin/scripts/releases")) {
     const auth = await requireAdminAuth(req);
     if (!auth.ok) {
@@ -2064,6 +2076,105 @@ async function retryRepairIssue(issueId, username) {
     });
   }
   return { ok: true, issueId, schoolId, queuedSamples: samples.length, queuedAt: Date.now() };
+}
+
+function buildIssueRepairItems(detail, samples) {
+  const issue = detail?.issue || {};
+  return (samples || []).map((sample) => ({
+    content: sanitizeContent(sample?.content || ""),
+    scriptName: issue.affectedScriptId || "",
+    createdAt: Number(sample?.createdAt || Date.now()),
+    hash: (sample?.contentSha256 || sample?.sampleId || hashText(sample?.content || "")).toString(),
+    schoolName: issue.schoolName || "",
+    schoolSystemType: issue.schoolSystemType || "unknown",
+    sourceUrl: issue.sourceUrlHost || "",
+    scriptVersion: Number(issue.affectedVersion || 0),
+    scriptSource: "",
+    failureType: issue.failureType || "unknown",
+    classifiedFailureType: issue.failureType || "unknown",
+    failureCategory: "",
+    failureSource: "admin_force_repair",
+    schoolSystemSource: "",
+    clientVersion: "",
+    parseSessionId: (sample?.parseSessionId || "").toString(),
+    issueId: issue.issueId || "",
+    attemptedParsers: issue.affectedScriptId ? [issue.affectedScriptId] : [],
+    candidateUrls: []
+  }));
+}
+
+async function forceRepairIssue(issueId, username) {
+  if (!redisReady) return { ok: false, code: 503, reason: "redis_unavailable" };
+  const detail = await getRepairIssueDetail(issueId);
+  if (!detail?.issue) return { ok: false, code: 404, reason: "issue_not_found" };
+  const schoolId = (detail.issue.schoolId || "").toString().trim();
+  if (!schoolId) return { ok: false, code: 400, reason: "missing_school_id" };
+  const samples = (detail.samples || []).filter((item) => item?.content).slice(0, 20);
+  if (!samples.length) return { ok: false, code: 400, reason: "sample_not_found" };
+  await appendRepairIssueTrace(issueId, {
+    stage: "QUEUED",
+    level: "warning",
+    message: "管理员触发立即修复，已忽略最小样本限制",
+    actor: username || "admin",
+    source: "admin_force_repair",
+    meta: {
+      schoolId,
+      sampleCount: samples.length,
+      ignoreMinQueueSize: true
+    }
+  });
+  const lockKey = buildSchoolLockKey(schoolId);
+  const lockToken = crypto.randomUUID();
+  const lease = await acquireSchoolLease(lockKey, lockToken, schoolLockTtlMs);
+  if (!lease.acquired) {
+    return { ok: false, code: 409, reason: "school_processing_busy" };
+  }
+  try {
+    const items = buildIssueRepairItems(detail, samples);
+    if (!items.length) return { ok: false, code: 400, reason: "sample_not_found" };
+    let state = (await getSchoolState(schoolId)) || {
+      lastSummaryHash: "",
+      lastScriptHash: "",
+      lastUpdatedAt: 0
+    };
+    const normalizedIssues = await normalizeIssueBatch(items, schoolId);
+    const now = Date.now();
+    const result = await processQueueCluster(schoolId, items, normalizedIssues, state, now, [issueId]);
+    if (result?.state) {
+      state = result.state;
+    }
+    if (result?.failed) {
+      return { ok: false, code: 500, reason: "repair_failed", schoolId, issueId };
+    }
+    if (result?.deferred) {
+      return { ok: false, code: 409, reason: "repair_deferred", schoolId, issueId };
+    }
+    if (!result?.applied) {
+      const issueRaw = await redisClient.get(buildRepairIssueKey(issueId));
+      const issue = issueRaw ? safeJson(issueRaw) : null;
+      return {
+        ok: true,
+        issueId,
+        schoolId,
+        forced: true,
+        sampleCount: items.length,
+        queuedAt: now,
+        releaseStage: issue?.status || "",
+        currentStage: issue?.currentStage || ""
+      };
+    }
+    return {
+      ok: true,
+      issueId,
+      schoolId,
+      forced: true,
+      sampleCount: items.length,
+      queuedAt: now,
+      state
+    };
+  } finally {
+    await releaseSchoolLease(lockKey, lockToken, lease.renewTimer);
+  }
 }
 
 function normalizeIssueIdList(value) {

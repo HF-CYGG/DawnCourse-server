@@ -2577,6 +2577,10 @@ if (repairIssueTableBody) {
     if (!button) return;
     const action = (button.dataset.action || "").toString();
     if (action === "row-menu") {
+      // 行内“操作”按钮不在 .dropdown 容器内，必须阻止冒泡，
+      // 否则会被 document 级点击监听立即关闭，表现为“点击没反应”。
+      e.preventDefault();
+      e.stopPropagation();
       const issueId = decodeURIComponent(button.dataset.issue || "");
       if (!issueId) return;
       openFloatingMenu(button, { mode: "row", issueId });

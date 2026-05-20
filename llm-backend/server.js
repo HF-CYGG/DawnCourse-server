@@ -224,7 +224,12 @@ function pushAdminLog(level, message, extra = {}) {
 function appendMirrorLog(level, args) {
   if (!backendMirrorLogFile) return;
   const line = `[${new Date().toISOString()}] [${level}] ${args.map(safeToLogString).join(" ")}\n`;
-  mirrorLogWriteQueue = mirrorLogWriteQueue.then(() => fs.appendFile(backendMirrorLogFile, line)).catch(() => {});
+  mirrorLogWriteQueue = mirrorLogWriteQueue
+    .then(async () => {
+      await fs.mkdir(path.dirname(backendMirrorLogFile), { recursive: true });
+      await fs.appendFile(backendMirrorLogFile, line);
+    })
+    .catch(() => {});
 }
 
 console.log = (...args) => {
@@ -4035,6 +4040,18 @@ async function ensureStorageLayout() {
   await fs.mkdir(scriptOutputDir, { recursive: true });
   await fs.mkdir(scriptBackupDir, { recursive: true });
   await fs.mkdir(path.dirname(schoolMetricsFile), { recursive: true });
+  if (backendMirrorLogFile) {
+    await fs.mkdir(path.dirname(backendMirrorLogFile), { recursive: true });
+    await fs.appendFile(backendMirrorLogFile, "");
+  }
+  if (nginxAccessLogFile) {
+    await fs.mkdir(path.dirname(nginxAccessLogFile), { recursive: true });
+    await fs.appendFile(nginxAccessLogFile, "");
+  }
+  if (nginxErrorLogFile) {
+    await fs.mkdir(path.dirname(nginxErrorLogFile), { recursive: true });
+    await fs.appendFile(nginxErrorLogFile, "");
+  }
 }
 
 /**
@@ -5974,11 +5991,11 @@ function randomString(length) {
 async function readTailLinesFromFile(filePath, maxLines) {
   if (!filePath) return { lines: [], exists: false };
   try {
-    const stats = await fs.promises.stat(filePath);
+    const stats = await fs.stat(filePath);
     if (!stats.isFile()) return { lines: [], exists: false };
     if (stats.size <= 0) return { lines: [], exists: true };
     const readBytes = Math.min(stats.size, runtimeLogReadBytes);
-    const fd = await fs.promises.open(filePath, "r");
+    const fd = await fs.open(filePath, "r");
     try {
       const buffer = Buffer.alloc(readBytes);
       await fd.read(buffer, 0, readBytes, stats.size - readBytes);
@@ -6000,8 +6017,8 @@ async function getRuntimeLogLines(source, limit) {
     nginx_error: nginxErrorLogFile
   };
   const memoryLines = adminLogBuffer.slice(-limit).map((item) => {
-    const detail = item?.detail ? ` ${JSON.stringify(item.detail)}` : "";
-    return `[admin:${item.level}] ${item.time} ${item.message}${detail}`;
+    const extra = item?.extra ? ` ${JSON.stringify(item.extra)}` : "";
+    return `[admin:${item.level}] ${formatTime(item?.createdAt || 0)} ${item?.message || ""}${extra}`;
   });
   if (source === "admin") {
     return {

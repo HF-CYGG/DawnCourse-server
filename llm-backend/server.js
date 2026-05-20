@@ -446,7 +446,7 @@ const server = http.createServer((req, res) => {
       return sendJson(res, 413, { code: 413, msg: "请求体过大" });
     }
     const body = safeJson(bodyText) || {};
-    const scriptName = (body?.scriptName || body?.script_name || "").toString();
+    const scriptName = normalizeScriptNameFromAny(body?.scriptName || body?.script_name || "");
     const scriptVersion = Number(body?.scriptVersion || body?.script_version || 0);
     const success = body?.success === true;
     const category = (body?.category || "").toString();
@@ -509,7 +509,7 @@ const server = http.createServer((req, res) => {
       return sendJson(res, 413, { code: 413, msg: "请求体过大" });
     }
     const body = safeJson(bodyText) || {};
-    const scriptName = (body?.scriptName || body?.script_name || "").toString();
+    const scriptName = normalizeScriptNameFromAny(body?.scriptName || body?.script_name || "");
     const category = (body?.category || "").toString();
     const source = (body?.source || "").toString();
     const pullTaskId = (body?.pullTaskId || body?.pull_task_id || "").toString();
@@ -1253,7 +1253,7 @@ const server = http.createServer((req, res) => {
     const schoolNameInput = (body?.schoolName || body?.school_name || "").toString();
     const schoolSystemTypeInput = (body?.schoolSystemType || body?.systemType || "").toString();
     const sourceUrl = (body?.sourceUrl || body?.source_url || "").toString().trim();
-    const scriptName = (body?.scriptName || body?.script_name || "").toString();
+    const scriptName = normalizeScriptNameFromAny(body?.scriptName || body?.script_name || "");
     const scriptVersion = Number(body?.scriptVersion || body?.script_version || 0);
     const scriptSource = (body?.scriptSource || body?.script_source || "").toString();
     const failureTypeInput = (body?.failureType || body?.failure_type || "").toString();
@@ -1719,7 +1719,8 @@ async function recordParseReport(body) {
 
 function normalizeParserAttempt(item) {
   return {
-    parserName: sanitizeScriptName(item?.parserName || item?.parser_name || ""),
+    // 兼容客户端上报的脚本名可能包含路径/URL 的情况，统一归一化为脚本文件名
+    parserName: normalizeScriptNameFromAny(item?.parserName || item?.parser_name || ""),
     category: (item?.category || "parsers").toString(),
     parserVersion: Number(item?.parserVersion || item?.parser_version || 0),
     releaseId: (item?.releaseId || item?.release_id || "").toString(),
@@ -1789,6 +1790,8 @@ async function saveFailureSample(issueId, sample) {
     PX: queueItemTtlMs
   });
   await redisClient.sAdd(buildRepairIssueSamplesKey(issueId), sampleId);
+  // 保持样本索引集合的生命周期与样本内容一致，避免出现“样本数有但取不到内容”的悬挂状态
+  await redisClient.expire(buildRepairIssueSamplesKey(issueId), Math.ceil(queueItemTtlMs / 1000));
   const issueRaw = await redisClient.get(buildRepairIssueKey(issueId));
   const issue = issueRaw ? safeJson(issueRaw) : null;
   if (issue) {
@@ -1826,6 +1829,24 @@ async function getRepairIssueDetail(issueId) {
       });
     }
   }
+  if (samples.length === 0) {
+    // 容器重建或过期清理后，Redis 里的样本可能丢失；尝试从 /shared/parsers 的落盘档案中恢复
+    const sessionIds = await redisClient.sMembers(buildRepairIssueSessionsKey(issueId));
+    const distinctSessionIds = Array.from(
+      new Set([...(Array.isArray(sessionIds) ? sessionIds : []), issue.lastParseSessionId].filter(Boolean))
+    ).slice(0, 60);
+    const archived = await loadArchivedFailureSamplesForIssue(issueId, issue, distinctSessionIds, 20);
+    for (const item of archived) {
+      samples.push(item);
+    }
+  }
+  if (samples.length === 0) {
+    // 如果客户端未上传 parse/report 的脱敏样本（或档案缺失），仍可尝试用云端 parse_task 的落盘内容作为回放样本
+    const archived = await loadArchivedSubmissionSamplesForIssue(issueId, issue, 20);
+    for (const item of archived) {
+      samples.push(item);
+    }
+  }
   const attempts = issue.lastParseSessionId ? await readParserAttempts(issue.lastParseSessionId) : [];
   const timelineData = await getRepairIssueTimeline(issueId, 120);
   const logsData = await getRepairIssueLogs(issueId, { limit: 120, cursor: 0 });
@@ -1858,8 +1879,38 @@ async function runRepairIssueTest(issueId, username) {
   if (!detail) {
     return { ok: false, code: 404, reason: "issue_not_found" };
   }
-  const scriptName = detail.issue?.affectedScriptId || "";
-  const script = await readScript(scriptName);
+  const primaryName = normalizeScriptNameFromAny(detail.issue?.affectedScriptId || "");
+  const systemType = (detail.issue?.schoolSystemType || "").toString();
+  const fallbackMapped =
+    normalizeSchoolSystemType(systemType) === "qiangzhi"
+      ? "qiangzhi.js"
+      : normalizeSchoolSystemType(systemType) === "zhengfang"
+        ? "zhengfang.js"
+        : normalizeSchoolSystemType(systemType) === "kingosoft"
+          ? "kingosoft.js"
+          : "";
+  const candidates = Array.from(
+    new Set(
+      [
+        primaryName,
+        fallbackMapped,
+        detail.issue?.schoolId ? sanitizeScriptName(detail.issue.schoolId) : "",
+        "qiangzhi.js",
+        "zhengfang.js",
+        "kingosoft.js"
+      ].filter(Boolean)
+    )
+  );
+  let script = "";
+  let matchedName = "";
+  for (const name of candidates) {
+    const content = await readScript(name);
+    if (content) {
+      script = content;
+      matchedName = name;
+      break;
+    }
+  }
   if (!script) {
     await appendRepairIssueTrace(issueId, {
       stage: "REPLAY_RESULT",
@@ -1868,7 +1919,7 @@ async function runRepairIssueTest(issueId, username) {
       actor: username || "admin",
       source: "admin_run_test",
       durationMs: Date.now() - replayStart,
-      meta: { scriptName }
+      meta: { scriptName: primaryName || (detail.issue?.affectedScriptId || ""), candidates }
     });
     return { ok: false, code: 404, reason: "script_not_found" };
   }
@@ -2076,7 +2127,13 @@ async function retryRepairIssue(issueId, username) {
   const schoolId = (detail.issue.schoolId || "").toString().trim();
   if (!schoolId) return { ok: false, code: 400, reason: "missing_school_id" };
   const samples = (detail.samples || []).filter((item) => item?.content).slice(0, 20);
-  if (!samples.length) return { ok: false, code: 400, reason: "sample_not_found" };
+  if (!samples.length) {
+    return {
+      ok: false,
+      code: 400,
+      reason: "缺少可用样本：可能未上传脱敏样本，或样本已过期/已被清理，请等待新的失败上报或开启云端兜底上传"
+    };
+  }
   await appendRepairIssueTrace(issueId, {
     stage: "QUEUED",
     level: "info",
@@ -2134,7 +2191,13 @@ async function forceRepairIssue(issueId, username) {
   const schoolId = (detail.issue.schoolId || "").toString().trim();
   if (!schoolId) return { ok: false, code: 400, reason: "missing_school_id" };
   const samples = (detail.samples || []).filter((item) => item?.content).slice(0, 20);
-  if (!samples.length) return { ok: false, code: 400, reason: "sample_not_found" };
+  if (!samples.length) {
+    return {
+      ok: false,
+      code: 400,
+      reason: "缺少可用样本：可能未上传脱敏样本，或样本已过期/已被清理，请等待新的失败上报或开启云端兜底上传"
+    };
+  }
   await appendRepairIssueTrace(issueId, {
     stage: "QUEUED",
     level: "warning",
@@ -3520,6 +3583,126 @@ async function persistParseReportSnapshot(body) {
   const day = new Date(now).toISOString().slice(0, 10);
   const filePath = path.join(parseReportArchiveDir, `${day}.jsonl`);
   await appendJsonLine(filePath, { receivedAt: now, body });
+}
+
+function buildIsoDayList(startMs, endMs, maxDays = 14) {
+  const start = Number(startMs || 0);
+  const end = Number(endMs || 0);
+  if (!start || !end || end < start) return [];
+  const max = Math.max(1, Math.min(60, Number(maxDays || 14)));
+  const list = [];
+  const startDate = new Date(start);
+  const endDate = new Date(end);
+  startDate.setHours(0, 0, 0, 0);
+  endDate.setHours(0, 0, 0, 0);
+  for (let i = 0; i < max; i++) {
+    const day = new Date(endDate.getTime() - i * 24 * 60 * 60 * 1000);
+    if (day.getTime() < startDate.getTime()) break;
+    list.push(day.toISOString().slice(0, 10));
+  }
+  return list;
+}
+
+async function loadArchivedFailureSamplesForIssue(issueId, issue, parseSessionIds, limit = 20) {
+  const sessionSet = new Set((Array.isArray(parseSessionIds) ? parseSessionIds : []).map((v) => v.toString()));
+  if (sessionSet.size === 0) return [];
+  const now = Date.now();
+  const start = Math.max(Number(issue?.createdAt || 0), now - 14 * 24 * 60 * 60 * 1000);
+  const end = Math.max(Number(issue?.lastSeenAt || 0), Number(issue?.updatedAt || 0), now);
+  const days = buildIsoDayList(start, end, 14);
+  const results = [];
+  for (const day of days) {
+    if (results.length >= limit) break;
+    const filePath = path.join(parseReportArchiveDir, `${day}.jsonl`);
+    const raw = await readTextIfExists(filePath);
+    if (!raw) continue;
+    const lines = raw.split("\n").filter(Boolean);
+    for (const line of lines) {
+      if (results.length >= limit) break;
+      const record = safeJson(line);
+      const body = record?.body || null;
+      const session = body?.session || {};
+      const parseSessionId = (session.parseSessionId || session.parse_session_id || "").toString().trim();
+      if (!parseSessionId || !sessionSet.has(parseSessionId)) continue;
+      const sample = body?.sanitizedSample || body?.sanitized_sample || null;
+      const hasConsent = sample?.hasUserConsent === true;
+      const content = (sample?.content || "").toString();
+      if (!hasConsent || !content) continue;
+      const contentSha256 = (sample?.contentSha256 || sample?.content_sha256 || "").toString() || hashText(content);
+      const sampleId = `sample_${hashText(`${issueId}:${parseSessionId}:${contentSha256}`).slice(0, 16)}`;
+      results.push({
+        sampleId,
+        issueId,
+        parseSessionId,
+        content,
+        contentSha256,
+        sanitizerVersion: Number(sample?.sanitizerVersion || sample?.sanitizer_version || 0),
+        pageFingerprint: body?.pageFingerprint || body?.page_fingerprint || null,
+        schoolId: (issue?.schoolId || "").toString(),
+        schoolSystemType: (issue?.schoolSystemType || "").toString(),
+        sourceUrlHost: (issue?.sourceUrlHost || "").toString(),
+        createdAt: Number(record?.receivedAt || 0) || now,
+        contentPreview: content.slice(0, 4000),
+        restoredFromArchive: true
+      });
+    }
+  }
+  return results;
+}
+
+async function loadArchivedSubmissionSamplesForIssue(issueId, issue, limit = 20) {
+  const schoolId = safePathSegment(issue?.schoolId);
+  if (!schoolId || schoolId === "unknown") return [];
+  const now = Date.now();
+  const start = Math.max(Number(issue?.createdAt || 0), now - 14 * 24 * 60 * 60 * 1000);
+  const end = Math.max(Number(issue?.lastSeenAt || 0), Number(issue?.updatedAt || 0), now);
+  const days = buildIsoDayList(start, end, 14);
+  const results = [];
+  for (const day of days) {
+    if (results.length >= limit) break;
+    const folder = path.join(submissionArchiveDir, schoolId, day);
+    let entries = [];
+    try {
+      entries = await fs.readdir(folder, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    const files = entries
+      .filter((it) => it.isFile() && it.name.toLowerCase().endsWith(".json"))
+      .slice(0, 60)
+      .map((it) => it.name);
+    for (const name of files) {
+      if (results.length >= limit) break;
+      const filePath = path.join(folder, name);
+      const raw = await readTextIfExists(filePath);
+      if (!raw) continue;
+      const data = safeJson(raw);
+      if (!data) continue;
+      const storedIssueId = (data?.issueId || "").toString().trim();
+      if (storedIssueId !== issueId) continue;
+      const content = (data?.content || "").toString();
+      if (!content) continue;
+      const parseSessionId = (data?.parseSessionId || "").toString().trim();
+      const contentSha256 = (data?.contentSha256 || "").toString() || hashText(content);
+      const sampleId = `sample_${hashText(`${issueId}:${parseSessionId}:${contentSha256}`).slice(0, 16)}`;
+      results.push({
+        sampleId,
+        issueId,
+        parseSessionId,
+        content,
+        contentSha256,
+        sanitizerVersion: Number(data?.sanitizerVersion || 0),
+        pageFingerprint: data?.pageFingerprint || null,
+        schoolId: (issue?.schoolId || "").toString(),
+        schoolSystemType: (issue?.schoolSystemType || "").toString(),
+        sourceUrlHost: (issue?.sourceUrlHost || "").toString(),
+        createdAt: Number(data?.receivedAt || 0) || now,
+        contentPreview: content.slice(0, 4000),
+        restoredFromArchive: true
+      });
+    }
+  }
+  return results;
 }
 
 /**
@@ -5836,6 +6019,26 @@ function sanitizeScriptName(scriptName) {
   const name = (scriptName || "").replace(/[\\/]/g, "_").trim();
   if (name.toLowerCase().endsWith(".js")) return name;
   return `${name || "unknown"}.js`;
+}
+
+function normalizeScriptNameFromAny(value) {
+  const raw = (value || "").toString().trim();
+  if (!raw) return "";
+  let text = raw;
+  try {
+    if (/^https?:\/\//i.test(text)) {
+      const parsed = new URL(text);
+      text = parsed.pathname || "";
+    }
+  } catch {
+    // ignore
+  }
+  text = text.split("#")[0].split("?")[0];
+  text = text.replace(/\\/g, "/");
+  const parts = text.split("/").filter(Boolean);
+  const baseName = parts.length > 0 ? parts[parts.length - 1] : "";
+  if (baseName) return sanitizeScriptName(baseName);
+  return sanitizeScriptName(raw);
 }
 
 function normalizeSchoolSystemType(value) {

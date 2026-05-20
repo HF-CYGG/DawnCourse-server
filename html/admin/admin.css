@@ -762,6 +762,209 @@ input:checked + .slider:before {
   white-space: pre;
   overflow: auto;
 }
+
+/* Repair Issues：进度与日志展示 */
+.btn.compact {
+  padding: 6px 10px;
+  border-radius: 8px;
+  font-size: 12px;
+}
+.hidden {
+  display: none !important;
+}
+.repair-progress {
+  padding: 14px;
+}
+.repair-progress-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+.repair-progress-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.repair-progress-metrics {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.metric-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.04);
+  font-size: 12px;
+  color: var(--text);
+}
+.metric-pill .label {
+  color: var(--muted);
+}
+.repair-progress-steps {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 10px;
+}
+.progress-step {
+  display: flex;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: #10141c;
+  min-height: 56px;
+}
+.progress-step .dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  margin-top: 4px;
+  background: rgba(154, 164, 178, 0.5);
+}
+.progress-step .content {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.progress-step .stage {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+}
+.progress-step .meta {
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.progress-step.completed .dot {
+  background: rgba(51, 214, 159, 0.9);
+}
+.progress-step.active {
+  border-color: rgba(91, 157, 255, 0.8);
+  box-shadow: 0 0 0 1px rgba(92, 160, 255, 0.25);
+}
+.progress-step.active .dot {
+  background: rgba(91, 157, 255, 0.9);
+}
+.progress-step.failed .dot {
+  background: rgba(255, 107, 107, 0.9);
+}
+
+.timeline-list {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: #0b0e14;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  max-height: 42vh;
+  overflow: auto;
+}
+.timeline-item {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 10px;
+  padding: 10px 0;
+  border-bottom: 1px solid rgba(43, 48, 59, 0.6);
+}
+.timeline-item:last-child {
+  border-bottom: none;
+}
+.timeline-side {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 110px;
+}
+.timeline-time {
+  font-size: 11px;
+  color: var(--muted);
+}
+.timeline-stage {
+  font-size: 11px;
+  color: var(--accent);
+}
+.timeline-main {
+  font-size: 12px;
+  line-height: 1.45;
+  word-break: break-word;
+}
+.timeline-source {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 4px;
+}
+
+.log-toolbar {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+.log-search {
+  flex: 1;
+  min-width: 220px;
+  background: #10141c;
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 8px 10px;
+  border-radius: 10px;
+}
+.log-table {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: #0b0e14;
+  overflow: auto;
+  max-height: 42vh;
+  margin-bottom: 12px;
+}
+.log-table table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.log-table th,
+.log-table td {
+  padding: 10px 10px;
+  border-bottom: 1px solid rgba(43, 48, 59, 0.65);
+  font-size: 12px;
+  vertical-align: top;
+  text-align: left;
+}
+.log-table th {
+  position: sticky;
+  top: 0;
+  background: rgba(23, 26, 33, 0.98);
+  color: var(--muted);
+  z-index: 1;
+}
+.log-msg {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.log-msg.nowrap {
+  white-space: pre;
+}
+.repair-log-meta {
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.log-row:hover td {
+  background: rgba(91, 157, 255, 0.08);
+}
 .user-form-row {
   display: grid;
   grid-template-columns: 1fr 1fr auto;

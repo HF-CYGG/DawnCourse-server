@@ -393,18 +393,47 @@
                   </div>
                 </div>
                 <div class="actions">
+                  <label class="checkbox-inline">
+                    <input id="repairIssueAutoRefresh" type="checkbox" checked>
+                    自动刷新
+                  </label>
+                  <label class="checkbox-inline">
+                    <input id="repairIssueFollowLogs" type="checkbox" checked>
+                    自动滚动
+                  </label>
+                  <button class="btn secondary" id="repairIssueCopySummaryBtn" type="button">复制摘要</button>
                   <button class="btn secondary" id="repairIssueLogReloadBtn" type="button">刷新日志</button>
                   <button class="btn secondary" id="repairIssueRetryBtn" type="button">重试修复</button>
                 </div>
               </div>
               <div class="muted mb-24" id="repairIssueDetailMeta">选择一条 Issue 查看详情。</div>
+              <div class="card repair-progress mb-24" id="repairIssueProgressCard">
+                <div class="repair-progress-header">
+                  <div class="repair-progress-title">
+                    <span class="badge" id="repairIssueProgressStageBadge">-</span>
+                    <span class="muted" id="repairIssueProgressHint">选择 Issue 后展示修复进度</span>
+                  </div>
+                  <div class="repair-progress-metrics" id="repairIssueProgressMetrics"></div>
+                </div>
+                <div class="repair-progress-steps" id="repairIssueProgressSteps"></div>
+              </div>
               <section class="split">
                 <div>
                   <h3 class="section-title">阶段时间线</h3>
+                  <div class="timeline-list" id="repairIssueTimelineList"></div>
                   <pre class="code-block" id="repairIssueTimeline">暂无时间线</pre>
                 </div>
                 <div>
                   <h3 class="section-title">步骤日志</h3>
+                  <div class="log-toolbar">
+                    <input id="repairIssueLogSearch" class="log-search" type="text" placeholder="搜索日志（关键词/阶段/来源/操作者）">
+                    <label class="checkbox-inline">
+                      <input id="repairIssueLogWrap" type="checkbox" checked>
+                      自动换行
+                    </label>
+                    <button class="btn secondary compact" id="repairIssueCopyLogsBtn" type="button">复制日志</button>
+                  </div>
+                  <div class="log-table" id="repairIssueLogTable"></div>
                   <pre class="code-block" id="repairIssueDetail">选择一条 Issue 查看日志。</pre>
                 </div>
               </section>

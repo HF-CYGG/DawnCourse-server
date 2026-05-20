@@ -44,6 +44,18 @@ const repairIssueLogLevel = document.getElementById("repairIssueLogLevel");
 const repairIssueLogReloadBtn = document.getElementById("repairIssueLogReloadBtn");
 const repairIssueRetryBtn = document.getElementById("repairIssueRetryBtn");
 let repairIssueForceBtn = document.getElementById("repairIssueForceBtn");
+const repairIssueAutoRefresh = document.getElementById("repairIssueAutoRefresh");
+const repairIssueFollowLogs = document.getElementById("repairIssueFollowLogs");
+const repairIssueCopySummaryBtn = document.getElementById("repairIssueCopySummaryBtn");
+const repairIssueProgressStageBadge = document.getElementById("repairIssueProgressStageBadge");
+const repairIssueProgressHint = document.getElementById("repairIssueProgressHint");
+const repairIssueProgressMetrics = document.getElementById("repairIssueProgressMetrics");
+const repairIssueProgressSteps = document.getElementById("repairIssueProgressSteps");
+const repairIssueTimelineList = document.getElementById("repairIssueTimelineList");
+const repairIssueLogSearch = document.getElementById("repairIssueLogSearch");
+const repairIssueLogWrap = document.getElementById("repairIssueLogWrap");
+const repairIssueLogTable = document.getElementById("repairIssueLogTable");
+const repairIssueCopyLogsBtn = document.getElementById("repairIssueCopyLogsBtn");
 const testSummaryConfigBtn = document.getElementById("testSummaryConfigBtn");
 const testSummaryConfigResult = document.getElementById("testSummaryConfigResult");
 const testScriptConfigBtn = document.getElementById("testScriptConfigBtn");
@@ -79,6 +91,10 @@ let scriptModalState = {
 };
 let activeRepairIssueId = "";
 let activeEventStreamToken = "";
+let repairIssueDetailCache = null;
+let repairIssueTimelineCache = [];
+let repairIssueLogsCache = [];
+let repairIssueAutoRefreshTimer = null;
 
 if (!repairIssueForceBtn && repairIssueRetryBtn?.parentElement) {
   repairIssueForceBtn = document.createElement("button");
@@ -92,6 +108,21 @@ if (!repairIssueForceBtn && repairIssueRetryBtn?.parentElement) {
 const navItems = document.querySelectorAll(".nav-item");
 const pageSections = document.querySelectorAll(".page-section");
 const pageTitle = document.getElementById("pageTitle");
+
+// 修复流水线阶段顺序：用于进度条与时间线可视化展示
+const REPAIR_STAGE_FLOW = [
+  { stage: "REPORT_RECEIVED", label: "收到上报" },
+  { stage: "ISSUE_MERGED", label: "聚合去重" },
+  { stage: "QUEUED", label: "进入队列" },
+  { stage: "REPLAY_RUNNING", label: "复现中" },
+  { stage: "REPLAY_RESULT", label: "复现结果" },
+  { stage: "CANDIDATE_TEST_RUNNING", label: "候选测试" },
+  { stage: "CANDIDATE_TEST_RESULT", label: "候选结果" },
+  { stage: "PENDING_RELEASE", label: "待发布" },
+  { stage: "PUBLISHED", label: "已发布" },
+  { stage: "ROLLED_BACK", label: "已回滚" },
+  { stage: "DISABLED", label: "已禁用" }
+];
 
 function setLoginHint(text, type) {
   if (!loginHint) return;
@@ -396,6 +427,10 @@ window.addEventListener("unhandledrejection", (event) => {
 navItems.forEach((item) => {
   item.addEventListener("click", () => {
     const target = item.getAttribute("data-target");
+    const prev = getActivePageId();
+    if (prev === "page-repair-issues" && target !== "page-repair-issues") {
+      stopRepairIssueAutoRefresh();
+    }
     navItems.forEach((nav) => nav.classList.remove("active"));
     item.classList.add("active");
     pageTitle.textContent = item.textContent.trim();
@@ -405,7 +440,10 @@ navItems.forEach((item) => {
         page.classList.add("active");
         if (target === "page-config") loadConfig();
         if (target === "page-scripts") loadScriptsPage();
-        if (target === "page-repair-issues") loadRepairIssuesPage();
+        if (target === "page-repair-issues") {
+          loadRepairIssuesPage();
+          startRepairIssueAutoRefresh();
+        }
         if (target === "page-users") loadUsersPage();
         if (target === "page-runtime-logs") loadRuntimeLogs();
       } else {
@@ -843,10 +881,39 @@ function setToken(token) {
 function clearToken() {
   localStorage.removeItem("dawn_admin_token");
 }
+async function copyText(text) {
+  const value = (text ?? "").toString();
+  if (!value) return;
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(value);
+    return;
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.setAttribute("readonly", "true");
+  textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  textarea.style.top = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  document.execCommand("copy");
+  document.body.removeChild(textarea);
+}
 function formatTime(ts) {
   if (!ts) return "-";
   const date = new Date(ts);
   return `${date.toLocaleDateString()} ${date.toLocaleTimeString()}`;
+}
+function formatDuration(ms) {
+  const value = Number(ms || 0);
+  if (!Number.isFinite(value) || value <= 0) return "-";
+  const totalSeconds = Math.floor(value / 1000);
+  const seconds = totalSeconds % 60;
+  const minutes = Math.floor(totalSeconds / 60) % 60;
+  const hours = Math.floor(totalSeconds / 3600);
+  if (hours > 0) return `${hours}h${minutes}m${seconds}s`;
+  if (minutes > 0) return `${minutes}m${seconds}s`;
+  return `${seconds}s`;
 }
 function formatCount(value) {
   return Number(value || 0).toLocaleString();
@@ -1870,6 +1937,122 @@ function formatRepairIssueMeta(issue) {
   } | 样本: ${Number(info.sampleCount || 0)} | 影响用户: ${Number(info.userCount || 0)}`;
 }
 
+function formatRepairStageLabel(stage) {
+  const key = (stage || "").toString().trim();
+  const item = REPAIR_STAGE_FLOW.find((it) => it.stage === key);
+  return item ? `${item.label}（${item.stage}）` : key || "-";
+}
+
+function getRepairStageIndex(stage) {
+  const key = (stage || "").toString().trim();
+  return REPAIR_STAGE_FLOW.findIndex((it) => it.stage === key);
+}
+
+function buildMetricPill(label, value) {
+  return `<span class="metric-pill"><span class="label">${escapeHtml(label)}</span><span>${escapeHtml(
+    value ?? "-"
+  )}</span></span>`;
+}
+
+function renderRepairProgress(issue, timelineItems) {
+  if (!repairIssueProgressSteps || !repairIssueProgressMetrics || !repairIssueProgressStageBadge) return;
+  const info = issue || {};
+  const stage = (info.currentStage || "").toString();
+  const stageIndex = getRepairStageIndex(stage);
+  const normalizedStageIndex = stageIndex >= 0 ? stageIndex : 0;
+  const lastStepAt = Number(info.lastStepAt || info.updatedAt || 0);
+  const lastSeenAt = Number(info.lastSeenAt || info.updatedAt || 0);
+
+  const timelineList = Array.isArray(timelineItems) ? timelineItems : [];
+  const stageTimeMap = new Map();
+  for (const item of timelineList) {
+    const key = (item?.stage || "").toString();
+    const ts = Number(item?.ts || 0);
+    if (!key || !ts) continue;
+    const existing = stageTimeMap.get(key) || 0;
+    if (ts > existing) stageTimeMap.set(key, ts);
+  }
+
+  const firstTs = timelineList.reduce((min, item) => {
+    const ts = Number(item?.ts || 0);
+    if (!ts) return min;
+    return min === 0 ? ts : Math.min(min, ts);
+  }, 0);
+  const lastTs = timelineList.reduce((max, item) => Math.max(max, Number(item?.ts || 0)), 0);
+  const durationText = firstTs && lastTs ? formatDuration(lastTs - firstTs) : "-";
+
+  const statusText = `${info.status || "open"} / ${info.currentStage || "-"}`;
+  repairIssueProgressStageBadge.textContent = statusText;
+  repairIssueProgressStageBadge.classList.remove("success", "warning", "danger");
+  if (["PUBLISHED"].includes(info.currentStage)) {
+    repairIssueProgressStageBadge.classList.add("success");
+  } else if (["ROLLED_BACK", "DISABLED"].includes(info.currentStage)) {
+    repairIssueProgressStageBadge.classList.add("warning");
+  } else if (info.lastErrorMessage) {
+    repairIssueProgressStageBadge.classList.add("danger");
+  }
+
+  if (repairIssueProgressHint) {
+    const percent = Math.round(((normalizedStageIndex + 1) / REPAIR_STAGE_FLOW.length) * 100);
+    repairIssueProgressHint.textContent = `进度 ${percent}% · 修复耗时 ${durationText}`;
+  }
+
+  repairIssueProgressMetrics.innerHTML = [
+    buildMetricPill("样本", Number(info.sampleCount || 0)),
+    buildMetricPill("影响用户", Number(info.userCount || 0)),
+    buildMetricPill("最近出现", formatTime(lastSeenAt)),
+    buildMetricPill("最近步骤", formatTime(lastStepAt)),
+    buildMetricPill("最近错误", info.lastErrorMessage ? "有" : "无")
+  ].join("");
+
+  repairIssueProgressSteps.innerHTML = REPAIR_STAGE_FLOW.map((step, idx) => {
+    const ts = stageTimeMap.get(step.stage) || 0;
+    const meta = ts ? formatTime(ts) : "未发生";
+    const classes = ["progress-step"];
+    if (idx < normalizedStageIndex) classes.push("completed");
+    if (idx === normalizedStageIndex) classes.push("active");
+    if (idx === normalizedStageIndex && info.lastErrorMessage) classes.push("failed");
+    return `
+      <div class="${classes.join(" ")}" data-stage="${escapeHtml(step.stage)}">
+        <div class="dot"></div>
+        <div class="content">
+          <div class="stage">${escapeHtml(step.label)}</div>
+          <div class="meta">${escapeHtml(step.stage)} · ${escapeHtml(meta)}</div>
+        </div>
+      </div>
+    `;
+  }).join("");
+}
+
+function renderRepairTimelineList(list) {
+  if (!repairIssueTimelineList) return;
+  const items = Array.isArray(list) ? list : [];
+  if (!items.length) {
+    repairIssueTimelineList.innerHTML = `<div class="muted">暂无时间线</div>`;
+    return;
+  }
+  repairIssueTimelineList.innerHTML = items
+    .map((item) => {
+      const ts = formatTime(item?.ts || 0);
+      const stage = (item?.stage || "").toString();
+      const msg = (item?.message || "").toString();
+      const source = (item?.source || "").toString();
+      return `
+        <div class="timeline-item">
+          <div class="timeline-side">
+            <div class="timeline-time">${escapeHtml(ts)}</div>
+            <div class="timeline-stage">${escapeHtml(stage || "-")}</div>
+          </div>
+          <div class="timeline-main">
+            <div>${escapeHtml(msg || "-")}</div>
+            <div class="timeline-source">${escapeHtml(source || "-")}</div>
+          </div>
+        </div>
+      `;
+    })
+    .join("");
+}
+
 function renderRepairTimeline(list) {
   if (!repairIssueTimeline) return;
   const items = Array.isArray(list) ? list : [];
@@ -1877,6 +2060,7 @@ function renderRepairTimeline(list) {
     repairIssueTimeline.textContent = "暂无时间线";
     return;
   }
+  renderRepairTimelineList(items);
   repairIssueTimeline.textContent = items
     .map((item) => {
       const ts = formatTime(item?.ts || 0);
@@ -1888,6 +2072,81 @@ function renderRepairTimeline(list) {
     .join("\n");
 }
 
+function filterRepairLogs(list, query) {
+  const raw = (query || "").toString().trim().toLowerCase();
+  if (!raw) return list;
+  return list.filter((item) => {
+    const message = (item?.message || "").toString().toLowerCase();
+    const stage = (item?.stage || "").toString().toLowerCase();
+    const source = (item?.source || "").toString().toLowerCase();
+    const actor = (item?.actor || "").toString().toLowerCase();
+    const meta = item?.meta ? JSON.stringify(item.meta).toLowerCase() : "";
+    return (
+      message.includes(raw) || stage.includes(raw) || source.includes(raw) || actor.includes(raw) || meta.includes(raw)
+    );
+  });
+}
+
+function renderRepairLogsTable(list) {
+  if (!repairIssueLogTable) return;
+  const wrapEnabled = repairIssueLogWrap?.checked !== false;
+  const query = (repairIssueLogSearch?.value || "").toString();
+  const filtered = filterRepairLogs(Array.isArray(list) ? list : [], query);
+  if (!filtered.length) {
+    repairIssueLogTable.innerHTML = `<div class="muted" style="padding: 12px 14px;">暂无日志</div>`;
+    return;
+  }
+  const rows = filtered
+    .map((item) => {
+      const ts = formatTime(item?.ts || 0);
+      const stage = (item?.stage || "").toString();
+      const level = (item?.level || "info").toString();
+      const source = (item?.source || "").toString();
+      const actor = (item?.actor || "").toString();
+      const durationMs = Number(item?.durationMs || 0);
+      const message = (item?.message || "").toString();
+      const meta = item?.meta ? JSON.stringify(item.meta, null, 2) : "";
+      const levelClass = level === "error" ? "danger" : level === "warning" ? "warning" : "";
+      const metaHtml = meta
+        ? `<details><summary class="muted">meta</summary><pre class="repair-log-meta">${escapeHtml(meta)}</pre></details>`
+        : "";
+      return `
+        <tr class="log-row">
+          <td style="white-space: nowrap;">${escapeHtml(ts)}</td>
+          <td><span class="badge ${levelClass}">${escapeHtml(level)}</span></td>
+          <td style="white-space: nowrap;">${escapeHtml(stage)}</td>
+          <td style="white-space: nowrap;">${escapeHtml(source || "-")}</td>
+          <td style="white-space: nowrap;">${escapeHtml(actor || "-")} · ${escapeHtml(durationMs)}ms</td>
+          <td>
+            <div class="log-msg ${wrapEnabled ? "" : "nowrap"}">${escapeHtml(message || "-")}</div>
+            ${metaHtml}
+          </td>
+        </tr>
+      `;
+    })
+    .join("");
+  repairIssueLogTable.innerHTML = `
+    <table>
+      <thead>
+        <tr>
+          <th style="min-width: 120px;">时间</th>
+          <th style="min-width: 70px;">级别</th>
+          <th style="min-width: 160px;">阶段</th>
+          <th style="min-width: 140px;">来源</th>
+          <th style="min-width: 160px;">操作者/耗时</th>
+          <th>内容</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${rows}
+      </tbody>
+    </table>
+  `;
+  if (repairIssueFollowLogs?.checked) {
+    repairIssueLogTable.scrollTop = repairIssueLogTable.scrollHeight;
+  }
+}
+
 function renderRepairLogs(data) {
   if (!repairIssueDetail) return;
   const list = Array.isArray(data?.list) ? data.list : [];
@@ -1895,6 +2154,7 @@ function renderRepairLogs(data) {
     repairIssueDetail.textContent = "暂无日志";
     return;
   }
+  renderRepairLogsTable(list);
   repairIssueDetail.textContent = list
     .map((item) => {
       const ts = formatTime(item?.ts || 0);
@@ -1915,7 +2175,16 @@ async function loadRepairIssueTimeline(issueId) {
   if (result.code !== 200) {
     throw new Error(result.msg || "时间线加载失败");
   }
-  renderRepairTimeline(result?.data?.list || []);
+  const list = Array.isArray(result?.data?.list) ? result.data.list : [];
+  repairIssueTimelineCache = list;
+  renderRepairTimeline(list);
+  if (repairIssueDetailCache?.issue) {
+    renderRepairProgress(repairIssueDetailCache.issue, list);
+  }
+  if (repairIssueTimeline && repairIssueTimelineList) {
+    repairIssueTimeline.classList.add("hidden");
+  }
+  return list;
 }
 
 async function loadRepairIssueLogs(issueId) {
@@ -1929,7 +2198,14 @@ async function loadRepairIssueLogs(issueId) {
   if (result.code !== 200) {
     throw new Error(result.msg || "日志加载失败");
   }
-  renderRepairLogs(result?.data || {});
+  const data = result?.data || {};
+  const list = Array.isArray(data?.list) ? data.list : [];
+  repairIssueLogsCache = list;
+  renderRepairLogs(data);
+  if (repairIssueDetail && repairIssueLogTable) {
+    repairIssueDetail.classList.add("hidden");
+  }
+  return list;
 }
 
 async function loadRepairIssueDetail(issueId) {
@@ -1941,11 +2217,45 @@ async function loadRepairIssueDetail(issueId) {
   if (repairIssueTimeline) repairIssueTimeline.textContent = "加载中...";
   const result = await fetchWithAuth(`/api/v1/admin/repair/issues/${encodeURIComponent(issueId)}`);
   const detail = result.data || {};
+  repairIssueDetailCache = detail;
   if (repairIssueDetailMeta) {
     repairIssueDetailMeta.textContent = formatRepairIssueMeta(detail.issue || {});
   }
+  renderRepairProgress(detail.issue || {}, repairIssueTimelineCache || []);
   await loadRepairIssueTimeline(issueId);
   await loadRepairIssueLogs(issueId);
+  startRepairIssueAutoRefresh();
+}
+
+function stopRepairIssueAutoRefresh() {
+  if (!repairIssueAutoRefreshTimer) return;
+  clearInterval(repairIssueAutoRefreshTimer);
+  repairIssueAutoRefreshTimer = null;
+}
+
+function startRepairIssueAutoRefresh() {
+  stopRepairIssueAutoRefresh();
+  if (!repairIssueAutoRefresh?.checked) return;
+  if (!activeRepairIssueId) return;
+  repairIssueAutoRefreshTimer = setInterval(async () => {
+    if (!repairIssueAutoRefresh?.checked) return;
+    if (!activeRepairIssueId) return;
+    try {
+      const result = await fetchWithAuth(`/api/v1/admin/repair/issues/${encodeURIComponent(activeRepairIssueId)}`);
+      repairIssueDetailCache = result.data || {};
+      if (repairIssueDetailMeta) {
+        repairIssueDetailMeta.textContent = formatRepairIssueMeta(repairIssueDetailCache.issue || {});
+      }
+      await loadRepairIssueTimeline(activeRepairIssueId);
+      await loadRepairIssueLogs(activeRepairIssueId);
+      const stage = (repairIssueDetailCache?.issue?.currentStage || "").toString();
+      if (["PUBLISHED", "ROLLED_BACK", "DISABLED"].includes(stage)) {
+        stopRepairIssueAutoRefresh();
+      }
+    } catch {
+      // 自动刷新失败时保持静默，避免影响管理员操作
+    }
+  }, 2500);
 }
 
 async function runRepairIssueReplay(issueId) {
@@ -2200,13 +2510,82 @@ if (repairIssueRetryBtn) {
 if (repairIssueForceBtn) {
   repairIssueForceBtn.addEventListener("click", async () => {
     if (!activeRepairIssueId) {
-      showToast("warning", "鏈€夋嫨 Issue", "璇峰厛鍦ㄥ垪琛ㄤ腑閫夋嫨涓€鏉?Issue");
+      showToast("warning", "未选择 Issue", "请先在列表中选择一条 Issue");
       return;
     }
     try {
       await forceRepairIssueFromAdmin(activeRepairIssueId);
     } catch (err) {
-      showToast("error", "立即修复失败", err?.message || "缃戠粶閿欒");
+      showToast("error", "立即修复失败", err?.message || "网络错误");
+    }
+  });
+}
+if (repairIssueAutoRefresh) {
+  repairIssueAutoRefresh.addEventListener("change", () => {
+    if (repairIssueAutoRefresh.checked) {
+      startRepairIssueAutoRefresh();
+    } else {
+      stopRepairIssueAutoRefresh();
+    }
+  });
+}
+if (repairIssueFollowLogs) {
+  repairIssueFollowLogs.addEventListener("change", () => {
+    if (repairIssueFollowLogs.checked) {
+      renderRepairLogsTable(repairIssueLogsCache);
+    }
+  });
+}
+if (repairIssueCopySummaryBtn) {
+  repairIssueCopySummaryBtn.addEventListener("click", async () => {
+    const meta = (repairIssueDetailMeta?.textContent || "").toString();
+    if (!meta.trim()) {
+      showToast("warning", "暂无摘要", "请先选择一条 Issue");
+      return;
+    }
+    try {
+      await copyText(meta);
+      showToast("info", "已复制", "Issue 摘要已复制到剪贴板");
+    } catch (e) {
+      showToast("error", "复制失败", e?.message || "浏览器不支持剪贴板");
+    }
+  });
+}
+if (repairIssueCopyLogsBtn) {
+  repairIssueCopyLogsBtn.addEventListener("click", async () => {
+    const text = (repairIssueDetail?.textContent || "").toString().trim();
+    if (!text) {
+      showToast("warning", "暂无日志", "请先选择一条 Issue");
+      return;
+    }
+    try {
+      await copyText(text);
+      showToast("info", "已复制", "步骤日志已复制到剪贴板");
+    } catch (e) {
+      showToast("error", "复制失败", e?.message || "浏览器不支持剪贴板");
+    }
+  });
+}
+if (repairIssueLogSearch) {
+  repairIssueLogSearch.addEventListener("input", () => {
+    renderRepairLogsTable(repairIssueLogsCache);
+  });
+}
+if (repairIssueLogWrap) {
+  repairIssueLogWrap.addEventListener("change", () => {
+    renderRepairLogsTable(repairIssueLogsCache);
+  });
+}
+if (repairIssueProgressSteps) {
+  repairIssueProgressSteps.addEventListener("click", async (e) => {
+    const step = e.target.closest(".progress-step");
+    const stage = (step?.dataset?.stage || "").toString();
+    if (!stage) return;
+    if (repairIssueLogStage) {
+      repairIssueLogStage.value = stage;
+      if (activeRepairIssueId) {
+        await loadRepairIssueLogs(activeRepairIssueId);
+      }
     }
   });
 }
@@ -2433,4 +2812,3 @@ setInterval(async () => {
     } catch {}
   }
 }, 10000);
-

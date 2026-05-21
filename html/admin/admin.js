@@ -452,6 +452,9 @@ function normalizeRepairTraceMeta(meta) {
     truncatedSummary: pickDefinedValue(info.truncatedSummary, info.truncated_summary) === true,
     truncatedGuidance: pickDefinedValue(info.truncatedGuidance, info.truncated_guidance) === true,
     truncatedPreviousScript: pickDefinedValue(info.truncatedPreviousScript, info.truncated_previous_script) === true,
+    previousScriptExtracted:
+      pickDefinedValue(info.previousScriptExtracted, info.previous_script_extracted) === true,
+    contextStrategy: `${pickDefinedValue(info.contextStrategy, info.context_strategy) || ""}`,
     statusCode: Number(pickDefinedValue(info.statusCode, info.status_code) || 0),
     errorCode: `${pickDefinedValue(info.errorCode, info.error_code) || ""}`,
     latencyMs: Number(pickDefinedValue(info.latencyMs, info.latency_ms, info.durationMs, info.duration_ms) || 0),
@@ -3079,6 +3082,7 @@ function buildRepairContextFromMeta(meta) {
   if (Number(info.summaryChars || 0) > 0) parts.push(`总结 ${Number(info.summaryChars || 0)} 字`);
   if (Number(info.guidanceChars || 0) > 0) parts.push(`指令 ${Number(info.guidanceChars || 0)} 字`);
   if (Number(info.previousScriptChars || 0) > 0) parts.push(`旧脚本 ${Number(info.previousScriptChars || 0)} 字`);
+  if (info.previousScriptExtracted) parts.push("旧脚本已提炼");
   if (info.truncatedSummary || info.truncatedGuidance || info.truncatedPreviousScript) {
     parts.push(
       `已裁剪 ${[
@@ -3118,6 +3122,7 @@ function buildRepairTraceContext(meta) {
   if (Number(info.summaryChars || 0) > 0) parts.push(`总结 ${Number(info.summaryChars || 0)} 字`);
   if (Number(info.guidanceChars || 0) > 0) parts.push(`指令 ${Number(info.guidanceChars || 0)} 字`);
   if (Number(info.previousScriptChars || 0) > 0) parts.push(`旧脚本 ${Number(info.previousScriptChars || 0)} 字`);
+  if (info.previousScriptExtracted) parts.push("旧脚本已提炼");
   if (info.truncatedSummary || info.truncatedGuidance || info.truncatedPreviousScript) {
     parts.push(
       `已裁剪 ${[
@@ -3129,6 +3134,7 @@ function buildRepairTraceContext(meta) {
         .join("/")}`
     );
   }
+  if ((info.contextStrategy || "").toString().trim()) parts.push(`策略 ${String(info.contextStrategy).trim()}`);
   if (Number(info.timeoutBudgetMs || 0) > 0) parts.push(`超时 ${Number(info.timeoutBudgetMs || 0)}ms`);
   if (Number(info.statusCode || 0) > 0) parts.push(`HTTP ${Number(info.statusCode || 0)}`);
   if ((info.errorCode || "").toString().trim()) parts.push(`错误码 ${String(info.errorCode).trim()}`);

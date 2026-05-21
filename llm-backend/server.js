@@ -2906,7 +2906,9 @@ async function processQueueCluster(schoolId, items, normalizedIssues, state, now
         originalPreviousScriptChars: Number(generatedScriptResult.inputMeta?.originalPreviousScriptChars || 0),
         truncatedSummary: Boolean(generatedScriptResult.inputMeta?.summaryTruncated),
         truncatedGuidance: Boolean(generatedScriptResult.inputMeta?.guidanceTruncated),
-        truncatedPreviousScript: Boolean(generatedScriptResult.inputMeta?.previousScriptTruncated)
+        truncatedPreviousScript: Boolean(generatedScriptResult.inputMeta?.previousScriptTruncated),
+        previousScriptExtracted: Boolean(generatedScriptResult.inputMeta?.previousScriptExtracted),
+        contextStrategy: generatedScriptResult.inputMeta?.contextStrategy || ""
       }
     });
     return { state, applied: false };
@@ -3162,7 +3164,9 @@ async function processIndividualSummaries(schoolId, queue, issueIds = []) {
         originalPreviousScriptChars: Number(generatedScriptResult.inputMeta?.originalPreviousScriptChars || 0),
         truncatedSummary: Boolean(generatedScriptResult.inputMeta?.summaryTruncated),
         truncatedGuidance: Boolean(generatedScriptResult.inputMeta?.guidanceTruncated),
-        truncatedPreviousScript: Boolean(generatedScriptResult.inputMeta?.previousScriptTruncated)
+        truncatedPreviousScript: Boolean(generatedScriptResult.inputMeta?.previousScriptTruncated),
+        previousScriptExtracted: Boolean(generatedScriptResult.inputMeta?.previousScriptExtracted),
+        contextStrategy: generatedScriptResult.inputMeta?.contextStrategy || ""
       }
     });
     return;
@@ -3828,12 +3832,92 @@ function clipTextKeepBothEnds(value, maxChars, truncatedLabel = "\n/* 已截断 
 }
 
 /**
+ * 合并多个行区间，便于从旧脚本中抽取关键片段。
+ */
+function mergeLineRanges(ranges) {
+  const sorted = (ranges || [])
+    .filter((item) => Array.isArray(item) && item.length === 2)
+    .map(([start, end]) => [Math.max(0, start), Math.max(0, end)])
+    .sort((a, b) => a[0] - b[0]);
+  const merged = [];
+  for (const current of sorted) {
+    const last = merged[merged.length - 1];
+    if (!last || current[0] > last[1] + 1) {
+      merged.push([...current]);
+    } else {
+      last[1] = Math.max(last[1], current[1]);
+    }
+  }
+  return merged;
+}
+
+/**
+ * 从旧脚本中提炼更可能与解析逻辑相关的片段，避免把整份脚本全文直接送给模型 2。
+ */
+function extractRelevantScriptContext(scriptText, maxChars = scriptMaxPreviousScriptChars) {
+  const raw = (scriptText || "").toString().trim();
+  if (!raw) {
+    return {
+      text: "",
+      originalChars: 0,
+      usedChars: 0,
+      truncated: false,
+      extracted: false,
+      strategy: "empty"
+    };
+  }
+  if (raw.length <= maxChars) {
+    return {
+      text: raw,
+      originalChars: raw.length,
+      usedChars: raw.length,
+      truncated: false,
+      extracted: false,
+      strategy: "full"
+    };
+  }
+  const lines = raw.split(/\r?\n/);
+  const keywordPattern =
+    /(parse|parser|course|courses|timetable|schedule|week|section|teacher|location|name|json\.stringify|return|extract|normalize|match|regex|result|quickjs)/i;
+  const ranges = [
+    [0, Math.min(lines.length - 1, 79)],
+    [Math.max(0, lines.length - 60), Math.max(0, lines.length - 1)]
+  ];
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index] || "";
+    if (!keywordPattern.test(line)) continue;
+    ranges.push([Math.max(0, index - 10), Math.min(lines.length - 1, index + 16)]);
+  }
+  const merged = mergeLineRanges(ranges);
+  const segments = [];
+  for (let i = 0; i < merged.length; i += 1) {
+    const [start, end] = merged[i];
+    const segment = lines.slice(start, end + 1).join("\n").trim();
+    if (!segment) continue;
+    if (segments.length > 0) {
+      segments.push("/* ... 已省略无关键代码 ... */");
+    }
+    segments.push(segment);
+  }
+  const extractedText = segments.join("\n");
+  const clipped = clipTextKeepBothEnds(extractedText, maxChars, "\n/* 已提炼并截断 */\n");
+  return {
+    text: clipped.text,
+    originalChars: raw.length,
+    usedChars: clipped.usedChars,
+    truncated: clipped.truncated || extractedText.length < raw.length,
+    extracted: true,
+    strategy: clipped.truncated ? "focused_extract_clipped" : "focused_extract"
+  };
+}
+
+/**
  * 构建模型 2 的生成输入，分别压缩总结、修复指令与旧脚本，并记录裁剪统计。
  */
 function buildScriptGenerationPayload(summary, patchGuidance, previousScript) {
   const summaryClip = clipSummarySampleText(summary || "", scriptMaxSummaryChars);
   const guidanceClip = clipSummarySampleText(patchGuidance || "", scriptMaxGuidanceChars);
-  const scriptClip = clipTextKeepBothEnds(previousScript || "", scriptMaxPreviousScriptChars);
+  const scriptClip = extractRelevantScriptContext(previousScript || "", scriptMaxPreviousScriptChars);
   return {
     summary: summaryClip.text,
     guidance: guidanceClip.text,
@@ -3847,6 +3931,8 @@ function buildScriptGenerationPayload(summary, patchGuidance, previousScript) {
     originalPreviousScriptChars: scriptClip.originalChars,
     previousScriptChars: scriptClip.usedChars,
     previousScriptTruncated: scriptClip.truncated,
+    previousScriptExtracted: scriptClip.extracted,
+    contextStrategy: scriptClip.strategy,
     totalInputChars: summaryClip.usedChars + guidanceClip.usedChars + scriptClip.usedChars
   };
 }

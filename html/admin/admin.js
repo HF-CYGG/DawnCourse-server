@@ -435,6 +435,12 @@ function normalizeRepairTraceMeta(meta) {
     scriptName: `${pickDefinedValue(info.scriptName, info.script_name) || ""}`,
     previousVersion: Number(pickDefinedValue(info.previousVersion, info.previous_version) || 0),
     sampleCount: Number(pickDefinedValue(info.sampleCount, info.sample_count) || 0),
+    includedSamples: Number(pickDefinedValue(info.includedSamples, info.included_samples) || 0),
+    droppedSamples: Number(pickDefinedValue(info.droppedSamples, info.dropped_samples) || 0),
+    truncatedSamples: Number(pickDefinedValue(info.truncatedSamples, info.truncated_samples) || 0),
+    inputChars: Number(pickDefinedValue(info.inputChars, info.input_chars) || 0),
+    originalInputChars: Number(pickDefinedValue(info.originalInputChars, info.original_input_chars) || 0),
+    timeoutBudgetMs: Number(pickDefinedValue(info.timeoutBudgetMs, info.timeout_budget_ms) || 0),
     statusCode: Number(pickDefinedValue(info.statusCode, info.status_code) || 0),
     errorCode: `${pickDefinedValue(info.errorCode, info.error_code) || ""}`,
     latencyMs: Number(pickDefinedValue(info.latencyMs, info.latency_ms, info.durationMs, info.duration_ms) || 0),
@@ -3052,6 +3058,14 @@ function buildRepairContextFromMeta(meta) {
   if (info.scriptName) parts.push(`脚本 ${info.scriptName}`);
   if (Number(info.previousVersion || 0) > 0) parts.push(`基于 v${Number(info.previousVersion || 0)}`);
   if (Number(info.sampleCount || 0) > 0) parts.push(`样本 ${Number(info.sampleCount || 0)}`);
+  if (Number(info.includedSamples || 0) > 0) parts.push(`纳入 ${Number(info.includedSamples || 0)} 条`);
+  if (Number(info.droppedSamples || 0) > 0) parts.push(`跳过 ${Number(info.droppedSamples || 0)} 条`);
+  if (Number(info.truncatedSamples || 0) > 0) parts.push(`截断 ${Number(info.truncatedSamples || 0)} 条`);
+  if (Number(info.inputChars || 0) > 0) parts.push(`输入 ${Number(info.inputChars || 0)} 字`);
+  if (Number(info.originalInputChars || 0) > Number(info.inputChars || 0)) {
+    parts.push(`原始 ${Number(info.originalInputChars || 0)} 字`);
+  }
+  if (Number(info.timeoutBudgetMs || 0) > 0) parts.push(`超时 ${Number(info.timeoutBudgetMs || 0)}ms`);
   if (Number(info.statusCode || 0) > 0) parts.push(`HTTP ${Number(info.statusCode || 0)}`);
   if ((info.errorCode || "").toString().trim()) parts.push(`错误码 ${String(info.errorCode).trim()}`);
   if (Number(info.latencyMs || 0) > 0) parts.push(`耗时 ${Number(info.latencyMs || 0)}ms`);
@@ -3069,6 +3083,14 @@ function buildRepairTraceContext(meta) {
   if (info.scriptName) parts.push(`脚本 ${info.scriptName}`);
   if (Number(info.previousVersion || 0) > 0) parts.push(`基于 v${Number(info.previousVersion || 0)}`);
   if (Number(info.sampleCount || 0) > 0) parts.push(`样本 ${Number(info.sampleCount || 0)}`);
+  if (Number(info.includedSamples || 0) > 0) parts.push(`纳入 ${Number(info.includedSamples || 0)} 条`);
+  if (Number(info.droppedSamples || 0) > 0) parts.push(`跳过 ${Number(info.droppedSamples || 0)} 条`);
+  if (Number(info.truncatedSamples || 0) > 0) parts.push(`截断 ${Number(info.truncatedSamples || 0)} 条`);
+  if (Number(info.inputChars || 0) > 0) parts.push(`输入 ${Number(info.inputChars || 0)} 字`);
+  if (Number(info.originalInputChars || 0) > Number(info.inputChars || 0)) {
+    parts.push(`原始 ${Number(info.originalInputChars || 0)} 字`);
+  }
+  if (Number(info.timeoutBudgetMs || 0) > 0) parts.push(`超时 ${Number(info.timeoutBudgetMs || 0)}ms`);
   if (Number(info.statusCode || 0) > 0) parts.push(`HTTP ${Number(info.statusCode || 0)}`);
   if ((info.errorCode || "").toString().trim()) parts.push(`错误码 ${String(info.errorCode).trim()}`);
   if (Number(info.latencyMs || 0) > 0) parts.push(`耗时 ${Number(info.latencyMs || 0)}ms`);

@@ -9,6 +9,10 @@ import { createClient } from "redis";
 const port = Number(process.env.PORT || 8080);
 // 单次请求超时
 const timeoutMs = Number(process.env.LLM_TIMEOUT_MS || 20000);
+// 模型 1 汇总相关请求单独放宽超时，避免真实样本汇总过早中断
+const summaryTimeoutMs = Number(process.env.LLM_SUMMARY_TIMEOUT_MS || Math.max(timeoutMs, 45000));
+// 模型 2 生成脚本通常更慢，允许比通用超时更长
+const scriptTimeoutMs = Number(process.env.LLM_SCRIPT_TIMEOUT_MS || Math.max(timeoutMs, 60000));
 // 请求体最大长度（默认 100 万字符，避免被动截断上传）
 const maxContentLength = Number(process.env.MAX_CONTENT_LENGTH || 1000000);
 // 任务缓存清理的最大存活时长
@@ -97,6 +101,10 @@ let summaryRequestExtraJson = (process.env.LLM_SUMMARY_REQUEST_EXTRA_JSON || "")
 let scriptRequestExtraJson = (process.env.LLM_SCRIPT_REQUEST_EXTRA_JSON || "").trim();
 let summaryRequestExtra = safeJson(summaryRequestExtraJson) || null;
 let scriptRequestExtra = safeJson(scriptRequestExtraJson) || null;
+// 模型 1 汇总输入裁剪策略：限制单样本长度、最大样本数与总字符数，降低超时概率
+const summaryMaxInputChars = Number(process.env.LLM_SUMMARY_MAX_INPUT_CHARS || 12000);
+const summaryMaxSampleChars = Number(process.env.LLM_SUMMARY_MAX_SAMPLE_CHARS || 2200);
+const summaryMaxSamples = Number(process.env.LLM_SUMMARY_MAX_SAMPLES || 6);
 // 强制指定 API 风格（chat 或 responses），留空则自动推断（例如 GPT-5 默认 responses）
 let summaryApiStyleRaw = (process.env.LLM_SUMMARY_API_STYLE || "").trim().toLowerCase();
 let scriptApiStyleRaw = (process.env.LLM_SCRIPT_API_STYLE || "").trim().toLowerCase();
@@ -2731,7 +2739,7 @@ async function processQueueCluster(schoolId, items, normalizedIssues, state, now
     const refreshed = (await getSchoolState(schoolId)) || state;
     return { state: refreshed, applied: true };
   }
-  const mergedText = items.map((item, index) => `【提交 ${index + 1}】\n${item.content}`).join("\n");
+  const mergedPayload = buildSummaryPayload(items);
   await appendRepairIssueTraceBatch(issueIds, {
     stage: "CANDIDATE_TEST_RUNNING",
     level: "info",
@@ -2743,10 +2751,16 @@ async function processQueueCluster(schoolId, items, normalizedIssues, state, now
       modelRole: "summary",
       provider: summaryProvider,
       model: summaryModel,
-      action: "summarize_submissions"
+      action: "summarize_submissions",
+      inputChars: mergedPayload.usedChars,
+      originalInputChars: mergedPayload.originalChars,
+      includedSamples: mergedPayload.includedSamples,
+      droppedSamples: mergedPayload.droppedSamples,
+      truncatedSamples: mergedPayload.truncatedSamples,
+      timeoutBudgetMs: summaryTimeoutMs
     }
   });
-  const summaryResult = await summarizeSubmissions(mergedText, schoolId);
+  const summaryResult = await summarizeSubmissions(mergedPayload.text, schoolId);
   if (!summaryResult.ok || !summaryResult.text) {
     await appendRepairIssueTraceBatch(issueIds, {
       stage: "CANDIDATE_TEST_RESULT",
@@ -2763,7 +2777,13 @@ async function processQueueCluster(schoolId, items, normalizedIssues, state, now
         statusCode: Number(summaryResult.statusCode || 0),
         latencyMs: Number(summaryResult.latencyMs || 0),
         errorCode: summaryResult.errorCode || "",
-        errorMessage: summaryResult.errorMessage || ""
+        errorMessage: summaryResult.errorMessage || "",
+        inputChars: mergedPayload.usedChars,
+        originalInputChars: mergedPayload.originalChars,
+        includedSamples: mergedPayload.includedSamples,
+        droppedSamples: mergedPayload.droppedSamples,
+        truncatedSamples: mergedPayload.truncatedSamples,
+        timeoutBudgetMs: summaryTimeoutMs
       }
     });
     return { state, applied: false };
@@ -2983,6 +3003,9 @@ async function processQueueCluster(schoolId, items, normalizedIssues, state, now
 async function processIndividualSummaries(schoolId, queue, issueIds = []) {
   const summaries = [];
   let lastSummaryFailure = null;
+  let totalOriginalChars = 0;
+  let totalUsedChars = 0;
+  let totalTruncatedSamples = 0;
   await appendRepairIssueTraceBatch(issueIds, {
     stage: "CANDIDATE_TEST_RUNNING",
     level: "info",
@@ -2994,11 +3017,16 @@ async function processIndividualSummaries(schoolId, queue, issueIds = []) {
       modelRole: "summary",
       provider: summaryProvider,
       model: summaryModel,
-      action: "summarize_submissions_single"
+      action: "summarize_submissions_single",
+      timeoutBudgetMs: summaryTimeoutMs
     }
   });
   for (const item of queue) {
-    const summaryResult = await summarizeSubmissions(item.content, schoolId);
+    const singlePayload = buildSummaryPayload([item]);
+    totalOriginalChars += singlePayload.originalChars;
+    totalUsedChars += singlePayload.usedChars;
+    totalTruncatedSamples += singlePayload.truncatedSamples;
+    const summaryResult = await summarizeSubmissions(singlePayload.text, schoolId);
     if (summaryResult.ok && summaryResult.text) {
       summaries.push(summaryResult.text);
     } else if (!lastSummaryFailure || summaryResult.failureReason) {
@@ -3021,7 +3049,11 @@ async function processIndividualSummaries(schoolId, queue, issueIds = []) {
         statusCode: Number(lastSummaryFailure?.statusCode || 0),
         latencyMs: Number(lastSummaryFailure?.latencyMs || 0),
         errorCode: lastSummaryFailure?.errorCode || "",
-        errorMessage: lastSummaryFailure?.errorMessage || ""
+        errorMessage: lastSummaryFailure?.errorMessage || "",
+        originalInputChars: totalOriginalChars,
+        inputChars: totalUsedChars,
+        truncatedSamples: totalTruncatedSamples,
+        timeoutBudgetMs: summaryTimeoutMs
       }
     });
     return;
@@ -3383,6 +3415,7 @@ async function callOpenAICompatible(systemPrompt, userPrompt, options = {}) {
   const requestApiKey = options.apiKey || apiKey;
   const requestModel = resolveModelName(options.model || model);
   const requestBaseUrl = options.baseUrl || baseUrl;
+  const requestTimeoutMs = Math.max(1000, Number(options.timeoutMs || timeoutMs));
   if (!requestApiKey) {
     return {
       ok: false,
@@ -3421,7 +3454,7 @@ async function callOpenAICompatible(systemPrompt, userPrompt, options = {}) {
   const body = mergeRequestExtras(baseBody, options.extra);
   const response = await httpPostJsonDetailed(endpoint, body, {
     Authorization: `Bearer ${requestApiKey}`
-  });
+  }, requestTimeoutMs);
   const json = safeJson(response.text || "");
   const text =
     apiStyle === "responses" ? extractResponsesText(json) : json?.choices?.[0]?.message?.content || "";
@@ -3452,6 +3485,7 @@ async function callGemini(systemPrompt, userPrompt, options = {}) {
   const requestApiKey = options.apiKey || apiKey;
   const requestModel = resolveModelName(options.model || model);
   const requestBaseUrl = options.baseUrl || baseUrl;
+  const requestTimeoutMs = Math.max(1000, Number(options.timeoutMs || timeoutMs));
   if (!requestApiKey) {
     return {
       ok: false,
@@ -3480,7 +3514,7 @@ async function callGemini(systemPrompt, userPrompt, options = {}) {
     baseBody.systemInstruction = { parts: [{ text: systemPrompt }] };
   }
   const body = mergeRequestExtras(baseBody, options.extra);
-  const response = await httpPostJsonDetailed(endpoint, body, {});
+  const response = await httpPostJsonDetailed(endpoint, body, {}, requestTimeoutMs);
   const json = safeJson(response.text || "");
   const text =
     json?.candidates?.[0]?.content?.parts?.[0]?.text ||
@@ -3672,6 +3706,73 @@ function formatModelFailureReason(result) {
   return errorMessage || errorCode || "unknown";
 }
 
+/**
+ * 安全裁剪单条样本文本，避免把过长 HTML 或日志全文直接送给模型 1。
+ */
+function clipSummarySampleText(value, maxChars = summaryMaxSampleChars) {
+  const text = (value || "").toString().trim();
+  if (!text) return { text: "", originalChars: 0, usedChars: 0, truncated: false };
+  if (text.length <= maxChars) {
+    return {
+      text,
+      originalChars: text.length,
+      usedChars: text.length,
+      truncated: false
+    };
+  }
+  return {
+    text: `${text.slice(0, Math.max(0, maxChars - 7))}\n[已截断]`,
+    originalChars: text.length,
+    usedChars: maxChars,
+    truncated: true
+  };
+}
+
+/**
+ * 构建模型 1 的汇总输入，限制样本数、单样本长度和总长度，优先保留最新样本。
+ */
+function buildSummaryPayload(items) {
+  const list = Array.isArray(items) ? items.slice(-summaryMaxSamples) : [];
+  const segments = [];
+  let originalChars = 0;
+  let usedChars = 0;
+  let includedSamples = 0;
+  let droppedSamples = Math.max(0, (Array.isArray(items) ? items.length : 0) - list.length);
+  let truncatedSamples = 0;
+  for (let index = 0; index < list.length; index += 1) {
+    const clipped = clipSummarySampleText(list[index]?.content || "");
+    originalChars += clipped.originalChars;
+    if (!clipped.text) continue;
+    const segment = `【提交 ${index + 1}】\n${clipped.text}`;
+    if (usedChars > 0 && usedChars + segment.length + 1 > summaryMaxInputChars) {
+      droppedSamples += list.length - index;
+      break;
+    }
+    if (usedChars === 0 && segment.length > summaryMaxInputChars) {
+      const available = Math.max(200, summaryMaxInputChars - "【提交 1】\n\n[已截断]".length);
+      const forced = clipSummarySampleText(list[index]?.content || "", available);
+      segments.push(`【提交 ${index + 1}】\n${forced.text}`);
+      usedChars += segments[0].length;
+      includedSamples += 1;
+      if (forced.truncated || clipped.truncated) truncatedSamples += 1;
+      droppedSamples += list.length - index - 1;
+      break;
+    }
+    segments.push(segment);
+    usedChars += segment.length + (segments.length > 1 ? 1 : 0);
+    includedSamples += 1;
+    if (clipped.truncated) truncatedSamples += 1;
+  }
+  return {
+    text: segments.join("\n"),
+    originalChars,
+    usedChars: segments.join("\n").length,
+    includedSamples,
+    droppedSamples,
+    truncatedSamples
+  };
+}
+
 async function summarizeSubmissions(content, schoolId) {
   const systemPrompt =
     "你是课表解析总结助手，目标是提炼教务系统课表页面结构的关键信息。" +
@@ -3690,7 +3791,8 @@ async function summarizeSubmissions(content, schoolId) {
           baseUrl: summaryBaseUrl,
           usageType: "summary",
           extra: summaryRequestExtra,
-          apiStyle: summaryApiStyleRaw
+          apiStyle: summaryApiStyleRaw,
+          timeoutMs: summaryTimeoutMs
         })
       : await callOpenAICompatible(systemPrompt, userPrompt, {
           provider: summaryProvider,
@@ -3699,7 +3801,8 @@ async function summarizeSubmissions(content, schoolId) {
           baseUrl: summaryBaseUrl,
           usageType: "summary",
           extra: summaryRequestExtra,
-          apiStyle: summaryApiStyleRaw
+          apiStyle: summaryApiStyleRaw,
+          timeoutMs: summaryTimeoutMs
         });
   const latencyMs = Date.now() - startTime;
   if (!rawText?.text) {
@@ -3772,7 +3875,8 @@ async function normalizeIssueBatch(items, schoolId) {
           baseUrl: summaryBaseUrl,
           usageType: "summary",
           extra: summaryRequestExtra,
-          apiStyle: summaryApiStyleRaw
+          apiStyle: summaryApiStyleRaw,
+          timeoutMs: summaryTimeoutMs
         })
       : await callOpenAICompatible(systemPrompt, userPrompt, {
           provider: summaryProvider,
@@ -3781,7 +3885,8 @@ async function normalizeIssueBatch(items, schoolId) {
           baseUrl: summaryBaseUrl,
           usageType: "summary",
           extra: summaryRequestExtra,
-          apiStyle: summaryApiStyleRaw
+          apiStyle: summaryApiStyleRaw,
+          timeoutMs: summaryTimeoutMs
         });
   const rawTextContent = rawText?.text || "";
   const parsed = rawTextContent ? safeJson(rawTextContent) : null;
@@ -3920,7 +4025,8 @@ async function generateParserScript(summary, patchGuidance, previousScript, scho
           baseUrl: scriptBaseUrl,
           usageType: "script",
           extra: scriptRequestExtra,
-          apiStyle: scriptApiStyleRaw
+          apiStyle: scriptApiStyleRaw,
+          timeoutMs: scriptTimeoutMs
         })
       : await callOpenAICompatible(systemPrompt, userPrompt, {
           provider: scriptProvider,
@@ -3929,7 +4035,8 @@ async function generateParserScript(summary, patchGuidance, previousScript, scho
           baseUrl: scriptBaseUrl,
           usageType: "script",
           extra: scriptRequestExtra,
-          apiStyle: scriptApiStyleRaw
+          apiStyle: scriptApiStyleRaw,
+          timeoutMs: scriptTimeoutMs
         });
   const latencyMs = Date.now() - startTime;
   if (!rawText?.text) {
@@ -6859,7 +6966,8 @@ async function classifyFailureByModel({
           baseUrl: summaryBaseUrl,
           usageType: "summary",
           extra: summaryRequestExtra,
-          apiStyle: summaryApiStyleRaw
+          apiStyle: summaryApiStyleRaw,
+          timeoutMs: summaryTimeoutMs
         })
       : await callOpenAICompatible(systemPrompt, userPrompt, {
           provider: summaryProvider,
@@ -6868,7 +6976,8 @@ async function classifyFailureByModel({
           baseUrl: summaryBaseUrl,
           usageType: "summary",
           extra: summaryRequestExtra,
-          apiStyle: summaryApiStyleRaw
+          apiStyle: summaryApiStyleRaw,
+          timeoutMs: summaryTimeoutMs
         });
   const objectText = sliceJson(rawText?.text || "", "{", "}");
   const parsed = objectText ? safeJson(objectText) : null;
@@ -7433,9 +7542,9 @@ function buildScriptMetaKey(scriptName) {
   return `script:meta:${sanitizeScriptName(scriptName)}`;
 }
 
-async function httpGetJson(url, headers) {
+async function httpGetJson(url, headers, requestTimeoutMs = timeoutMs) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const timeout = setTimeout(() => controller.abort(), requestTimeoutMs);
   try {
     const response = await fetch(url, {
       method: "GET",
@@ -7457,9 +7566,9 @@ async function httpGetJson(url, headers) {
 /**
  * 发送 JSON 请求
  */
-async function httpPostJson(url, body, headers) {
+async function httpPostJson(url, body, headers, requestTimeoutMs = timeoutMs) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const timeout = setTimeout(() => controller.abort(), requestTimeoutMs);
   try {
     const response = await fetch(url, {
       method: "POST",
@@ -7479,9 +7588,9 @@ async function httpPostJson(url, body, headers) {
   }
 }
 
-async function httpPostJsonDetailed(url, body, headers) {
+async function httpPostJsonDetailed(url, body, headers, requestTimeoutMs = timeoutMs) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const timeout = setTimeout(() => controller.abort(), requestTimeoutMs);
   const startedAt = Date.now();
   try {
     const response = await fetch(url, {

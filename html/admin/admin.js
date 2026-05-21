@@ -441,6 +441,17 @@ function normalizeRepairTraceMeta(meta) {
     inputChars: Number(pickDefinedValue(info.inputChars, info.input_chars) || 0),
     originalInputChars: Number(pickDefinedValue(info.originalInputChars, info.original_input_chars) || 0),
     timeoutBudgetMs: Number(pickDefinedValue(info.timeoutBudgetMs, info.timeout_budget_ms) || 0),
+    summaryChars: Number(pickDefinedValue(info.summaryChars, info.summary_chars) || 0),
+    originalSummaryChars: Number(pickDefinedValue(info.originalSummaryChars, info.original_summary_chars) || 0),
+    guidanceChars: Number(pickDefinedValue(info.guidanceChars, info.guidance_chars) || 0),
+    originalGuidanceChars: Number(pickDefinedValue(info.originalGuidanceChars, info.original_guidance_chars) || 0),
+    previousScriptChars: Number(pickDefinedValue(info.previousScriptChars, info.previous_script_chars) || 0),
+    originalPreviousScriptChars: Number(
+      pickDefinedValue(info.originalPreviousScriptChars, info.original_previous_script_chars) || 0
+    ),
+    truncatedSummary: pickDefinedValue(info.truncatedSummary, info.truncated_summary) === true,
+    truncatedGuidance: pickDefinedValue(info.truncatedGuidance, info.truncated_guidance) === true,
+    truncatedPreviousScript: pickDefinedValue(info.truncatedPreviousScript, info.truncated_previous_script) === true,
     statusCode: Number(pickDefinedValue(info.statusCode, info.status_code) || 0),
     errorCode: `${pickDefinedValue(info.errorCode, info.error_code) || ""}`,
     latencyMs: Number(pickDefinedValue(info.latencyMs, info.latency_ms, info.durationMs, info.duration_ms) || 0),
@@ -1760,7 +1771,7 @@ function renderScriptReleaseGuide(list) {
 }
 function renderRuntimeLogSummary(payload) {
   if (!runtimeLogSummaryCards || !runtimeLogCallout) return;
-  const info = normalizeRuntimeLogPayload(payload, runtimeLogSource?.value || "all", runtimeLogLimit?.value || 1000);
+  const info = normalizeRuntimeLogPayload(payload, runtimeLogSource?.value || "all", runtimeLogLimit?.value || 500);
   const source = info.source;
   const lines = info.lines;
   const counts = info.counts;
@@ -1776,7 +1787,7 @@ function renderRuntimeLogSummary(payload) {
     {
       title: "实际加载",
       value: `${formatCount(lines.length)} 行`,
-      sub: `读取上限 ${formatCount(info.requestedLimit || runtimeLogLimit?.value || 1000)} 行`
+      sub: `读取上限 ${formatCount(info.requestedLimit || runtimeLogLimit?.value || 500)} 行`
     },
     {
       title: "有内容来源",
@@ -2270,7 +2281,7 @@ async function createUser() {
 async function loadRuntimeLogs() {
   if (!runtimeLogContent) return false;
   const source = (runtimeLogSource?.value || "all").toString();
-  const limit = Math.max(100, Math.min(20000, Number(runtimeLogLimit?.value || 1000)));
+  const limit = Math.max(100, Math.min(20000, Number(runtimeLogLimit?.value || 500)));
   runtimeLogContent.textContent = "日志加载中...";
   if (runtimeLogMeta) runtimeLogMeta.textContent = "正在读取日志来源与结果说明…";
   if (runtimeLogSummaryCards) runtimeLogSummaryCards.innerHTML = "";
@@ -3065,6 +3076,20 @@ function buildRepairContextFromMeta(meta) {
   if (Number(info.originalInputChars || 0) > Number(info.inputChars || 0)) {
     parts.push(`原始 ${Number(info.originalInputChars || 0)} 字`);
   }
+  if (Number(info.summaryChars || 0) > 0) parts.push(`总结 ${Number(info.summaryChars || 0)} 字`);
+  if (Number(info.guidanceChars || 0) > 0) parts.push(`指令 ${Number(info.guidanceChars || 0)} 字`);
+  if (Number(info.previousScriptChars || 0) > 0) parts.push(`旧脚本 ${Number(info.previousScriptChars || 0)} 字`);
+  if (info.truncatedSummary || info.truncatedGuidance || info.truncatedPreviousScript) {
+    parts.push(
+      `已裁剪 ${[
+        info.truncatedSummary ? "总结" : "",
+        info.truncatedGuidance ? "指令" : "",
+        info.truncatedPreviousScript ? "旧脚本" : ""
+      ]
+        .filter(Boolean)
+        .join("/")}`
+    );
+  }
   if (Number(info.timeoutBudgetMs || 0) > 0) parts.push(`超时 ${Number(info.timeoutBudgetMs || 0)}ms`);
   if (Number(info.statusCode || 0) > 0) parts.push(`HTTP ${Number(info.statusCode || 0)}`);
   if ((info.errorCode || "").toString().trim()) parts.push(`错误码 ${String(info.errorCode).trim()}`);
@@ -3089,6 +3114,20 @@ function buildRepairTraceContext(meta) {
   if (Number(info.inputChars || 0) > 0) parts.push(`输入 ${Number(info.inputChars || 0)} 字`);
   if (Number(info.originalInputChars || 0) > Number(info.inputChars || 0)) {
     parts.push(`原始 ${Number(info.originalInputChars || 0)} 字`);
+  }
+  if (Number(info.summaryChars || 0) > 0) parts.push(`总结 ${Number(info.summaryChars || 0)} 字`);
+  if (Number(info.guidanceChars || 0) > 0) parts.push(`指令 ${Number(info.guidanceChars || 0)} 字`);
+  if (Number(info.previousScriptChars || 0) > 0) parts.push(`旧脚本 ${Number(info.previousScriptChars || 0)} 字`);
+  if (info.truncatedSummary || info.truncatedGuidance || info.truncatedPreviousScript) {
+    parts.push(
+      `已裁剪 ${[
+        info.truncatedSummary ? "总结" : "",
+        info.truncatedGuidance ? "指令" : "",
+        info.truncatedPreviousScript ? "旧脚本" : ""
+      ]
+        .filter(Boolean)
+        .join("/")}`
+    );
   }
   if (Number(info.timeoutBudgetMs || 0) > 0) parts.push(`超时 ${Number(info.timeoutBudgetMs || 0)}ms`);
   if (Number(info.statusCode || 0) > 0) parts.push(`HTTP ${Number(info.statusCode || 0)}`);

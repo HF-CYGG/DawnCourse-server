@@ -105,6 +105,10 @@ let scriptRequestExtra = safeJson(scriptRequestExtraJson) || null;
 const summaryMaxInputChars = Number(process.env.LLM_SUMMARY_MAX_INPUT_CHARS || 12000);
 const summaryMaxSampleChars = Number(process.env.LLM_SUMMARY_MAX_SAMPLE_CHARS || 2200);
 const summaryMaxSamples = Number(process.env.LLM_SUMMARY_MAX_SAMPLES || 6);
+// 模型 2 输入裁剪策略：重点限制总结、修复指令和旧脚本长度，降低完整脚本生成超时概率
+const scriptMaxSummaryChars = Number(process.env.LLM_SCRIPT_MAX_SUMMARY_CHARS || 2200);
+const scriptMaxGuidanceChars = Number(process.env.LLM_SCRIPT_MAX_GUIDANCE_CHARS || 1600);
+const scriptMaxPreviousScriptChars = Number(process.env.LLM_SCRIPT_MAX_PREVIOUS_SCRIPT_CHARS || 9000);
 // 强制指定 API 风格（chat 或 responses），留空则自动推断（例如 GPT-5 默认 responses）
 let summaryApiStyleRaw = (process.env.LLM_SUMMARY_API_STYLE || "").trim().toLowerCase();
 let scriptApiStyleRaw = (process.env.LLM_SCRIPT_API_STYLE || "").trim().toLowerCase();
@@ -2868,7 +2872,8 @@ async function processQueueCluster(schoolId, items, normalizedIssues, state, now
       modelRole: "script_repair",
       provider: scriptProvider,
       model: scriptModel,
-      action: "generate_candidate_script"
+      action: "generate_candidate_script",
+      timeoutBudgetMs: scriptTimeoutMs
     }
   });
   const generatedScriptResult = await generateParserScript(summary, patchGuidance, previousScript, schoolId);
@@ -2890,7 +2895,18 @@ async function processQueueCluster(schoolId, items, normalizedIssues, state, now
         statusCode: Number(generatedScriptResult.statusCode || 0),
         latencyMs: Number(generatedScriptResult.latencyMs || 0),
         errorCode: generatedScriptResult.errorCode || "",
-        errorMessage: generatedScriptResult.errorMessage || ""
+        errorMessage: generatedScriptResult.errorMessage || "",
+        timeoutBudgetMs: scriptTimeoutMs,
+        inputChars: Number(generatedScriptResult.inputMeta?.totalInputChars || 0),
+        summaryChars: Number(generatedScriptResult.inputMeta?.summaryChars || 0),
+        originalSummaryChars: Number(generatedScriptResult.inputMeta?.originalSummaryChars || 0),
+        guidanceChars: Number(generatedScriptResult.inputMeta?.guidanceChars || 0),
+        originalGuidanceChars: Number(generatedScriptResult.inputMeta?.originalGuidanceChars || 0),
+        previousScriptChars: Number(generatedScriptResult.inputMeta?.previousScriptChars || 0),
+        originalPreviousScriptChars: Number(generatedScriptResult.inputMeta?.originalPreviousScriptChars || 0),
+        truncatedSummary: Boolean(generatedScriptResult.inputMeta?.summaryTruncated),
+        truncatedGuidance: Boolean(generatedScriptResult.inputMeta?.guidanceTruncated),
+        truncatedPreviousScript: Boolean(generatedScriptResult.inputMeta?.previousScriptTruncated)
       }
     });
     return { state, applied: false };
@@ -3112,7 +3128,8 @@ async function processIndividualSummaries(schoolId, queue, issueIds = []) {
       modelRole: "script_repair",
       provider: scriptProvider,
       model: scriptModel,
-      action: "generate_candidate_script_single"
+      action: "generate_candidate_script_single",
+      timeoutBudgetMs: scriptTimeoutMs
     }
   });
   const generatedScriptResult = await generateParserScript(mergedSummary, patchGuidance, previousScript, schoolId);
@@ -3134,7 +3151,18 @@ async function processIndividualSummaries(schoolId, queue, issueIds = []) {
         statusCode: Number(generatedScriptResult.statusCode || 0),
         latencyMs: Number(generatedScriptResult.latencyMs || 0),
         errorCode: generatedScriptResult.errorCode || "",
-        errorMessage: generatedScriptResult.errorMessage || ""
+        errorMessage: generatedScriptResult.errorMessage || "",
+        timeoutBudgetMs: scriptTimeoutMs,
+        inputChars: Number(generatedScriptResult.inputMeta?.totalInputChars || 0),
+        summaryChars: Number(generatedScriptResult.inputMeta?.summaryChars || 0),
+        originalSummaryChars: Number(generatedScriptResult.inputMeta?.originalSummaryChars || 0),
+        guidanceChars: Number(generatedScriptResult.inputMeta?.guidanceChars || 0),
+        originalGuidanceChars: Number(generatedScriptResult.inputMeta?.originalGuidanceChars || 0),
+        previousScriptChars: Number(generatedScriptResult.inputMeta?.previousScriptChars || 0),
+        originalPreviousScriptChars: Number(generatedScriptResult.inputMeta?.originalPreviousScriptChars || 0),
+        truncatedSummary: Boolean(generatedScriptResult.inputMeta?.summaryTruncated),
+        truncatedGuidance: Boolean(generatedScriptResult.inputMeta?.guidanceTruncated),
+        truncatedPreviousScript: Boolean(generatedScriptResult.inputMeta?.previousScriptTruncated)
       }
     });
     return;
@@ -3773,6 +3801,56 @@ function buildSummaryPayload(items) {
   };
 }
 
+/**
+ * 从中间裁剪长文本，尽量同时保留头尾信息，适合旧脚本这类首尾都可能有关键线索的内容。
+ */
+function clipTextKeepBothEnds(value, maxChars, truncatedLabel = "\n/* 已截断 */\n") {
+  const text = (value || "").toString().trim();
+  if (!text) return { text: "", originalChars: 0, usedChars: 0, truncated: false };
+  if (text.length <= maxChars) {
+    return {
+      text,
+      originalChars: text.length,
+      usedChars: text.length,
+      truncated: false
+    };
+  }
+  const budget = Math.max(0, maxChars - truncatedLabel.length);
+  const head = Math.max(200, Math.floor(budget * 0.65));
+  const tail = Math.max(120, budget - head);
+  const clipped = `${text.slice(0, head)}${truncatedLabel}${text.slice(-tail)}`;
+  return {
+    text: clipped,
+    originalChars: text.length,
+    usedChars: clipped.length,
+    truncated: true
+  };
+}
+
+/**
+ * 构建模型 2 的生成输入，分别压缩总结、修复指令与旧脚本，并记录裁剪统计。
+ */
+function buildScriptGenerationPayload(summary, patchGuidance, previousScript) {
+  const summaryClip = clipSummarySampleText(summary || "", scriptMaxSummaryChars);
+  const guidanceClip = clipSummarySampleText(patchGuidance || "", scriptMaxGuidanceChars);
+  const scriptClip = clipTextKeepBothEnds(previousScript || "", scriptMaxPreviousScriptChars);
+  return {
+    summary: summaryClip.text,
+    guidance: guidanceClip.text,
+    previousScript: scriptClip.text,
+    originalSummaryChars: summaryClip.originalChars,
+    summaryChars: summaryClip.usedChars,
+    summaryTruncated: summaryClip.truncated,
+    originalGuidanceChars: guidanceClip.originalChars,
+    guidanceChars: guidanceClip.usedChars,
+    guidanceTruncated: guidanceClip.truncated,
+    originalPreviousScriptChars: scriptClip.originalChars,
+    previousScriptChars: scriptClip.usedChars,
+    previousScriptTruncated: scriptClip.truncated,
+    totalInputChars: summaryClip.usedChars + guidanceClip.usedChars + scriptClip.usedChars
+  };
+}
+
 async function summarizeSubmissions(content, schoolId) {
   const systemPrompt =
     "你是课表解析总结助手，目标是提炼教务系统课表页面结构的关键信息。" +
@@ -3948,7 +4026,8 @@ async function generatePatchGuidance(summary, schoolId) {
           baseUrl: summaryBaseUrl,
           usageType: "summary",
           extra: summaryRequestExtra,
-          apiStyle: summaryApiStyleRaw
+          apiStyle: summaryApiStyleRaw,
+          timeoutMs: summaryTimeoutMs
         })
       : await callOpenAICompatible(systemPrompt, userPrompt, {
           provider: summaryProvider,
@@ -3957,7 +4036,8 @@ async function generatePatchGuidance(summary, schoolId) {
           baseUrl: summaryBaseUrl,
           usageType: "summary",
           extra: summaryRequestExtra,
-          apiStyle: summaryApiStyleRaw
+          apiStyle: summaryApiStyleRaw,
+          timeoutMs: summaryTimeoutMs
         });
   const latencyMs = Date.now() - startTime;
   if (!rawText?.text) {
@@ -4003,6 +4083,7 @@ async function generatePatchGuidance(summary, schoolId) {
  * 输出：可执行的 JavaScript 字符串
  */
 async function generateParserScript(summary, patchGuidance, previousScript, schoolId) {
+  const payload = buildScriptGenerationPayload(summary, patchGuidance, previousScript);
   const systemPrompt =
     "你是教务系统解析脚本工程师，输出必须是可直接运行的 JavaScript 解析脚本。" +
     "脚本运行环境为 QuickJS，无 DOM API，仅可使用字符串与正则。" +
@@ -4011,9 +4092,9 @@ async function generateParserScript(summary, patchGuidance, previousScript, scho
     "请根据以下结构总结修复或生成解析脚本，要求输出完整 JS 脚本内容。" +
     "脚本必须返回 JSON 字符串，结构兼容 ParsedCourse 字段。" +
     "若提供旧脚本，请在其基础上修复，保留工具函数与已有规范。\n" +
-    `【结构总结】\n${summary}\n` +
-    `【修复指令】\n${patchGuidance || "无"}\n` +
-    `【旧脚本】\n${previousScript || "无"}\n` +
+    `【结构总结】\n${payload.summary || "无"}\n` +
+    `【修复指令】\n${payload.guidance || "无"}\n` +
+    `【旧脚本】\n${payload.previousScript || "无"}\n` +
     "请仅输出 JS 源码。";
   const startTime = Date.now();
   const rawText =
@@ -4053,7 +4134,8 @@ async function generateParserScript(summary, patchGuidance, previousScript, scho
       latencyMs: Number(rawText?.latencyMs || latencyMs),
       errorCode: (rawText?.errorCode || "").toString(),
       errorMessage: (rawText?.errorMessage || "").toString(),
-      failureReason: formatModelFailureReason(rawText)
+      failureReason: formatModelFailureReason(rawText),
+      inputMeta: payload
     };
   }
   await recordMetric("script_success", latencyMs, scriptCostPerCall);
@@ -4069,7 +4151,8 @@ async function generateParserScript(summary, patchGuidance, previousScript, scho
     latencyMs: Number(rawText?.latencyMs || latencyMs),
     errorCode: "",
     errorMessage: "",
-    failureReason: ""
+    failureReason: "",
+    inputMeta: payload
   };
 }
 

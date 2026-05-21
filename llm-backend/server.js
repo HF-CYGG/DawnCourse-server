@@ -1102,8 +1102,18 @@ const server = http.createServer((req, res) => {
     if (!content) {
       return sendJson(res, 404, { code: 404, msg: "内容不存在或已过期" });
     }
-    const meta = await getScriptMeta(scriptName);
-    return sendJson(res, 200, { code: 200, data: { content, meta } });
+    const currentMeta = await getScriptMeta(scriptName);
+    const meta = await buildAdminScriptContentMeta(scriptName, source, version, currentMeta);
+    return sendJson(res, 200, {
+      code: 200,
+      data: {
+        content,
+        meta,
+        requestedSource: source,
+        resolvedSource: meta.contentSource || source,
+        requestedVersion: version
+      }
+    });
   }
   if (req.method === "GET" && url.pathname === "/api/v1/admin/script_history") {
     const auth = await requireAdminAuth(req);
@@ -1830,9 +1840,49 @@ async function listRepairIssues(limit = 100) {
   for (const issueId of ids) {
     const raw = await redisClient.get(buildRepairIssueKey(issueId));
     const issue = raw ? safeJson(raw) : null;
-    if (issue) items.push(issue);
+    if (issue) items.push(buildRepairIssueAdminView(issue));
   }
   return items.sort((a, b) => Number(b.lastSeenAt || 0) - Number(a.lastSeenAt || 0)).slice(0, limit);
+}
+
+/**
+ * 为 Repair Issues 页面补充扁平展示字段
+ *
+ * 兼容策略：
+ * - 保留原始 issue / lastAttempt 结构，避免已有调用方失效
+ * - 同时补充前端更容易直接消费的 lastXxx 字段，减少各页面重复解析逻辑
+ */
+function buildRepairIssueAdminView(issue) {
+  const info = issue && typeof issue === "object" ? { ...issue } : {};
+  const lastAttempt = normalizeParserAttempt(info.lastAttempt || info.last_attempt || {});
+  const lastStatusCode = Number(info.lastStatusCode || info.last_status_code || 0);
+  const lastErrorCode = (info.lastErrorCode || info.last_error_code || "").toString();
+  const lastDurationMs = Number(info.lastDurationMs || info.last_duration_ms || 0);
+  const lastParserName = (info.lastParserName || info.last_parser_name || "").toString();
+  const lastParserVersion = Number(info.lastParserVersion || info.last_parser_version || 0);
+  const lastScriptSource = (info.lastScriptSource || info.last_script_source || "").toString();
+  const lastResultCount = Number(info.lastResultCount || info.last_result_count || 0);
+  const lastConfidence = Number(info.lastConfidence || info.last_confidence || 0);
+  const lastSchemaValidRaw = info.lastSchemaValid ?? info.last_schema_valid;
+  return {
+    ...info,
+    lastAttempt,
+    lastStatusCode: lastStatusCode || Number(lastAttempt.statusCode || 0),
+    lastErrorCode: lastErrorCode || (lastAttempt.safeErrorCode || "").toString(),
+    lastDurationMs: lastDurationMs || Number(lastAttempt.durationMs || 0),
+    lastParserName: lastParserName || (lastAttempt.parserName || "").toString(),
+    lastParserVersion: lastParserVersion || Number(lastAttempt.parserVersion || 0),
+    lastScriptSource: lastScriptSource || (lastAttempt.scriptSource || "").toString(),
+    lastResultCount: lastResultCount || Number(lastAttempt.resultCount || 0),
+    lastConfidence: lastConfidence || Number(lastAttempt.confidence || 0),
+    lastSchemaValid:
+      typeof lastSchemaValidRaw === "boolean"
+        ? lastSchemaValidRaw
+        : typeof lastAttempt.schemaValid === "boolean"
+          ? lastAttempt.schemaValid
+          : null,
+    displaySourceHost: (info.displaySourceHost || info.display_source_host || info.sourceUrlHost || "").toString()
+  };
 }
 
 async function getRepairIssueDetail(issueId) {
@@ -1872,13 +1922,26 @@ async function getRepairIssueDetail(issueId) {
   const attempts = issue.lastParseSessionId ? await readParserAttempts(issue.lastParseSessionId) : [];
   const timelineData = await getRepairIssueTimeline(issueId, 120);
   const logsData = await getRepairIssueLogs(issueId, { limit: 120, cursor: 0 });
+  const sampleSummary = {
+    totalCount: samples.length,
+    restoredCount: samples.filter((item) => item?.restoredFromArchive === true).length,
+    latestCreatedAt: Math.max(0, ...samples.map((item) => Number(item?.createdAt || 0)))
+  };
+  const attemptSummary = {
+    totalCount: attempts.length,
+    successCount: attempts.filter((item) => item?.success === true).length,
+    failureCount: attempts.filter((item) => item?.success !== true).length,
+    latestParserName: (attempts[attempts.length - 1]?.parserName || "").toString()
+  };
   return {
-    issue,
+    issue: buildRepairIssueAdminView(issue),
     samples,
     attempts,
     timeline: timelineData?.list || [],
     logs: logsData?.list || [],
-    logsPage: logsData || { list: [], cursor: 0, nextCursor: null, total: 0 }
+    logsPage: logsData || { list: [], cursor: 0, nextCursor: null, total: 0 },
+    sampleSummary,
+    attemptSummary
   };
 }
 
@@ -6184,30 +6247,50 @@ async function getRuntimeLogLines(source, limit) {
   const files = {
     backend: backendMirrorLogFile,
     nginx_access: nginxAccessLogFile,
-    nginx_error: nginxErrorLogFile
+    nginx_error: nginxErrorLogFile,
+    admin: "adminLogBuffer"
+  };
+  const sourceLabels = {
+    backend: "llm-backend",
+    nginx_access: "nginx 访问日志",
+    nginx_error: "nginx 错误日志",
+    admin: "管理后台缓存"
+  };
+  const buildRuntimeLogPayload = (resolvedSource, lines, sourceCounts, missingSources) => {
+    const availableSources = Object.keys(files);
+    const safeCounts = sourceCounts || {};
+    const safeMissingSources = Array.isArray(missingSources) ? missingSources : [];
+    return {
+      source: resolvedSource,
+      requestedSource: source,
+      requestedLimit: limit,
+      actualLimit: limit,
+      loadedAt: Date.now(),
+      lineCount: Array.isArray(lines) ? lines.length : 0,
+      availableSources,
+      sourceDetails: availableSources.map((key) => ({
+        key,
+        label: sourceLabels[key] || key,
+        path: files[key] || "",
+        lineCount: Number(safeCounts[key] || 0),
+        missing: safeMissingSources.includes(key)
+      })),
+      files,
+      lines,
+      sourceCounts: safeCounts,
+      missingSources: safeMissingSources
+    };
   };
   const memoryLines = adminLogBuffer.slice(-limit).map((item) => {
     const extra = item?.extra ? ` ${JSON.stringify(item.extra)}` : "";
     return `[admin:${item.level}] ${formatTime(item?.createdAt || 0)} ${item?.message || ""}${extra}`;
   });
   if (source === "admin") {
-    return {
-      source,
-      files,
-      lines: memoryLines.slice(-limit),
-      sourceCounts: { admin: Math.min(memoryLines.length, limit) },
-      missingSources: []
-    };
+    return buildRuntimeLogPayload(source, memoryLines.slice(-limit), { admin: Math.min(memoryLines.length, limit) }, []);
   }
-  if (source in files) {
+  if (source in files && source !== "admin") {
     const result = await readTailLinesFromFile(files[source], limit);
-    return {
-      source,
-      files,
-      lines: result.lines,
-      sourceCounts: { [source]: result.lines.length },
-      missingSources: result.exists ? [] : [source]
-    };
+    return buildRuntimeLogPayload(source, result.lines, { [source]: result.lines.length }, result.exists ? [] : [source]);
   }
   const backendResult = await readTailLinesFromFile(files.backend, limit);
   const accessResult = await readTailLinesFromFile(files.nginx_access, limit);
@@ -6225,17 +6308,104 @@ async function getRuntimeLogLines(source, limit) {
   if (!backendResult.exists) missingSources.push("backend");
   if (!accessResult.exists) missingSources.push("nginx_access");
   if (!errorResult.exists) missingSources.push("nginx_error");
-  return {
-    source: "all",
-    files,
-    lines: merged,
-    sourceCounts: {
+  return buildRuntimeLogPayload(
+    "all",
+    merged,
+    {
       backend: backendLines.length,
       nginx_access: accessLines.length,
       nginx_error: errorLines.length,
       admin: memoryLines.length
     },
     missingSources
+  );
+}
+
+/**
+ * 提取脚本历史中的核心元信息
+ *
+ * 兼容旧事件结构：
+ * - 旧事件可能把 releaseStage / appliedBy 放在顶层
+ * - 新事件则以 meta 嵌套保存
+ */
+function extractScriptHistoryMeta(entry) {
+  const info = entry && typeof entry === "object" ? entry : {};
+  const meta = info.meta && typeof info.meta === "object" ? info.meta : {};
+  return {
+    version: Number(meta.version || info.version || info.scriptVersion || info.script_version || 0),
+    parentVersion: Number(meta.parentVersion || info.parentVersion || info.parent_version || 0),
+    releaseStage: (meta.releaseStage || meta.release_stage || info.releaseStage || info.release_stage || "").toString(),
+    appliedBy: (meta.appliedBy || meta.applied_by || info.appliedBy || info.applied_by || "").toString(),
+    updatedAt: Number(meta.updatedAt || meta.updated_at || info.updatedAt || info.updated_at || info.createdAt || 0)
+  };
+}
+
+/**
+ * 为脚本内容接口生成“来源感知”的 meta
+ *
+ * 目的：
+ * - current / pending / backup 三种来源在弹窗中展示不同版本含义
+ * - 兼容老数据下缺少独立 meta 的情况，仍给出可读的版本提示
+ */
+async function buildAdminScriptContentMeta(scriptName, source, version, currentMeta) {
+  const baseMeta =
+    currentMeta && typeof currentMeta === "object"
+      ? { ...currentMeta }
+      : {
+          scriptName: sanitizeScriptName(scriptName),
+          version: 0,
+          parentVersion: 0,
+          releaseStage: "active",
+          updatedAt: 0,
+          appliedBy: ""
+        };
+  if (source === "current") {
+    return {
+      ...baseMeta,
+      contentSource: "current",
+      requestedVersion: Number(version || 0),
+      resolvedVersion: Number(baseMeta.version || 0)
+    };
+  }
+  const history = await getScriptHistory(scriptName, Math.min(120, scriptHistoryLimit));
+  if (source === "pending") {
+    const pendingEntry =
+      history.find((item) => extractScriptHistoryMeta(item).releaseStage === "pending") || null;
+    const pendingMeta = extractScriptHistoryMeta(pendingEntry);
+    const inferredVersion = Number(pendingMeta.version || 0) || Number(baseMeta.version || 0) + 1;
+    return {
+      ...baseMeta,
+      contentSource: "pending",
+      releaseStage: "pending",
+      version: inferredVersion,
+      parentVersion: Number(pendingMeta.parentVersion || baseMeta.version || 0),
+      updatedAt: Number(pendingMeta.updatedAt || pendingEntry?.createdAt || baseMeta.updatedAt || 0),
+      appliedBy: pendingMeta.appliedBy || baseMeta.appliedBy || "",
+      resolvedVersion: inferredVersion,
+      virtualVersion: Number(pendingMeta.version || 0) <= 0
+    };
+  }
+  if (source === "backup") {
+    const targetVersion = Number(version || 0);
+    const backupEntry =
+      history.find((item) => extractScriptHistoryMeta(item).version === targetVersion) || null;
+    const backupMeta = extractScriptHistoryMeta(backupEntry);
+    return {
+      ...baseMeta,
+      contentSource: "backup",
+      releaseStage: backupMeta.releaseStage || "rollback",
+      version: targetVersion || Number(backupMeta.version || 0),
+      parentVersion: Number(backupMeta.parentVersion || Math.max(0, targetVersion - 1)),
+      updatedAt: Number(backupMeta.updatedAt || backupEntry?.createdAt || 0),
+      appliedBy: backupMeta.appliedBy || baseMeta.appliedBy || "",
+      resolvedVersion: targetVersion || Number(backupMeta.version || 0)
+    };
+  }
+  return {
+    ...baseMeta,
+    contentSource: (source || "current").toString(),
+    requestedVersion: Number(version || 0),
+    resolvedVersion: Number(baseMeta.version || 0)
   };
 }
 

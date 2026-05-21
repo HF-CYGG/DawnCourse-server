@@ -1,9 +1,10 @@
+<!-- 文件说明：Dawn Course 服务端运维后台首页，负责承载导航、页面区块、运维模块入口与主要操作按钮。 -->
 <!DOCTYPE html>
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Dawn Course 兜底解析监控</title>
+    <title>Dawn Course 运维后台</title>
     <link rel="stylesheet" href="admin.css">
     <script src="admin.js" defer></script>
   </head>
@@ -11,26 +12,26 @@
     <div class="app-wrapper">
       <aside class="sidebar">
         <div class="sidebar-header">
-          <h1>Dawn Course 解析监控</h1>
+          <h1>Dawn Course 运维后台</h1>
         </div>
         <nav class="sidebar-nav">
           <div class="nav-item active" data-target="page-dashboard">
-            概览与监控
+            总览监控
           </div>
           <div class="nav-item" data-target="page-scripts">
             脚本发布
           </div>
           <div class="nav-item" data-target="page-repair-issues">
-            Repair Issues
+            修复问题
           </div>
           <div class="nav-item" data-target="page-config">
             模型配置
           </div>
           <div class="nav-item" data-target="page-users">
-            用户管理
+            账号管理
           </div>
           <div class="nav-item" data-target="page-runtime-logs">
-            日志查看
+            运行日志
           </div>
         </nav>
         <div class="sidebar-footer">
@@ -41,11 +42,12 @@
       <div class="main-content">
         <header>
           <div>
-            <h2 id="pageTitle">概览与监控</h2>
+            <h2 id="pageTitle">总览监控</h2>
             <div class="meta" id="headerMeta">等待数据…</div>
+            <div class="meta refresh-status" id="pageRefreshStatus">刷新状态：等待首次刷新</div>
           </div>
           <div class="actions">
-            <button class="btn secondary" id="refreshBtn" type="button">刷新数据</button>
+            <button class="btn secondary" id="refreshBtn" type="button">立即刷新</button>
           </div>
         </header>
 
@@ -53,6 +55,9 @@
           <div id="page-dashboard" class="page-section active">
             <section class="mb-24">
               <div class="grid cards" id="summaryCards"></div>
+            </section>
+            <section class="mb-24">
+              <div class="overview-banner" id="dashboardSummaryPanel">等待数据…</div>
             </section>
             <section class="filter-bar mb-24">
               <div class="filters">
@@ -70,76 +75,85 @@
                 </div>
               </div>
               <div class="actions">
-                <button class="btn secondary" id="exportBtn" type="button">导出统计</button>
+                <button class="btn secondary" id="exportBtn" type="button">导出筛选结果</button>
               </div>
             </section>
             <section class="split">
               <div>
                 <h3 class="section-title">学校维度统计</h3>
-                <table class="table" id="schoolTable">
+                <div class="section-meta" id="schoolTableMeta">等待数据…</div>
+                <div class="table-shell">
+                  <table class="table table-wide table-dashboard-school" id="schoolTable">
+                    <thead>
+                      <tr>
+                        <th>学校</th>
+                        <th>名称</th>
+                        <th>教务系统</th>
+                        <th>识别来源</th>
+                        <th>队列</th>
+                        <th>成功率</th>
+                        <th>解析</th>
+                        <th>总结</th>
+                        <th>脚本</th>
+                        <th>费用</th>
+                        <th>最近更新</th>
+                      </tr>
+                    </thead>
+                    <tbody></tbody>
+                  </table>
+                </div>
+              </div>
+              <div>
+                <h3 class="section-title">最近失败</h3>
+                <div class="section-meta" id="failureTableMeta">等待数据…</div>
+                <div class="failure-summary" id="failureSummary"></div>
+                <div class="table-shell">
+                  <table class="table table-wide table-dashboard-failure" id="failureTable">
+                    <thead>
+                      <tr>
+                        <th>学校</th>
+                        <th>脚本</th>
+                        <th>类型</th>
+                        <th>原因</th>
+                        <th>时间</th>
+                      </tr>
+                    </thead>
+                    <tbody></tbody>
+                  </table>
+                </div>
+              </div>
+            </section>
+            <section>
+              <h3 class="section-title">客户端脚本拉取统计（按脚本）</h3>
+              <div class="section-meta" id="pullScriptTableMeta">等待数据…</div>
+              <div class="table-shell">
+                <table class="table table-wide table-pull-script" id="pullScriptTable">
                   <thead>
                     <tr>
-                      <th>学校</th>
-                      <th>名称</th>
-                      <th>教务系统</th>
-                      <th>识别来源</th>
-                      <th>队列</th>
-                      <th>成功率</th>
-                      <th>解析</th>
-                      <th>总结</th>
-                      <th>脚本</th>
-                      <th>费用</th>
+                      <th>脚本名</th>
+                      <th>分类</th>
+                      <th>总拉取</th>
+                      <th>云端</th>
+                      <th>本地</th>
+                      <th>任务去重</th>
+                      <th>去重云端</th>
+                      <th>去重本地</th>
+                      <th>云端占比</th>
                       <th>最近更新</th>
                     </tr>
                   </thead>
                   <tbody></tbody>
                 </table>
               </div>
-              <div>
-                <h3 class="section-title">最近失败</h3>
-                <div class="failure-summary" id="failureSummary"></div>
-                <table class="table" id="failureTable">
-                  <thead>
-                    <tr>
-                      <th>学校</th>
-                      <th>脚本</th>
-                      <th>类型</th>
-                      <th>原因</th>
-                      <th>时间</th>
-                    </tr>
-                  </thead>
-                  <tbody></tbody>
-                </table>
-              </div>
-            </section>
-            <section>
-              <h3 class="section-title">App 脚本拉取统计（按脚本）</h3>
-              <table class="table" id="pullScriptTable">
-                <thead>
-                  <tr>
-                    <th>脚本名</th>
-                    <th>分类</th>
-                    <th>总拉取</th>
-                    <th>云端</th>
-                    <th>本地</th>
-                    <th>任务去重</th>
-                    <th>去重云端</th>
-                    <th>去重本地</th>
-                    <th>云端占比</th>
-                    <th>最近更新</th>
-                  </tr>
-                </thead>
-                <tbody></tbody>
-              </table>
             </section>
           </div>
 
           <div id="page-config" class="page-section">
             <div class="config-form">
               <div class="config-group">
-                <h3>模型 1：总结与解析（低成本）</h3>
+                <h3>模型 1：总结与解析配置（低成本）</h3>
                 <div class="config-row">
-                  <label>供应商 (Provider)</label>
+                  <label>服务提供方（Provider）</label>
                   <select id="conf_summaryProviderRaw">
                     <option value="auto">自动推断 (auto)</option>
                     <option value="gpt">OpenAI (gpt)</option>
@@ -154,15 +168,15 @@
                   <input type="text" id="conf_summaryModelRaw" placeholder="如: gpt-4o-mini, gemini-1.5-flash">
                 </div>
                 <div class="config-row">
-                  <label>API Key</label>
-                  <input type="password" id="conf_summaryApiKey" autocomplete="new-password" placeholder="输入密钥">
+                  <label>接口密钥（API Key）</label>
+                  <input type="password" id="conf_summaryApiKey" autocomplete="new-password" placeholder="请输入接口密钥">
                 </div>
                 <div class="config-row">
-                  <label>Base URL</label>
-                  <input type="text" id="conf_summaryBaseUrl" placeholder="为空则使用默认">
+                  <label>服务地址（Base URL）</label>
+                  <input type="text" id="conf_summaryBaseUrl" placeholder="留空则使用默认地址">
                 </div>
                 <div class="config-row">
-                  <label>API 风格</label>
+                  <label>接口风格</label>
                   <select id="conf_summaryApiStyleRaw">
                     <option value="">自动推断</option>
                     <option value="chat">Chat Completions</option>
@@ -170,19 +184,19 @@
                   </select>
                 </div>
                 <div class="config-row">
-                  <label>扩展请求体 (JSON)</label>
+                  <label>扩展请求参数（JSON）</label>
                   <textarea id="conf_summaryRequestExtraJson" placeholder='如: {"response_format": {"type": "json_object"}}'></textarea>
                 </div>
                 <div class="config-actions">
-                  <button class="btn secondary" id="testSummaryConfigBtn" type="button">测试模型 1</button>
+                  <button class="btn secondary" id="testSummaryConfigBtn" type="button">测试模型 1 连通性</button>
                   <span class="muted" id="testSummaryConfigResult">-</span>
                 </div>
               </div>
 
               <div class="config-group">
-                <h3>模型 2：脚本修复（高成本）</h3>
+                <h3>模型 2：脚本修复配置（高成本）</h3>
                 <div class="config-row">
-                  <label>供应商 (Provider)</label>
+                  <label>服务提供方（Provider）</label>
                   <select id="conf_scriptProviderRaw">
                     <option value="auto">自动推断 (auto)</option>
                     <option value="gpt">OpenAI (gpt)</option>
@@ -197,15 +211,15 @@
                   <input type="text" id="conf_scriptModelRaw" placeholder="如: gpt-4o, gemini-1.5-pro">
                 </div>
                 <div class="config-row">
-                  <label>API Key</label>
-                  <input type="password" id="conf_scriptApiKey" autocomplete="new-password" placeholder="输入密钥">
+                  <label>接口密钥（API Key）</label>
+                  <input type="password" id="conf_scriptApiKey" autocomplete="new-password" placeholder="请输入接口密钥">
                 </div>
                 <div class="config-row">
-                  <label>Base URL</label>
-                  <input type="text" id="conf_scriptBaseUrl" placeholder="为空则使用默认">
+                  <label>服务地址（Base URL）</label>
+                  <input type="text" id="conf_scriptBaseUrl" placeholder="留空则使用默认地址">
                 </div>
                 <div class="config-row">
-                  <label>API 风格</label>
+                  <label>接口风格</label>
                   <select id="conf_scriptApiStyleRaw">
                     <option value="">自动推断</option>
                     <option value="chat">Chat Completions</option>
@@ -213,11 +227,11 @@
                   </select>
                 </div>
                 <div class="config-row">
-                  <label>扩展请求体 (JSON)</label>
+                  <label>扩展请求参数（JSON）</label>
                   <textarea id="conf_scriptRequestExtraJson" placeholder='如: {"response_format": {"type": "json_object"}}'></textarea>
                 </div>
                 <div class="config-actions">
-                  <button class="btn secondary" id="testScriptConfigBtn" type="button">测试模型 2</button>
+                  <button class="btn secondary" id="testScriptConfigBtn" type="button">测试模型 2 连通性</button>
                   <span class="muted" id="testScriptConfigResult">-</span>
                 </div>
               </div>
@@ -294,76 +308,86 @@
             <section class="mb-24">
               <h3 class="section-title">脚本解析统计</h3>
               <div class="meta" id="scriptAnalyticsMeta">等待数据...</div>
-              <table class="table" id="scriptAnalyticsTable">
-                <thead>
-                  <tr>
-                    <th>脚本</th>
-                    <th>成功</th>
-                    <th>失败</th>
-                    <th>成功率</th>
-                    <th>系统分布</th>
-                    <th>失败原因</th>
-                    <th>未知占比</th>
-                    <th>最近更新</th>
-                  </tr>
-                </thead>
-                <tbody></tbody>
-              </table>
+              <div class="table-shell">
+                <table class="table table-wide table-script-analytics" id="scriptAnalyticsTable">
+                  <thead>
+                    <tr>
+                      <th>脚本</th>
+                      <th>成功</th>
+                      <th>失败</th>
+                      <th>成功率</th>
+                      <th>系统分布</th>
+                      <th>失败原因</th>
+                      <th>未知占比</th>
+                      <th>最近更新</th>
+                    </tr>
+                  </thead>
+                  <tbody></tbody>
+                </table>
+              </div>
             </section>
             <section class="mb-24">
               <div class="grid cards" id="scriptSummaryCards"></div>
             </section>
             <section class="mb-24">
-              <h3 class="section-title">脚本发布管理</h3>
-              <table class="table" id="scriptTable">
-                <thead>
-                  <tr>
-                    <th>脚本</th>
-                    <th>阶段</th>
-                    <th>版本</th>
-                    <th>父版本</th>
-                    <th>Pending</th>
-                    <th>回滚</th>
-                    <th>更新时间</th>
-                    <th>操作人</th>
-                    <th>操作</th>
-                  </tr>
-                </thead>
-                <tbody></tbody>
-              </table>
+              <div class="overview-banner" id="scriptReleaseGuide">等待脚本发布数据…</div>
+            </section>
+            <section class="mb-24">
+              <h3 class="section-title">脚本发布列表</h3>
+              <div class="section-meta" id="scriptReleaseMeta">等待数据…</div>
+              <div class="table-shell">
+                <table class="table table-wide table-script-release" id="scriptTable">
+                  <thead>
+                    <tr>
+                      <th>脚本</th>
+                      <th>阶段</th>
+                      <th>版本</th>
+                      <th>父版本</th>
+                      <th>待发布</th>
+                      <th>回滚状态</th>
+                      <th>更新时间</th>
+                      <th>操作人</th>
+                      <th>操作</th>
+                    </tr>
+                  </thead>
+                  <tbody></tbody>
+                </table>
+              </div>
             </section>
           </div>
 
           <div id="page-repair-issues" class="page-section">
             <section class="mb-24">
-              <h3 class="section-title">Repair Issue 列表</h3>
+              <h3 class="section-title">修复问题列表</h3>
               <div class="muted mb-24" id="repairIssueMeta">等待加载...</div>
-              <table class="table" id="repairIssueTable">
-                <thead>
-                  <tr>
-                    <th>Issue</th>
-                    <th>学校</th>
-                    <th>系统</th>
-                    <th>脚本</th>
-                    <th>版本</th>
-                    <th>失败类型</th>
-                    <th>样本</th>
-                    <th>用户</th>
-                    <th>状态</th>
-                    <th>最近出现</th>
-                    <th>操作</th>
-                  </tr>
-                </thead>
-                <tbody></tbody>
-              </table>
+              <div class="table-shell">
+                <table class="table table-wide table-repair-issues" id="repairIssueTable">
+                  <thead>
+                    <tr>
+                      <th>问题编号</th>
+                      <th>学校</th>
+                      <th>系统</th>
+                      <th>脚本</th>
+                      <th>版本</th>
+                      <th>失败类型</th>
+                      <th>样本</th>
+                      <th>用户</th>
+                      <th>状态</th>
+                      <th>最近出现</th>
+                      <th>操作</th>
+                    </tr>
+                  </thead>
+                  <tbody></tbody>
+                </table>
+              </div>
             </section>
             <section class="mb-24">
-              <h3 class="section-title">Issue 详情</h3>
+              <h3 class="section-title">修复问题详情</h3>
               <div class="filter-bar mb-24">
                 <div class="filters">
                   <div class="filter">
-                    <label>当前 Issue</label>
-                    <input id="repairIssueSelected" type="text" readonly placeholder="未选择">
+                    <label>当前问题</label>
+                    <input id="repairIssueSelected" type="text" readonly placeholder="尚未选择">
                   </div>
                   <div class="filter">
                     <label>日志阶段</label>
@@ -401,26 +425,43 @@
                     <input id="repairIssueFollowLogs" type="checkbox" checked>
                     自动滚动
                   </label>
-                  <button class="btn secondary" id="repairIssueLogReloadBtn" type="button">刷新日志</button>
+                  <button class="btn secondary" id="repairIssueLogReloadBtn" type="button">重新加载日志</button>
                   <div class="dropdown" id="repairIssueActions">
-                    <button class="btn" id="repairIssueActionsBtn" type="button">更多操作</button>
+                    <button class="btn" id="repairIssueActionsBtn" type="button">问题操作</button>
                     <div class="dropdown-menu" id="repairIssueActionsMenu">
-                      <button class="dropdown-item" type="button" data-action="issue-copy-summary">复制摘要</button>
-                      <button class="dropdown-item" type="button" data-action="issue-run-test">复现</button>
+                      <button class="dropdown-item" type="button" data-action="issue-copy-summary">复制问题摘要</button>
+                      <button class="dropdown-item" type="button" data-action="issue-run-test">执行复现</button>
                       <button class="dropdown-item" type="button" data-action="issue-retry">重试修复</button>
                       <button class="dropdown-item danger" type="button" data-action="issue-force-repair">立即修复</button>
                       <div class="dropdown-sep"></div>
-                      <button class="dropdown-item danger" type="button" data-action="issue-delete">删除 Issue</button>
+                      <button class="dropdown-item danger" type="button" data-action="issue-delete">删除问题</button>
                     </div>
                   </div>
                 </div>
               </div>
-              <div class="muted mb-24" id="repairIssueDetailMeta">选择一条 Issue 查看详情。</div>
+              <div class="refresh-rule-banner mb-24" id="repairIssueRefreshRule">
+                自动刷新开启后，仅会静默刷新当前选中的修复问题、时间线与日志；手动刷新只执行一次，并保留当前选中项、日志筛选、自动滚动与自动换行设置。
+              </div>
+              <div class="muted mb-24" id="repairIssueDetailMeta">选择一条修复问题后查看详情。</div>
+              <div class="repair-overview-grid mb-24" id="repairIssueOverviewGrid">
+                <div class="card repair-summary-card">
+                  <h4>问题概览</h4>
+                  <div class="muted">选择修复问题后展示学校、脚本版本、失败类型与来源等上下文。</div>
+                </div>
+                <div class="card repair-summary-card">
+                  <h4>模型与发布状态</h4>
+                  <div class="muted">这里会展示模型 1、模型 2、候选验证和待发布状态。</div>
+                </div>
+                <div class="card repair-summary-card">
+                  <h4>失败原因</h4>
+                  <div class="muted">这里会展示最近失败原因、状态码、错误码与耗时信息。</div>
+                </div>
+              </div>
               <div class="card repair-progress mb-24" id="repairIssueProgressCard">
                 <div class="repair-progress-header">
                   <div class="repair-progress-title">
                     <span class="badge" id="repairIssueProgressStageBadge">-</span>
-                    <span class="muted" id="repairIssueProgressHint">选择 Issue 后展示修复进度</span>
+                    <span class="muted" id="repairIssueProgressHint">选择修复问题后展示处理进度</span>
                   </div>
                   <div class="repair-progress-metrics" id="repairIssueProgressMetrics"></div>
                 </div>
@@ -430,20 +471,26 @@
                 <div>
                   <h3 class="section-title">阶段时间线</h3>
                   <div class="timeline-list" id="repairIssueTimelineList"></div>
-                  <pre class="code-block" id="repairIssueTimeline">暂无时间线</pre>
+                  <div class="code-shell">
+                    <pre class="code-block code-block-wide" id="repairIssueTimeline">暂无时间线</pre>
+                  </div>
                 </div>
                 <div>
                   <h3 class="section-title">步骤日志</h3>
                   <div class="log-toolbar">
                     <input id="repairIssueLogSearch" class="log-search" type="text" placeholder="搜索日志（关键词/阶段/来源/操作者）">
+                    <button class="btn secondary compact" id="repairIssueClearSearchBtn" type="button">清空搜索</button>
                     <label class="checkbox-inline">
                       <input id="repairIssueLogWrap" type="checkbox" checked>
                       自动换行
                     </label>
-                    <button class="btn secondary compact" id="repairIssueCopyLogsBtn" type="button">复制日志</button>
+                    <button class="btn secondary compact" id="repairIssueCopyLogsBtn" type="button">复制日志内容</button>
                   </div>
+                  <div class="muted mb-24" id="repairIssueLogSummary">选择修复问题后展示当前筛选结果、自动刷新与自动滚动状态。</div>
                   <div class="log-table" id="repairIssueLogTable"></div>
-                  <pre class="code-block" id="repairIssueDetail">选择一条 Issue 查看日志。</pre>
+                  <div class="code-shell">
+                    <pre class="code-block code-block-wide" id="repairIssueDetail">选择一条修复问题后查看日志。</pre>
+                  </div>
                 </div>
               </section>
             </section>
@@ -451,35 +498,37 @@
 
           <div id="page-users" class="page-section">
             <section class="mb-24">
-              <h3 class="section-title">新增登录用户</h3>
+              <h3 class="section-title">新增运维账号</h3>
               <div class="user-create-card">
                 <div class="user-form-row">
-                  <input id="newUserName" type="text" placeholder="新账号">
-                  <input id="newUserPassword" type="password" autocomplete="new-password" placeholder="新密码（至少 4 位）">
-                  <button class="btn" id="createUserBtn" type="button">新增用户</button>
+                  <input id="newUserName" type="text" placeholder="请输入新账号">
+                  <input id="newUserPassword" type="password" autocomplete="new-password" placeholder="请输入新密码（至少 4 位）">
+                  <button class="btn" id="createUserBtn" type="button">创建账号</button>
                 </div>
                 <div class="muted user-create-tip">建议：使用专属运维账号，避免多人共用 admin。</div>
               </div>
             </section>
             <section class="mb-24">
               <div class="user-list-header">
-                <h3 class="section-title">账号列表</h3>
+                <h3 class="section-title">运维账号列表</h3>
                 <div class="user-stats" id="userStats"></div>
               </div>
-              <table class="table user-table" id="userTable">
-                <thead>
-                  <tr>
-                    <th>账号</th>
-                    <th>创建时间</th>
-                    <th>更新时间</th>
-                    <th>最近登录</th>
-                    <th>改账号名</th>
-                    <th>改密码</th>
-                    <th>删除</th>
-                  </tr>
-                </thead>
-                <tbody></tbody>
-              </table>
+              <div class="table-shell">
+                <table class="table table-wide table-user-list user-table" id="userTable">
+                  <thead>
+                    <tr>
+                      <th>账号</th>
+                      <th>创建时间</th>
+                      <th>更新时间</th>
+                      <th>最近登录</th>
+                      <th>改账号名</th>
+                      <th>改密码</th>
+                      <th>删除</th>
+                    </tr>
+                  </thead>
+                  <tbody></tbody>
+                </table>
+              </div>
             </section>
           </div>
 
@@ -491,9 +540,9 @@
                   <select id="runtimeLogSource">
                     <option value="all">全部</option>
                     <option value="backend">llm-backend</option>
-                    <option value="nginx_access">nginx access</option>
-                    <option value="nginx_error">nginx error</option>
-                    <option value="admin">admin buffer</option>
+                    <option value="nginx_access">nginx 访问日志</option>
+                    <option value="nginx_error">nginx 错误日志</option>
+                    <option value="admin">管理后台缓存</option>
                   </select>
                 </div>
                 <div class="filter">
@@ -506,14 +555,22 @@
                   <input id="runtimeLogAutoScroll" type="checkbox" checked>
                   自动滚动到最新
                 </label>
-                <button class="btn secondary" id="runtimeLogDownloadBtn" type="button">下载日志</button>
-                <button class="btn secondary" id="runtimeLogRefreshBtn" type="button">刷新日志</button>
+                <button class="btn secondary" id="runtimeLogDownloadBtn" type="button">导出当前日志</button>
+                <button class="btn secondary" id="runtimeLogRefreshBtn" type="button">重新加载日志</button>
               </div>
             </section>
+            <section class="mb-24">
+              <div class="grid cards" id="runtimeLogSummaryCards"></div>
+            </section>
+            <section class="mb-24">
+              <div class="info-callout" id="runtimeLogCallout">等待日志数据…</div>
+            </section>
             <section>
-              <h3 class="section-title">运行日志</h3>
+              <h3 class="section-title">服务端运行日志</h3>
               <div class="log-meta muted" id="runtimeLogMeta">等待加载…</div>
-              <pre class="code-block runtime-log-block" id="runtimeLogContent"></pre>
+              <div class="code-shell">
+                <pre class="code-block code-block-wide runtime-log-block" id="runtimeLogContent"></pre>
+              </div>
             </section>
           </div>
 
@@ -529,8 +586,8 @@
           </div>
           <div class="actions">
             <select id="scriptModalSource" class="modal-select">
-              <option value="current">当前脚本</option>
-              <option value="pending">Pending</option>
+              <option value="current">当前版本</option>
+              <option value="pending">待发布版本</option>
               <option value="backup">父版本备份</option>
             </select>
             <button class="btn secondary" id="scriptModalClose" type="button">关闭</button>
@@ -550,11 +607,36 @@
         </div>
       </div>
     </div>
+    <div class="confirm-overlay" id="confirmOverlay" style="display: none">
+      <div class="confirm-panel" role="dialog" aria-modal="true" aria-labelledby="confirmTitle">
+        <div class="confirm-header">
+          <div>
+            <div class="confirm-kicker" id="confirmKicker">请确认操作</div>
+            <h2 id="confirmTitle">操作确认</h2>
+          </div>
+          <button class="icon-btn" id="confirmCloseBtn" type="button" aria-label="关闭确认弹窗">关闭</button>
+        </div>
+        <div class="confirm-body">
+          <div class="confirm-detail" id="confirmDetail">确认后将执行对应操作。</div>
+          <div class="confirm-emphasis" id="confirmEmphasis" style="display: none"></div>
+          <div class="confirm-input-group" id="confirmInputGroup" style="display: none">
+            <label class="muted" for="confirmInput">请输入确认文本</label>
+            <input id="confirmInput" type="text" autocomplete="off" placeholder="请输入确认文本">
+            <div class="muted" id="confirmInputHint"></div>
+          </div>
+          <div class="confirm-feedback muted" id="confirmFeedback"></div>
+        </div>
+        <div class="confirm-actions">
+          <button class="btn secondary" id="confirmCancelBtn" type="button">取消</button>
+          <button class="btn danger" id="confirmSubmitBtn" type="button">确认执行</button>
+        </div>
+      </div>
+    </div>
     <div class="login-overlay" id="loginOverlay">
       <div class="login-panel">
         <div class="login-brand">
           <div class="login-title">Dawn Course</div>
-          <div class="login-subtitle">兜底解析监控后台</div>
+          <div class="login-subtitle">服务端运维后台</div>
         </div>
         <h2 class="login-heading">登录</h2>
         <div class="form-row">

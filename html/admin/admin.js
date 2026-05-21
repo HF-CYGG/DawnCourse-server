@@ -471,8 +471,18 @@ function normalizeRepairTraceMeta(meta) {
     attemptsUsed: Number(pickDefinedValue(info.attemptsUsed, info.attempts_used) || 0),
     retryCount: Number(pickDefinedValue(info.retryCount, info.retry_count) || 0),
     retryPolicy: `${pickDefinedValue(info.retryPolicy, info.retry_policy) || ""}`,
+    repairRound: Number(pickDefinedValue(info.repairRound, info.repair_round) || 0),
+    failureType: `${pickDefinedValue(info.failureType, info.failure_type) || ""}`,
+    failureReason: `${pickDefinedValue(info.failureReason, info.failure_reason) || ""}`,
     fallbackPath: `${pickDefinedValue(info.fallbackPath, info.fallback_path) || ""}`,
     manualSuggestion: `${pickDefinedValue(info.manualSuggestion, info.manual_suggestion) || ""}`,
+    scriptRepairMode: `${pickDefinedValue(info.scriptRepairMode, info.script_repair_mode, info.repairMode, info.repair_mode) || ""}`,
+    opsApplied: pickDefinedValue(info.opsApplied, info.ops_applied) === true,
+    opsCount: Number(pickDefinedValue(info.opsCount, info.ops_count) || 0),
+    opsMissedCount: Number(pickDefinedValue(info.opsMissedCount, info.ops_missed_count) || 0),
+    opsMissedNames: `${pickDefinedValue(info.opsMissedNames, info.ops_missed_names) || ""}`,
+    opsApplyFailureReason: `${pickDefinedValue(info.opsApplyFailureReason, info.ops_apply_failure_reason) || ""}`,
+    cacheHit: pickDefinedValue(info.cacheHit, info.cache_hit) === true,
     releaseStage: `${pickDefinedValue(info.releaseStage, info.release_stage) || ""}`,
     ok: pickDefinedValue(info.ok, info.success) === true
   };
@@ -3110,6 +3120,11 @@ function buildRepairContextFromMeta(meta) {
   if (Number(info.guidanceChars || 0) > 0) parts.push(`指令 ${Number(info.guidanceChars || 0)} 字`);
   if (Number(info.previousScriptChars || 0) > 0) parts.push(`旧脚本 ${Number(info.previousScriptChars || 0)} 字`);
   if (info.previousScriptExtracted) parts.push("旧脚本已提炼");
+  if ((info.scriptRepairMode || "").toString().trim()) parts.push(`修复模式 ${String(info.scriptRepairMode).trim()}`);
+  if (info.cacheHit) parts.push("缓存命中");
+  if (info.opsApplied || Number(info.opsCount || 0) > 0) parts.push(`操作 ${Number(info.opsCount || 0)} 项`);
+  if (Number(info.opsMissedCount || 0) > 0) parts.push(`未命中 ${Number(info.opsMissedCount || 0)} 项`);
+  if ((info.opsApplyFailureReason || "").toString().trim()) parts.push(`ops失败 ${String(info.opsApplyFailureReason).trim()}`);
   if (info.truncatedSummary || info.truncatedGuidance || info.truncatedPreviousScript) {
     parts.push(
       `已裁剪 ${[
@@ -3133,6 +3148,8 @@ function buildRepairContextFromMeta(meta) {
   }
   if (Number(info.retryCount || 0) > 0) parts.push(`重试 ${Number(info.retryCount || 0)} 次`);
   if ((info.retryPolicy || "").toString().trim()) parts.push(`重试策略 ${String(info.retryPolicy).trim()}`);
+  if (Number(info.repairRound || 0) > 1) parts.push(`修复第 ${Number(info.repairRound || 0)} 轮`);
+  if ((info.failureType || "").toString().trim()) parts.push(`失败类型 ${String(info.failureType).trim()}`);
   if (Number(info.statusCode || 0) > 0) parts.push(`HTTP ${Number(info.statusCode || 0)}`);
   if ((info.errorCode || "").toString().trim()) parts.push(`错误码 ${String(info.errorCode).trim()}`);
   if (Number(info.latencyMs || 0) > 0) parts.push(`耗时 ${Number(info.latencyMs || 0)}ms`);
@@ -3166,6 +3183,11 @@ function buildRepairTraceContext(meta) {
   if (Number(info.guidanceChars || 0) > 0) parts.push(`指令 ${Number(info.guidanceChars || 0)} 字`);
   if (Number(info.previousScriptChars || 0) > 0) parts.push(`旧脚本 ${Number(info.previousScriptChars || 0)} 字`);
   if (info.previousScriptExtracted) parts.push("旧脚本已提炼");
+  if ((info.scriptRepairMode || "").toString().trim()) parts.push(`修复模式 ${String(info.scriptRepairMode).trim()}`);
+  if (info.cacheHit) parts.push("缓存命中");
+  if (info.opsApplied || Number(info.opsCount || 0) > 0) parts.push(`操作 ${Number(info.opsCount || 0)} 项`);
+  if (Number(info.opsMissedCount || 0) > 0) parts.push(`未命中 ${Number(info.opsMissedCount || 0)} 项`);
+  if ((info.opsApplyFailureReason || "").toString().trim()) parts.push(`ops失败 ${String(info.opsApplyFailureReason).trim()}`);
   if (info.truncatedSummary || info.truncatedGuidance || info.truncatedPreviousScript) {
     parts.push(
       `已裁剪 ${[
@@ -3190,6 +3212,8 @@ function buildRepairTraceContext(meta) {
   }
   if (Number(info.retryCount || 0) > 0) parts.push(`重试 ${Number(info.retryCount || 0)} 次`);
   if ((info.retryPolicy || "").toString().trim()) parts.push(`重试策略 ${String(info.retryPolicy).trim()}`);
+  if (Number(info.repairRound || 0) > 1) parts.push(`修复第 ${Number(info.repairRound || 0)} 轮`);
+  if ((info.failureType || "").toString().trim()) parts.push(`失败类型 ${String(info.failureType).trim()}`);
   if (Number(info.statusCode || 0) > 0) parts.push(`HTTP ${Number(info.statusCode || 0)}`);
   if ((info.errorCode || "").toString().trim()) parts.push(`错误码 ${String(info.errorCode).trim()}`);
   if (Number(info.latencyMs || 0) > 0) parts.push(`耗时 ${Number(info.latencyMs || 0)}ms`);

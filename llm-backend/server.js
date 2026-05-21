@@ -1,3 +1,4 @@
+// llm-backend 主服务：提供 LLM 兜底解析、自动修复脚本流水线、管理后台接口与运行日志读取等能力。
 import http from "node:http";
 import { URL, fileURLToPath } from "node:url";
 import crypto from "node:crypto";
@@ -8,13 +9,13 @@ import { createClient } from "redis";
 // 服务端监听端口
 const port = Number(process.env.PORT || 8080);
 // 单次请求超时
-const timeoutMs = Number(process.env.LLM_TIMEOUT_MS || 20000);
+const timeoutMs = Number(process.env.LLM_TIMEOUT_MS || 3600000);
 // 模型 1 汇总相关请求单独放宽超时，避免真实样本汇总过早中断
-const summaryTimeoutMs = Number(process.env.LLM_SUMMARY_TIMEOUT_MS || Math.max(timeoutMs, 45000));
+const summaryTimeoutMs = Number(process.env.LLM_SUMMARY_TIMEOUT_MS || Math.max(timeoutMs, 3600000));
 // 模型 1 修复指令生成通常比总结更短，但仍需要独立预算，避免与总结/脚本生成共用同一超时策略
-const patchGuidanceTimeoutMs = Number(process.env.LLM_PATCH_GUIDANCE_TIMEOUT_MS || Math.max(timeoutMs, 30000));
+const patchGuidanceTimeoutMs = Number(process.env.LLM_PATCH_GUIDANCE_TIMEOUT_MS || Math.max(timeoutMs, 3600000));
 // 模型 2 生成脚本通常更慢，允许比通用超时更长
-const scriptTimeoutMs = Number(process.env.LLM_SCRIPT_TIMEOUT_MS || Math.max(timeoutMs, 60000));
+const scriptTimeoutMs = Number(process.env.LLM_SCRIPT_TIMEOUT_MS || Math.max(timeoutMs, 3600000));
 // 三类调用分别配置独立重试次数，重试次数表示“失败后额外再试几次”
 const summaryMaxRetries = Math.max(0, Number(process.env.LLM_SUMMARY_MAX_RETRIES || 1));
 const patchGuidanceMaxRetries = Math.max(0, Number(process.env.LLM_PATCH_GUIDANCE_MAX_RETRIES || 2));
@@ -115,6 +116,10 @@ const summaryMaxSamples = Number(process.env.LLM_SUMMARY_MAX_SAMPLES || 6);
 const scriptMaxSummaryChars = Number(process.env.LLM_SCRIPT_MAX_SUMMARY_CHARS || 2200);
 const scriptMaxGuidanceChars = Number(process.env.LLM_SCRIPT_MAX_GUIDANCE_CHARS || 1600);
 const scriptMaxPreviousScriptChars = Number(process.env.LLM_SCRIPT_MAX_PREVIOUS_SCRIPT_CHARS || 9000);
+const scriptOpsEnabled = process.env.LLM_SCRIPT_OPS_ENABLED !== "false";
+const candidateScriptCacheTtlMs = Number(process.env.CANDIDATE_SCRIPT_CACHE_TTL_MS || 12 * 60 * 60 * 1000);
+const scriptSelfRepairRounds = Math.max(0, Number(process.env.LLM_SCRIPT_SELF_REPAIR_ROUNDS || 1));
+const scriptSelfRepairSampleChars = Math.max(300, Number(process.env.LLM_SCRIPT_SELF_REPAIR_SAMPLE_CHARS || 1500));
 // 强制指定 API 风格（chat 或 responses），留空则自动推断（例如 GPT-5 默认 responses）
 let summaryApiStyleRaw = (process.env.LLM_SUMMARY_API_STYLE || "").trim().toLowerCase();
 let scriptApiStyleRaw = (process.env.LLM_SCRIPT_API_STYLE || "").trim().toLowerCase();
@@ -2909,7 +2914,9 @@ async function processQueueCluster(schoolId, items, normalizedIssues, state, now
     source: "queue_processor",
     meta: scriptTraceMeta
   });
-  const generatedScriptResult = await generateParserScript(summary, patchGuidance, previousScript, schoolId, scriptPayload);
+  let generatedScriptResult = await generateParserScript(summary, patchGuidance, previousScript, schoolId, scriptPayload, {
+    scriptName
+  });
   if (!generatedScriptResult.ok || !generatedScriptResult.text) {
     await appendRepairIssueTraceBatch(issueIds, {
       stage: "CANDIDATE_TEST_RESULT",
@@ -2927,12 +2934,87 @@ async function processQueueCluster(schoolId, items, normalizedIssues, state, now
           action: "generate_candidate_script",
           ok: false
         }),
+        scriptRepairMode: (generatedScriptResult.scriptRepairMode || "").toString(),
+        opsApplied: Boolean(generatedScriptResult.opsApplied),
+        opsCount: Number(generatedScriptResult.opsCount || 0),
+        cacheHit: Boolean(generatedScriptResult.cacheHit),
         manualSuggestion: "请人工检查模型2输入裁剪结果、旧脚本提炼片段与模型配置后再重试"
       }
     });
     return { state, applied: false };
   }
-  const generatedScript = generatedScriptResult.text;
+  let generatedScript = generatedScriptResult.text;
+  for (let roundIndex = 0; roundIndex < scriptSelfRepairRounds; roundIndex += 1) {
+    const validation = validateScriptStructure(generatedScript);
+    let failureType = "";
+    let failureReason = "";
+    if (!validation.ok) {
+      failureType = "validation";
+      failureReason = validation.reason || "validation_failed";
+    } else {
+      const probe = runSubmissionReplay(generatedScript, items);
+      if (probe.ok) break;
+      failureType = "submission_replay";
+      failureReason = probe.reason || "submission_replay_failed";
+    }
+    const sampleHint = ((items?.[0]?.content || "").toString() || "").slice(0, scriptSelfRepairSampleChars);
+    const lastParserCode = extractFunctionCode(generatedScript, "scheduleHtmlParser", 2200);
+    const feedbackText = buildScriptSelfRepairFeedback({
+      failureType,
+      failureReason,
+      sampleHint,
+      lastParserCode
+    });
+    await appendRepairIssueTraceBatch(issueIds, {
+      stage: "CANDIDATE_TEST_RUNNING",
+      level: "warning",
+      message: `候选脚本验证未通过，尝试自动二次修复（第 ${roundIndex + 2} 轮）`,
+      source: "queue_processor",
+      meta: {
+        ...scriptTraceMeta,
+        repairRound: roundIndex + 2,
+        failureType,
+        failureReason
+      }
+    });
+    const repairedResult = await generateParserScript(summary, patchGuidance, previousScript, schoolId, scriptPayload, {
+      scriptName,
+      forceOps: Boolean(previousScript),
+      feedbackText
+    });
+    if (!repairedResult.ok || !repairedResult.text) {
+      generatedScriptResult = repairedResult;
+      break;
+    }
+    generatedScriptResult = repairedResult;
+    generatedScript = repairedResult.text;
+  }
+  if (!generatedScriptResult.ok || !generatedScriptResult.text) {
+    await appendRepairIssueTraceBatch(issueIds, {
+      stage: "CANDIDATE_TEST_RESULT",
+      level: "error",
+      message: `模型 2 二次修复失败：${generatedScriptResult.failureReason || "未生成脚本"}`,
+      source: "queue_processor",
+      meta: {
+        ...scriptTraceMeta,
+        ...buildScriptGenerationTraceMeta(generatedScriptResult.inputMeta, {}),
+        ...buildModelCallTraceMeta(generatedScriptResult, {
+          schoolId,
+          scriptName,
+          previousVersion: Number(previousMeta?.version || 0),
+          modelRole: "script_repair",
+          action: "generate_candidate_script",
+          ok: false
+        }),
+        scriptRepairMode: (generatedScriptResult.scriptRepairMode || "").toString(),
+        opsApplied: Boolean(generatedScriptResult.opsApplied),
+        opsCount: Number(generatedScriptResult.opsCount || 0),
+        cacheHit: Boolean(generatedScriptResult.cacheHit),
+        manualSuggestion: "候选脚本多轮自动修复仍失败，请人工介入补充指令或手动修复脚本"
+      }
+    });
+    return { state, applied: false };
+  }
   const replayStart = Date.now();
   await appendRepairIssueTraceBatch(issueIds, {
     stage: "CANDIDATE_TEST_RUNNING",
@@ -2951,6 +3033,11 @@ async function processQueueCluster(schoolId, items, normalizedIssues, state, now
         action: "generate_candidate_script",
         ok: true
       })
+      ,
+      scriptRepairMode: (generatedScriptResult.scriptRepairMode || "").toString(),
+      opsApplied: Boolean(generatedScriptResult.opsApplied),
+      opsCount: Number(generatedScriptResult.opsCount || 0),
+      cacheHit: Boolean(generatedScriptResult.cacheHit)
     }
   });
   const submissionReplay = runSubmissionReplay(generatedScript, items);
@@ -2984,6 +3071,8 @@ async function processQueueCluster(schoolId, items, normalizedIssues, state, now
     source: "queue_processor",
     meta: { schoolId, scriptName, ok: true }
   });
+  const candidateCacheKey = buildCandidateScriptCacheKey(scriptName, summary, patchGuidance, previousScript);
+  await saveCandidateScriptCache(candidateCacheKey, generatedScript);
   await setSchoolPhase(schoolId, "APPLYING");
   const applyResult = await applyScriptUpdate(scriptName, generatedScript, previousScript, {
     schoolId,
@@ -3221,7 +3310,8 @@ async function processIndividualSummaries(schoolId, queue, issueIds = []) {
     patchGuidance,
     previousScript,
     schoolId,
-    scriptPayload
+    scriptPayload,
+    { scriptName }
   );
   if (!generatedScriptResult.ok || !generatedScriptResult.text) {
     await appendRepairIssueTraceBatch(issueIds, {
@@ -3240,12 +3330,87 @@ async function processIndividualSummaries(schoolId, queue, issueIds = []) {
           action: "generate_candidate_script_single",
           ok: false
         }),
+        scriptRepairMode: (generatedScriptResult.scriptRepairMode || "").toString(),
+        opsApplied: Boolean(generatedScriptResult.opsApplied),
+        opsCount: Number(generatedScriptResult.opsCount || 0),
+        cacheHit: Boolean(generatedScriptResult.cacheHit),
         manualSuggestion: "请人工检查逐条总结、修复指令与旧脚本提炼结果后再决定是否重试"
       }
     });
     return { applied: false, failed: true };
   }
-  const generatedScript = generatedScriptResult.text;
+  let generatedScript = generatedScriptResult.text;
+  for (let roundIndex = 0; roundIndex < scriptSelfRepairRounds; roundIndex += 1) {
+    const validation = validateScriptStructure(generatedScript);
+    let failureType = "";
+    let failureReason = "";
+    if (!validation.ok) {
+      failureType = "validation";
+      failureReason = validation.reason || "validation_failed";
+    } else {
+      const probe = runSubmissionReplay(generatedScript, queue);
+      if (probe.ok) break;
+      failureType = "submission_replay";
+      failureReason = probe.reason || "submission_replay_failed";
+    }
+    const sampleHint = ((queue?.[0]?.content || "").toString() || "").slice(0, scriptSelfRepairSampleChars);
+    const lastParserCode = extractFunctionCode(generatedScript, "scheduleHtmlParser", 2200);
+    const feedbackText = buildScriptSelfRepairFeedback({
+      failureType,
+      failureReason,
+      sampleHint,
+      lastParserCode
+    });
+    await appendRepairIssueTraceBatch(issueIds, {
+      stage: "CANDIDATE_TEST_RUNNING",
+      level: "warning",
+      message: `逐条修复候选脚本验证未通过，尝试自动二次修复（第 ${roundIndex + 2} 轮）`,
+      source: "queue_processor",
+      meta: {
+        ...scriptTraceMeta,
+        repairRound: roundIndex + 2,
+        failureType,
+        failureReason
+      }
+    });
+    const repairedResult = await generateParserScript(mergedSummary, patchGuidance, previousScript, schoolId, scriptPayload, {
+      scriptName,
+      forceOps: Boolean(previousScript),
+      feedbackText
+    });
+    if (!repairedResult.ok || !repairedResult.text) {
+      generatedScriptResult = repairedResult;
+      break;
+    }
+    generatedScriptResult = repairedResult;
+    generatedScript = repairedResult.text;
+  }
+  if (!generatedScriptResult.ok || !generatedScriptResult.text) {
+    await appendRepairIssueTraceBatch(issueIds, {
+      stage: "CANDIDATE_TEST_RESULT",
+      level: "error",
+      message: `模型 2 逐条修复二次修复失败：${generatedScriptResult.failureReason || "未生成脚本"}`,
+      source: "queue_processor",
+      meta: {
+        ...scriptTraceMeta,
+        ...buildScriptGenerationTraceMeta(generatedScriptResult.inputMeta, {}),
+        ...buildModelCallTraceMeta(generatedScriptResult, {
+          schoolId,
+          scriptName,
+          previousVersion: Number(previousMeta?.version || 0),
+          modelRole: "script_repair",
+          action: "generate_candidate_script_single",
+          ok: false
+        }),
+        scriptRepairMode: (generatedScriptResult.scriptRepairMode || "").toString(),
+        opsApplied: Boolean(generatedScriptResult.opsApplied),
+        opsCount: Number(generatedScriptResult.opsCount || 0),
+        cacheHit: Boolean(generatedScriptResult.cacheHit),
+        manualSuggestion: "逐条修复候选脚本多轮自动修复仍失败，请人工介入补充指令或手动修复脚本"
+      }
+    });
+    return { applied: false, failed: true };
+  }
   const replayStart = Date.now();
   await appendRepairIssueTraceBatch(issueIds, {
     stage: "CANDIDATE_TEST_RUNNING",
@@ -3262,7 +3427,11 @@ async function processIndividualSummaries(schoolId, queue, issueIds = []) {
         modelRole: "script_repair",
         action: "generate_candidate_script_single",
         ok: true
-      })
+      }),
+      scriptRepairMode: (generatedScriptResult.scriptRepairMode || "").toString(),
+      opsApplied: Boolean(generatedScriptResult.opsApplied),
+      opsCount: Number(generatedScriptResult.opsCount || 0),
+      cacheHit: Boolean(generatedScriptResult.cacheHit)
     }
   });
   const submissionReplay = runSubmissionReplay(generatedScript, queue);
@@ -3296,6 +3465,8 @@ async function processIndividualSummaries(schoolId, queue, issueIds = []) {
     source: "queue_processor",
     meta: { schoolId, scriptName, ok: true }
   });
+  const candidateCacheKey = buildCandidateScriptCacheKey(scriptName, mergedSummary, patchGuidance, previousScript);
+  await saveCandidateScriptCache(candidateCacheKey, generatedScript);
   const context = {
     mode: "single",
     clusterSize: Array.isArray(queue) ? queue.length : 0,
@@ -3955,6 +4126,13 @@ function extractRelevantScriptContext(scriptText, maxChars = scriptMaxPreviousSc
       strategy: "full"
     };
   }
+  const callgraph = extractCallGraphScriptContext(raw, "scheduleHtmlParser", {
+    maxChars,
+    maxFunctions: 14
+  });
+  if (callgraph && callgraph.text) {
+    return callgraph;
+  }
   const lines = raw.split(/\r?\n/);
   const keywordPattern =
     /(parse|parser|course|courses|timetable|schedule|week|section|teacher|location|name|json\.stringify|return|extract|normalize|match|regex|result|quickjs)/i;
@@ -3991,6 +4169,134 @@ function extractRelevantScriptContext(scriptText, maxChars = scriptMaxPreviousSc
 }
 
 /**
+ * 从旧脚本中按“入口函数 + 调用闭包”提炼上下文（类似优秀项目的 context slicing）。
+ * - 先定位入口 scheduleHtmlParser
+ * - 再从入口代码中提取可能的函数调用名，递归补齐其定义
+ * - 最终结果仍会按 maxChars 预算裁剪
+ */
+function extractCallGraphScriptContext(scriptText, entryFunctionName, options = {}) {
+  const raw = (scriptText || "").toString().trim();
+  const entryName = (entryFunctionName || "").toString().trim();
+  const maxChars = Math.max(800, Number(options.maxChars || scriptMaxPreviousScriptChars));
+  const maxFunctions = Math.max(3, Math.min(40, Number(options.maxFunctions || 14)));
+  if (!raw || !entryName) return null;
+  if (findFunctionStartIndex(raw, entryName) < 0) return null;
+
+  const visited = new Set();
+  const queued = new Set();
+  const queue = [entryName];
+  queued.add(entryName);
+  const blocks = [];
+
+  while (queue.length > 0 && blocks.length < maxFunctions) {
+    const current = queue.shift();
+    queued.delete(current);
+    if (!current || visited.has(current)) continue;
+    const range = findFunctionBlockRange(raw, current);
+    if (!range) continue;
+    visited.add(current);
+    const code = raw.slice(range.startIndex, range.endIndex).trim();
+    if (!code) continue;
+    blocks.push({ name: current, code });
+
+    const calledNames = extractCalledFunctionNames(code);
+    for (const name of calledNames) {
+      if (visited.has(name) || queued.has(name)) continue;
+      if (blocks.length + queue.length >= maxFunctions) break;
+      if (findFunctionStartIndex(raw, name) < 0) continue;
+      queue.push(name);
+      queued.add(name);
+    }
+  }
+
+  if (blocks.length === 0) return null;
+  const combined = blocks
+    .map((item, index) => {
+      if (index === 0) return item.code;
+      return `/* --- 依赖函数：${item.name} --- */\n${item.code}`;
+    })
+    .join("\n\n");
+  const clipped = clipTextKeepBothEnds(combined, maxChars, "\n/* 已调用链提炼并截断 */\n");
+  return {
+    text: clipped.text,
+    originalChars: raw.length,
+    usedChars: clipped.usedChars,
+    truncated: clipped.truncated || combined.length < raw.length,
+    extracted: true,
+    extractedFunctions: blocks.length,
+    strategy: clipped.truncated ? "callgraph_extract_clipped" : "callgraph_extract"
+  };
+}
+
+function extractCalledFunctionNames(functionCode) {
+  const text = (functionCode || "").toString();
+  if (!text) return [];
+  const candidates = new Set();
+  const callRe = /\b([A-Za-z_$][\w$]{1,60})\s*\(/g;
+  let match;
+  while ((match = callRe.exec(text))) {
+    const name = match[1] || "";
+    if (!name) continue;
+    if (!isProbablyLocalFunctionName(name)) continue;
+    candidates.add(name);
+    if (candidates.size >= 40) break;
+  }
+  return Array.from(candidates);
+}
+
+function isProbablyLocalFunctionName(name) {
+  const id = (name || "").toString().trim();
+  if (!id) return false;
+  const lower = id.toLowerCase();
+  const reserved = new Set([
+    "if",
+    "for",
+    "while",
+    "switch",
+    "catch",
+    "function",
+    "return",
+    "typeof",
+    "new",
+    "class",
+    "do",
+    "try",
+    "throw",
+    "await",
+    "async",
+    "this",
+    "super",
+    "json",
+    "string",
+    "number",
+    "boolean",
+    "object",
+    "array",
+    "date",
+    "math",
+    "regexp",
+    "console",
+    "parseint",
+    "parsefloat",
+    "isnan",
+    "isfinite",
+    "encodeuri",
+    "encodeuricomponent",
+    "decodeuri",
+    "decodeuricomponent",
+    "settimeout",
+    "setinterval",
+    "cleartimeout",
+    "clearinterval"
+  ]);
+  if (reserved.has(lower)) return false;
+  if (lower.startsWith("__")) return false;
+  if (lower.startsWith("on")) return false;
+  if (id.length <= 1) return false;
+  return true;
+}
+
+/**
  * 构建模型 2 的生成输入，分别压缩总结、修复指令与旧脚本，并记录裁剪统计。
  */
 function buildScriptGenerationPayload(summary, patchGuidance, previousScript) {
@@ -4013,6 +4319,263 @@ function buildScriptGenerationPayload(summary, patchGuidance, previousScript) {
     previousScriptExtracted: scriptClip.extracted,
     contextStrategy: scriptClip.strategy,
     totalInputChars: summaryClip.usedChars + guidanceClip.usedChars + scriptClip.usedChars
+  };
+}
+
+function buildCandidateScriptCacheKey(scriptName, summary, patchGuidance, previousScript) {
+  const safeName = sanitizeScriptName(scriptName || "unknown.js");
+  const summaryHash = hashText((summary || "").toString()).slice(0, 16);
+  const guidanceHash = hashText((patchGuidance || "").toString()).slice(0, 16);
+  const previousHash = hashText((previousScript || "").toString()).slice(0, 16);
+  return `script:candidate:${safeName}:${summaryHash}:${guidanceHash}:${previousHash}`;
+}
+
+async function loadCandidateScriptCache(cacheKey) {
+  if (!redisReady) return "";
+  try {
+    return (await redisClient.get(cacheKey)) || "";
+  } catch {
+    return "";
+  }
+}
+
+async function saveCandidateScriptCache(cacheKey, scriptText) {
+  if (!redisReady) return;
+  if (!scriptText) return;
+  try {
+    await redisClient.set(cacheKey, scriptText, { PX: candidateScriptCacheTtlMs });
+  } catch {
+    return;
+  }
+}
+
+function tryParseScriptOpsPayload(rawText) {
+  const extracted = extractJsonObjectFromText(rawText);
+  const parsed = extracted ? safeJson(extracted) : null;
+  if (!parsed || typeof parsed !== "object") return null;
+  const mode = (parsed.mode || parsed.type || "").toString().trim().toLowerCase();
+  if (mode !== "ops" && mode !== "operations") return null;
+  const ops = Array.isArray(parsed.ops) ? parsed.ops : Array.isArray(parsed.operations) ? parsed.operations : [];
+  if (!ops.length) return null;
+  return { mode: "ops", ops };
+}
+
+function extractJsonObjectFromText(rawText) {
+  const text = (rawText || "").toString().trim();
+  if (!text) return "";
+  const fenceMatch = /```(?:json)?\s*([\s\S]*?)```/i.exec(text);
+  if (fenceMatch && fenceMatch[1]) {
+    const fenced = fenceMatch[1].trim();
+    if (fenced) return fenced;
+  }
+  const firstBrace = text.indexOf("{");
+  const lastBrace = text.lastIndexOf("}");
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    return text.slice(firstBrace, lastBrace + 1).trim();
+  }
+  return text;
+}
+
+function findFunctionStartIndex(scriptText, name) {
+  const id = (name || "").toString().trim();
+  if (!id) return -1;
+  const patterns = [
+    new RegExp(`\\bfunction\\s+${id}\\s*\\(`, "m"),
+    new RegExp(`\\b(?:var|let|const)\\s+${id}\\s*=\\s*function\\s*\\(`, "m"),
+    new RegExp(`\\b${id}\\s*=\\s*function\\s*\\(`, "m")
+  ];
+  for (const pattern of patterns) {
+    const match = pattern.exec(scriptText);
+    if (match && typeof match.index === "number") return match.index;
+  }
+  return -1;
+}
+
+function findJsBlockEndIndex(text, startBraceIndex) {
+  let depth = 0;
+  let inSingle = false;
+  let inDouble = false;
+  let inTemplate = false;
+  let inLineComment = false;
+  let inBlockComment = false;
+  for (let i = startBraceIndex; i < text.length; i += 1) {
+    const ch = text[i];
+    const next = i + 1 < text.length ? text[i + 1] : "";
+    if (inLineComment) {
+      if (ch === "\n") inLineComment = false;
+      continue;
+    }
+    if (inBlockComment) {
+      if (ch === "*" && next === "/") {
+        inBlockComment = false;
+        i += 1;
+      }
+      continue;
+    }
+    if (!inSingle && !inDouble && !inTemplate) {
+      if (ch === "/" && next === "/") {
+        inLineComment = true;
+        i += 1;
+        continue;
+      }
+      if (ch === "/" && next === "*") {
+        inBlockComment = true;
+        i += 1;
+        continue;
+      }
+    }
+    if (!inDouble && !inTemplate && ch === "'" && text[i - 1] !== "\\") {
+      inSingle = !inSingle;
+      continue;
+    }
+    if (!inSingle && !inTemplate && ch === '"' && text[i - 1] !== "\\") {
+      inDouble = !inDouble;
+      continue;
+    }
+    if (!inSingle && !inDouble && ch === "`" && text[i - 1] !== "\\") {
+      inTemplate = !inTemplate;
+      continue;
+    }
+    if (inSingle || inDouble || inTemplate) continue;
+    if (ch === "{") depth += 1;
+    if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+function findFunctionBlockRange(scriptText, name) {
+  const startIndex = findFunctionStartIndex(scriptText, name);
+  if (startIndex < 0) return null;
+  const braceIndex = scriptText.indexOf("{", startIndex);
+  if (braceIndex < 0) return null;
+  const endIndex = findJsBlockEndIndex(scriptText, braceIndex);
+  if (endIndex < 0) return null;
+  return { startIndex, endIndex: endIndex + 1 };
+}
+
+function extractFunctionCode(scriptText, name, maxChars = 2600) {
+  const raw = (scriptText || "").toString();
+  const range = findFunctionBlockRange(raw, name);
+  if (!range) return "";
+  const code = raw.slice(range.startIndex, range.endIndex).trim();
+  if (!code) return "";
+  if (code.length <= maxChars) return code;
+  const clipped = clipTextKeepBothEnds(code, maxChars, "\n/* 已截断 */\n");
+  return clipped.text;
+}
+
+function buildScriptSelfRepairFeedback(params) {
+  const info = params && typeof params === "object" ? params : {};
+  const failureType = (info.failureType || "").toString().trim();
+  const failureReason = (info.failureReason || "").toString().trim();
+  const sampleHint = (info.sampleHint || "").toString().trim();
+  const lastParserCode = (info.lastParserCode || "").toString().trim();
+  const lines = [];
+  if (failureType || failureReason) {
+    lines.push(`【上轮失败类型】${failureType || "-"}`);
+    lines.push(`【上轮失败原因】${failureReason || "-"}`);
+  }
+  if (sampleHint) {
+    lines.push("【样本片段】");
+    lines.push(sampleHint);
+  }
+  if (lastParserCode) {
+    lines.push("【当前 scheduleHtmlParser 片段】");
+    lines.push(lastParserCode);
+  }
+  return lines.join("\n").trim();
+}
+
+function applyScriptOps(previousScript, ops) {
+  let scriptText = (previousScript || "").toString();
+  const applied = [];
+  const missed = [];
+  for (const op of ops || []) {
+    const item = op && typeof op === "object" ? op : {};
+    const type = (item.type || item.op || "").toString().trim().toLowerCase();
+    if (type === "replace_function" || type === "upsert_function") {
+      const name = (item.name || item.function || "").toString().trim();
+      const code = (item.code || item.body || "").toString();
+      if (!name || !code) {
+        missed.push({ type, name, reason: "missing_name_or_code" });
+        continue;
+      }
+      const range = findFunctionBlockRange(scriptText, name);
+      if (range) {
+        scriptText = `${scriptText.slice(0, range.startIndex)}${code}\n${scriptText.slice(range.endIndex)}`;
+        applied.push({ type: "replace_function", name });
+        continue;
+      }
+      if (type === "upsert_function") {
+        scriptText = `${scriptText.trimEnd()}\n\n${code}\n`;
+        applied.push({ type: "upsert_function", name });
+      } else {
+        missed.push({ type: "replace_function", name, reason: "function_not_found" });
+      }
+      continue;
+    }
+    if (type === "append") {
+      const code = (item.code || item.body || "").toString();
+      if (!code) {
+        missed.push({ type: "append", reason: "missing_code" });
+        continue;
+      }
+      scriptText = `${scriptText.trimEnd()}\n\n${code}\n`;
+      applied.push({ type: "append" });
+      continue;
+    }
+    if (type === "replace_regex") {
+      const pattern = (item.pattern || "").toString();
+      const replacement = (item.replacement || "").toString();
+      const flags = (item.flags || "g").toString();
+      if (!pattern) {
+        missed.push({ type: "replace_regex", reason: "missing_pattern" });
+        continue;
+      }
+      try {
+        const re = new RegExp(pattern, flags);
+        const before = scriptText;
+        const after = before.replace(re, replacement);
+        scriptText = after;
+        if (after !== before) {
+          applied.push({ type: "replace_regex" });
+        } else {
+          missed.push({ type: "replace_regex", reason: "pattern_not_matched" });
+        }
+      } catch {
+        missed.push({ type: "replace_regex", reason: "invalid_regex" });
+        continue;
+      }
+    }
+  }
+  if (applied.length === 0) {
+    return {
+      ok: false,
+      scriptText: "",
+      appliedOps: applied,
+      missedOps: missed,
+      failureReason: missed.length ? "no_ops_applied" : "empty_ops"
+    };
+  }
+  const hasEntry = /\bfunction\s+scheduleHtmlParser\s*\(/.test(scriptText);
+  if (!hasEntry) {
+    return {
+      ok: false,
+      scriptText: "",
+      appliedOps: applied,
+      missedOps: missed,
+      failureReason: "missing_scheduleHtmlParser"
+    };
+  }
+  return {
+    ok: true,
+    scriptText,
+    appliedOps: applied,
+    missedOps: missed,
+    failureReason: ""
   };
 }
 
@@ -4487,20 +5050,62 @@ async function generatePatchGuidance(summary, schoolId) {
  * 接收：结构总结、具体的修复指令、先前的脚本内容
  * 输出：可执行的 JavaScript 字符串
  */
-async function generateParserScript(summary, patchGuidance, previousScript, schoolId, preparedPayload = null) {
+async function generateParserScript(summary, patchGuidance, previousScript, schoolId, preparedPayload = null, options = {}) {
+  const optionInfo = options && typeof options === "object" ? options : {};
+  const scriptName = (optionInfo.scriptName || "").toString().trim();
   const payload = preparedPayload || buildScriptGenerationPayload(summary, patchGuidance, previousScript);
+  const cacheKey = scriptName ? buildCandidateScriptCacheKey(scriptName, summary, patchGuidance, previousScript) : "";
+  const cacheEnabled = cacheKey && optionInfo.cacheEnabled !== false;
+  if (cacheEnabled) {
+    const cached = await loadCandidateScriptCache(cacheKey);
+    if (cached) {
+      return {
+        ok: true,
+        text: cached,
+        provider: scriptProvider,
+        model: scriptModel,
+        statusCode: 200,
+        latencyMs: 0,
+        errorCode: "",
+        errorMessage: "",
+        failureReason: "",
+        stageId: "script_generation",
+        stageLabel: formatLlmStageLabel("script_generation"),
+        timeoutBudgetMs: Number(scriptTimeoutMs),
+        maxAttempts: 1,
+        attemptsUsed: 0,
+        retryCount: 0,
+        retryPolicy: "缓存命中",
+        attempts: [],
+        inputMeta: payload,
+        scriptRepairMode: "cache",
+        opsApplied: false,
+        opsCount: 0,
+        cacheHit: true
+      };
+    }
+  }
+  const feedbackText = (optionInfo.feedbackText || "").toString().trim();
+  const forceOps = optionInfo.forceOps === true;
   const systemPrompt =
     "你是教务系统解析脚本工程师，输出必须是可直接运行的 JavaScript 解析脚本。" +
     "脚本运行环境为 QuickJS，无 DOM API，仅可使用字符串与正则。" +
     "禁止输出 Markdown 或多余说明。";
   const userPrompt =
-    "请根据以下结构总结修复或生成解析脚本，要求输出完整 JS 脚本内容。" +
+    "请根据以下结构总结修复或生成解析脚本。" +
+    "优先采用“修复操作”输出：当提供旧脚本时，请输出 JSON（不要 Markdown），形如：\n" +
+    '{"mode":"ops","ops":[{"type":"replace_function","name":"scheduleHtmlParser","code":"function scheduleHtmlParser(html){...}"}]}\n' +
+    "可选 op: upsert_function/append/replace_regex。\n" +
+    (forceOps
+      ? "必须输出 JSON ops（不要输出完整脚本）。优先只替换 scheduleHtmlParser，必要时可补充 upsert_function。\n"
+      : "如果无法给出 ops（例如旧脚本缺失或需要整体重写），请直接输出完整 JS 脚本源码（不要 Markdown）。") +
     "脚本必须返回 JSON 字符串，结构兼容 ParsedCourse 字段。" +
     "若提供旧脚本，请在其基础上修复，保留工具函数与已有规范。\n" +
     `【结构总结】\n${payload.summary || "无"}\n` +
     `【修复指令】\n${payload.guidance || "无"}\n` +
     `【旧脚本】\n${payload.previousScript || "无"}\n` +
-    "请仅输出 JS 源码。";
+    (feedbackText ? `【上轮失败信息】\n${feedbackText}\n` : "") +
+    "输出要求：优先 JSON ops，否则完整 JS 源码。";
   const result = await callModelStage(systemPrompt, userPrompt, "script_generation");
   const latencyMs = Number(result?.latencyMs || 0);
   if (!result?.text) {
@@ -4526,16 +5131,234 @@ async function generateParserScript(summary, patchGuidance, previousScript, scho
       retryPolicy: (result?.retryPolicy || "").toString(),
       attempts: Array.isArray(result?.attempts) ? result.attempts : [],
       failureReason: (result?.failureReason || formatModelFailureReason(result)).toString(),
-      inputMeta: payload
+      inputMeta: payload,
+      scriptRepairMode: "full",
+      opsApplied: false,
+      opsCount: 0,
+      cacheHit: false
+    };
+  }
+  const rawText = (result.text || "").toString().trim();
+  const opsPayload = scriptOpsEnabled && previousScript ? tryParseScriptOpsPayload(rawText) : null;
+  if (opsPayload && Array.isArray(opsPayload.ops)) {
+    const applied = applyScriptOps(previousScript, opsPayload.ops);
+    if (applied.ok && applied.scriptText) {
+      const finalScript = applied.scriptText.trim();
+      await recordMetric("script_success", latencyMs, scriptCostPerCall);
+      if (schoolId) {
+        await recordSchoolMetric(schoolId, "script_success", latencyMs, scriptCostPerCall);
+      }
+      return {
+        ok: true,
+        text: finalScript,
+        provider: result?.provider || scriptProvider,
+        model: result?.model || scriptModel,
+        statusCode: Number(result?.statusCode || 200),
+        latencyMs,
+        errorCode: "",
+        errorMessage: "",
+        failureReason: "",
+        stageId: result?.stageId || "script_generation",
+        stageLabel: result?.stageLabel || formatLlmStageLabel("script_generation"),
+        timeoutBudgetMs: Number(result?.timeoutBudgetMs || scriptTimeoutMs),
+        maxAttempts: Number(result?.maxAttempts || scriptMaxRetries + 1),
+        attemptsUsed: Number(result?.attemptsUsed || 1),
+        retryCount: Number(result?.retryCount || 0),
+        retryPolicy: (result?.retryPolicy || "").toString(),
+        attempts: Array.isArray(result?.attempts) ? result.attempts : [],
+        inputMeta: payload,
+        scriptRepairMode: "ops",
+        opsApplied: true,
+        opsCount: Array.isArray(applied.appliedOps) ? applied.appliedOps.length : 0,
+        opsMissedCount: Array.isArray(applied.missedOps) ? applied.missedOps.length : 0,
+        opsMissedNames: Array.isArray(applied.missedOps)
+          ? applied.missedOps
+              .map((item) => (item?.name || "").toString().trim())
+              .filter(Boolean)
+              .slice(0, 6)
+              .join(",")
+          : "",
+        cacheHit: false
+      };
+    }
+    const opsCount = Array.isArray(opsPayload.ops) ? opsPayload.ops.length : 0;
+    const missedOps = Array.isArray(applied.missedOps) ? applied.missedOps : [];
+    const opsMissedCount = missedOps.length;
+    const opsMissedNames = missedOps
+      .map((item) => (item?.name || "").toString().trim())
+      .filter(Boolean)
+      .slice(0, 6)
+      .join(",");
+    const opsApplyFailureReason = (applied.failureReason || "ops_apply_failed").toString();
+    if (forceOps) {
+      await recordMetric("script_failed", latencyMs, scriptCostPerCall);
+      if (schoolId) {
+        await recordSchoolMetric(schoolId, "script_failed", latencyMs, scriptCostPerCall);
+      }
+      return {
+        ok: false,
+        text: "",
+        provider: result?.provider || scriptProvider,
+        model: result?.model || scriptModel,
+        statusCode: Number(result?.statusCode || 0),
+        latencyMs,
+        errorCode: "ops_apply_failed",
+        errorMessage: opsApplyFailureReason,
+        stageId: result?.stageId || "script_generation",
+        stageLabel: result?.stageLabel || formatLlmStageLabel("script_generation"),
+        timeoutBudgetMs: Number(result?.timeoutBudgetMs || scriptTimeoutMs),
+        maxAttempts: Number(result?.maxAttempts || scriptMaxRetries + 1),
+        attemptsUsed: Number(result?.attemptsUsed || 1),
+        retryCount: Number(result?.retryCount || 0),
+        retryPolicy: (result?.retryPolicy || "").toString(),
+        attempts: Array.isArray(result?.attempts) ? result.attempts : [],
+        failureReason: `ops_apply_failed:${opsApplyFailureReason}`,
+        inputMeta: payload,
+        scriptRepairMode: "ops_failed",
+        opsApplied: false,
+        opsCount,
+        opsMissedCount,
+        opsMissedNames,
+        opsApplyFailureReason,
+        cacheHit: false
+      };
+    }
+    const fullUserPrompt =
+      "上一次输出了 JSON ops，但服务端应用失败。" +
+      "请直接输出“完整 JavaScript 脚本源码”（不要输出 JSON，不要 Markdown），并确保可通过结构校验。" +
+      "脚本运行环境为 QuickJS，无 DOM API，仅可使用字符串与正则。" +
+      "脚本必须返回 JSON 字符串，结构兼容 ParsedCourse 字段。" +
+      "若提供旧脚本，请在其基础上修复，保留工具函数与已有规范。\n" +
+      `【结构总结】\n${payload.summary || "无"}\n` +
+      `【修复指令】\n${payload.guidance || "无"}\n` +
+      `【旧脚本】\n${payload.previousScript || "无"}\n` +
+      `【ops 应用失败原因】${opsApplyFailureReason}\n` +
+      (opsMissedNames ? `【未命中函数】${opsMissedNames}\n` : "") +
+      (feedbackText ? `【上轮失败信息】\n${feedbackText}\n` : "") +
+      "输出要求：只输出完整 JS 源码。";
+    const fullResult = await callModelStage(systemPrompt, fullUserPrompt, "script_generation");
+    const fullLatencyMs = latencyMs + Number(fullResult?.latencyMs || 0);
+    if (!fullResult?.text) {
+      await recordMetric("script_failed", fullLatencyMs, scriptCostPerCall);
+      if (schoolId) {
+        await recordSchoolMetric(schoolId, "script_failed", fullLatencyMs, scriptCostPerCall);
+      }
+      return {
+        ok: false,
+        text: "",
+        provider: fullResult?.provider || result?.provider || scriptProvider,
+        model: fullResult?.model || result?.model || scriptModel,
+        statusCode: Number(fullResult?.statusCode || result?.statusCode || 0),
+        latencyMs: fullLatencyMs,
+        errorCode: (fullResult?.errorCode || result?.errorCode || "").toString(),
+        errorMessage: (fullResult?.errorMessage || result?.errorMessage || "").toString(),
+        stageId: fullResult?.stageId || result?.stageId || "script_generation",
+        stageLabel: fullResult?.stageLabel || result?.stageLabel || formatLlmStageLabel("script_generation"),
+        timeoutBudgetMs: Number(fullResult?.timeoutBudgetMs || result?.timeoutBudgetMs || scriptTimeoutMs),
+        maxAttempts: Number(fullResult?.maxAttempts || result?.maxAttempts || scriptMaxRetries + 1),
+        attemptsUsed: Number(fullResult?.attemptsUsed || result?.attemptsUsed || 1),
+        retryCount: Number(fullResult?.retryCount || result?.retryCount || 0),
+        retryPolicy: (fullResult?.retryPolicy || result?.retryPolicy || "").toString(),
+        attempts: Array.isArray(fullResult?.attempts) ? fullResult.attempts : Array.isArray(result?.attempts) ? result.attempts : [],
+        failureReason: (fullResult?.failureReason || formatModelFailureReason(fullResult)).toString() || "full_fallback_failed",
+        inputMeta: payload,
+        scriptRepairMode: "full_fallback_failed",
+        opsApplied: false,
+        opsCount,
+        opsMissedCount,
+        opsMissedNames,
+        opsApplyFailureReason,
+        cacheHit: false,
+        fallbackPath: "ops_apply_failed->full_script"
+      };
+    }
+    const fullText = (fullResult.text || "").toString().trim();
+    const fullOpsPayload = scriptOpsEnabled && previousScript ? tryParseScriptOpsPayload(fullText) : null;
+    if (fullOpsPayload && Array.isArray(fullOpsPayload.ops)) {
+      const repairedApplied = applyScriptOps(previousScript, fullOpsPayload.ops);
+      if (repairedApplied.ok && repairedApplied.scriptText) {
+        const finalScript = repairedApplied.scriptText.trim();
+        await recordMetric("script_success", fullLatencyMs, scriptCostPerCall);
+        if (schoolId) {
+          await recordSchoolMetric(schoolId, "script_success", fullLatencyMs, scriptCostPerCall);
+        }
+        return {
+          ok: true,
+          text: finalScript,
+          provider: fullResult?.provider || result?.provider || scriptProvider,
+          model: fullResult?.model || result?.model || scriptModel,
+          statusCode: Number(fullResult?.statusCode || 200),
+          latencyMs: fullLatencyMs,
+          errorCode: "",
+          errorMessage: "",
+          failureReason: "",
+          stageId: fullResult?.stageId || "script_generation",
+          stageLabel: fullResult?.stageLabel || formatLlmStageLabel("script_generation"),
+          timeoutBudgetMs: Number(fullResult?.timeoutBudgetMs || scriptTimeoutMs),
+          maxAttempts: Number(fullResult?.maxAttempts || scriptMaxRetries + 1),
+          attemptsUsed: Number(fullResult?.attemptsUsed || 1),
+          retryCount: Number(fullResult?.retryCount || 0),
+          retryPolicy: (fullResult?.retryPolicy || "").toString(),
+          attempts: Array.isArray(fullResult?.attempts) ? fullResult.attempts : [],
+          inputMeta: payload,
+          scriptRepairMode: "ops_fallback",
+          opsApplied: true,
+          opsCount: Array.isArray(repairedApplied.appliedOps) ? repairedApplied.appliedOps.length : 0,
+          opsMissedCount: Array.isArray(repairedApplied.missedOps) ? repairedApplied.missedOps.length : 0,
+          opsMissedNames: Array.isArray(repairedApplied.missedOps)
+            ? repairedApplied.missedOps
+                .map((item) => (item?.name || "").toString().trim())
+                .filter(Boolean)
+                .slice(0, 6)
+                .join(",")
+            : "",
+          cacheHit: false,
+          fallbackPath: "ops_apply_failed->full_prompt->ops"
+        };
+      }
+    }
+    await recordMetric("script_success", fullLatencyMs, scriptCostPerCall);
+    if (schoolId) {
+      await recordSchoolMetric(schoolId, "script_success", fullLatencyMs, scriptCostPerCall);
+    }
+    const finalScript = cleanScriptOutput(fullText);
+    return {
+      ok: true,
+      text: finalScript,
+      provider: fullResult?.provider || result?.provider || scriptProvider,
+      model: fullResult?.model || result?.model || scriptModel,
+      statusCode: Number(fullResult?.statusCode || 200),
+      latencyMs: fullLatencyMs,
+      errorCode: "",
+      errorMessage: "",
+      failureReason: "",
+      stageId: fullResult?.stageId || "script_generation",
+      stageLabel: fullResult?.stageLabel || formatLlmStageLabel("script_generation"),
+      timeoutBudgetMs: Number(fullResult?.timeoutBudgetMs || scriptTimeoutMs),
+      maxAttempts: Number(fullResult?.maxAttempts || scriptMaxRetries + 1),
+      attemptsUsed: Number(fullResult?.attemptsUsed || 1),
+      retryCount: Number(fullResult?.retryCount || 0),
+      retryPolicy: (fullResult?.retryPolicy || "").toString(),
+      attempts: Array.isArray(fullResult?.attempts) ? fullResult.attempts : [],
+      inputMeta: payload,
+      scriptRepairMode: "full_fallback",
+      opsApplied: false,
+      opsCount,
+      opsMissedCount,
+      opsMissedNames,
+      opsApplyFailureReason,
+      cacheHit: false,
+      fallbackPath: "ops_apply_failed->full_script"
     };
   }
   await recordMetric("script_success", latencyMs, scriptCostPerCall);
   if (schoolId) {
     await recordSchoolMetric(schoolId, "script_success", latencyMs, scriptCostPerCall);
   }
+  const finalScript = cleanScriptOutput(rawText);
   return {
     ok: true,
-    text: cleanScriptOutput(result.text),
+    text: finalScript,
     provider: result?.provider || scriptProvider,
     model: result?.model || scriptModel,
     statusCode: Number(result?.statusCode || 200),
@@ -4551,7 +5374,11 @@ async function generateParserScript(summary, patchGuidance, previousScript, scho
     retryCount: Number(result?.retryCount || 0),
     retryPolicy: (result?.retryPolicy || "").toString(),
     attempts: Array.isArray(result?.attempts) ? result.attempts : [],
-    inputMeta: payload
+    inputMeta: payload,
+    scriptRepairMode: "full",
+    opsApplied: false,
+    opsCount: 0,
+    cacheHit: false
   };
 }
 

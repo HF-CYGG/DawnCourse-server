@@ -11,8 +11,14 @@ const port = Number(process.env.PORT || 8080);
 const timeoutMs = Number(process.env.LLM_TIMEOUT_MS || 20000);
 // 模型 1 汇总相关请求单独放宽超时，避免真实样本汇总过早中断
 const summaryTimeoutMs = Number(process.env.LLM_SUMMARY_TIMEOUT_MS || Math.max(timeoutMs, 45000));
+// 模型 1 修复指令生成通常比总结更短，但仍需要独立预算，避免与总结/脚本生成共用同一超时策略
+const patchGuidanceTimeoutMs = Number(process.env.LLM_PATCH_GUIDANCE_TIMEOUT_MS || Math.max(timeoutMs, 30000));
 // 模型 2 生成脚本通常更慢，允许比通用超时更长
 const scriptTimeoutMs = Number(process.env.LLM_SCRIPT_TIMEOUT_MS || Math.max(timeoutMs, 60000));
+// 三类调用分别配置独立重试次数，重试次数表示“失败后额外再试几次”
+const summaryMaxRetries = Math.max(0, Number(process.env.LLM_SUMMARY_MAX_RETRIES || 1));
+const patchGuidanceMaxRetries = Math.max(0, Number(process.env.LLM_PATCH_GUIDANCE_MAX_RETRIES || 2));
+const scriptMaxRetries = Math.max(0, Number(process.env.LLM_SCRIPT_MAX_RETRIES || 1));
 // 请求体最大长度（默认 100 万字符，避免被动截断上传）
 const maxContentLength = Number(process.env.MAX_CONTENT_LENGTH || 1000000);
 // 任务缓存清理的最大存活时长
@@ -2705,9 +2711,10 @@ async function processSchoolQueue(schoolId) {
       }
       if (result?.failed) {
         await setSchoolPhase(schoolId, "FAILED_RETRYING");
-        return;
+    return { applied: false, failed: true };
       }
-    }
+  return { applied: true, failed: false };
+}
     if (!appliedAny) return;
     await clearSchoolQueue(schoolId);
     await setSchoolPhase(schoolId, "IDLE");
@@ -2744,24 +2751,28 @@ async function processQueueCluster(schoolId, items, normalizedIssues, state, now
     return { state: refreshed, applied: true };
   }
   const mergedPayload = buildSummaryPayload(items);
+  const summaryTraceMeta = buildSummaryPayloadTraceMeta(mergedPayload, {
+    schoolId,
+    modelRole: "summary",
+    provider: summaryProvider,
+    model: summaryModel,
+    action: "summarize_submissions",
+    llmStage: "summary",
+    llmStageLabel: formatLlmStageLabel("summary"),
+    timeoutBudgetMs: summaryTimeoutMs,
+    maxAttempts: summaryMaxRetries + 1,
+    attemptsUsed: 0,
+    retryCount: 0,
+    retryPolicy: buildModelRetryPolicy(getModelStageConfig("summary"))
+  });
   await appendRepairIssueTraceBatch(issueIds, {
     stage: "CANDIDATE_TEST_RUNNING",
     level: "info",
     message: "开始汇总失败样本（模型 1）",
     source: "queue_processor",
     meta: {
-      schoolId,
-      sampleCount: Array.isArray(items) ? items.length : 0,
-      modelRole: "summary",
-      provider: summaryProvider,
-      model: summaryModel,
-      action: "summarize_submissions",
-      inputChars: mergedPayload.usedChars,
-      originalInputChars: mergedPayload.originalChars,
-      includedSamples: mergedPayload.includedSamples,
-      droppedSamples: mergedPayload.droppedSamples,
-      truncatedSamples: mergedPayload.truncatedSamples,
-      timeoutBudgetMs: summaryTimeoutMs
+      ...summaryTraceMeta,
+      sampleCount: Array.isArray(items) ? items.length : 0
     }
   });
   const summaryResult = await summarizeSubmissions(mergedPayload.text, schoolId);
@@ -2769,28 +2780,24 @@ async function processQueueCluster(schoolId, items, normalizedIssues, state, now
     await appendRepairIssueTraceBatch(issueIds, {
       stage: "CANDIDATE_TEST_RESULT",
       level: "error",
-      message: `模型 1 汇总失败：${summaryResult.failureReason || "未生成结构总结"}`,
+      message: `模型 1 汇总失败：${summaryResult.failureReason || "未生成结构总结"}；降级为逐条修复流程`,
       source: "queue_processor",
       meta: {
-        schoolId,
-        modelRole: "summary",
-        provider: summaryResult.provider || summaryProvider,
-        model: summaryResult.model || summaryModel,
-        action: "summarize_submissions",
-        ok: false,
-        statusCode: Number(summaryResult.statusCode || 0),
-        latencyMs: Number(summaryResult.latencyMs || 0),
-        errorCode: summaryResult.errorCode || "",
-        errorMessage: summaryResult.errorMessage || "",
-        inputChars: mergedPayload.usedChars,
-        originalInputChars: mergedPayload.originalChars,
-        includedSamples: mergedPayload.includedSamples,
-        droppedSamples: mergedPayload.droppedSamples,
-        truncatedSamples: mergedPayload.truncatedSamples,
-        timeoutBudgetMs: summaryTimeoutMs
+        ...summaryTraceMeta,
+        ...buildModelCallTraceMeta(summaryResult, {
+          schoolId,
+          modelRole: "summary",
+          action: "summarize_submissions"
+        }),
+        sampleCount: Array.isArray(items) ? items.length : 0,
+        fallbackPath: "降级为逐条总结 -> 再生成修复脚本",
+        manualSuggestion: "若逐条流程仍失败，请人工查看失败样本并在后台重试或手动修复脚本"
       }
     });
-    return { state, applied: false };
+    await setSchoolPhase(schoolId, "REPAIRING");
+    const degraded = await processIndividualSummaries(schoolId, items, issueIds);
+    const refreshed = (await getSchoolState(schoolId)) || state;
+    return { state: refreshed, applied: Boolean(degraded?.applied), failed: Boolean(degraded?.failed) };
   }
   const summary = summaryResult.text;
   await appendRepairIssueTraceBatch(issueIds, {
@@ -2799,13 +2806,29 @@ async function processQueueCluster(schoolId, items, normalizedIssues, state, now
     message: "模型 1 汇总完成，开始生成修复指令",
     source: "queue_processor",
     meta: {
-      schoolId,
-      modelRole: "summary",
-      provider: summaryProvider,
-      model: summaryModel,
-      action: "generate_patch_guidance",
-      ok: true
+      ...summaryTraceMeta,
+      ...buildModelCallTraceMeta(summaryResult, {
+        schoolId,
+        modelRole: "summary",
+        action: "summarize_submissions",
+        ok: true
+      }),
+      sampleCount: Array.isArray(items) ? items.length : 0
     }
+  });
+  const patchGuidanceTraceMeta = buildPatchGuidanceTraceMeta(summary, {
+    schoolId,
+    modelRole: "summary",
+    provider: summaryProvider,
+    model: summaryModel,
+    action: "generate_patch_guidance",
+    llmStage: "patch_guidance",
+    llmStageLabel: formatLlmStageLabel("patch_guidance"),
+    timeoutBudgetMs: patchGuidanceTimeoutMs,
+    maxAttempts: patchGuidanceMaxRetries + 1,
+    attemptsUsed: 0,
+    retryCount: 0,
+    retryPolicy: buildModelRetryPolicy(getModelStageConfig("patch_guidance"))
   });
   const patchGuidanceResult = await generatePatchGuidance(summary, schoolId);
   await appendRepairIssueTraceBatch(issueIds, {
@@ -2813,19 +2836,21 @@ async function processQueueCluster(schoolId, items, normalizedIssues, state, now
     level: patchGuidanceResult.ok && patchGuidanceResult.text ? "info" : "warning",
     message: patchGuidanceResult.ok && patchGuidanceResult.text
       ? "修复指令生成完成，准备调用模型 2 生成候选脚本"
-      : `修复指令生成失败：${patchGuidanceResult.failureReason || "输出为空"}，仍继续调用模型 2 生成候选脚本`,
+      : `修复指令生成失败：${patchGuidanceResult.failureReason || "输出为空"}，降级为“仅依赖总结+旧脚本”继续调用模型 2`,
     source: "queue_processor",
     meta: {
-      schoolId,
-      modelRole: "summary",
-      provider: patchGuidanceResult.provider || summaryProvider,
-      model: patchGuidanceResult.model || summaryModel,
-      action: "generate_patch_guidance",
-      ok: Boolean(patchGuidanceResult.ok && patchGuidanceResult.text),
-      statusCode: Number(patchGuidanceResult.statusCode || 0),
-      latencyMs: Number(patchGuidanceResult.latencyMs || 0),
-      errorCode: patchGuidanceResult.errorCode || "",
-      errorMessage: patchGuidanceResult.errorMessage || ""
+      ...patchGuidanceTraceMeta,
+      ...buildModelCallTraceMeta(patchGuidanceResult, {
+        schoolId,
+        modelRole: "summary",
+        action: "generate_patch_guidance",
+        ok: Boolean(patchGuidanceResult.ok && patchGuidanceResult.text)
+      }),
+      fallbackPath: patchGuidanceResult.ok && patchGuidanceResult.text ? "" : "保留模型1总结，跳过修复指令，继续模型2脚本生成",
+      manualSuggestion:
+        patchGuidanceResult.ok && patchGuidanceResult.text
+          ? ""
+          : "若模型2结果仍不稳定，请人工补充修复指令后重试"
     }
   });
   const patchGuidance = patchGuidanceResult.text || "";
@@ -2859,24 +2884,32 @@ async function processQueueCluster(schoolId, items, normalizedIssues, state, now
   const scriptName = resolveScriptName(schoolId, items);
   const previousScript = await readScript(scriptName);
   const previousMeta = await getScriptMeta(scriptName);
+  const scriptPayload = buildScriptGenerationPayload(summary, patchGuidance, previousScript);
+  const scriptTraceMeta = buildScriptGenerationTraceMeta(scriptPayload, {
+    schoolId,
+    scriptName,
+    previousVersion: Number(previousMeta?.version || 0),
+    modelRole: "script_repair",
+    provider: scriptProvider,
+    model: scriptModel,
+    action: "generate_candidate_script",
+    llmStage: "script_generation",
+    llmStageLabel: formatLlmStageLabel("script_generation"),
+    timeoutBudgetMs: scriptTimeoutMs,
+    maxAttempts: scriptMaxRetries + 1,
+    attemptsUsed: 0,
+    retryCount: 0,
+    retryPolicy: buildModelRetryPolicy(getModelStageConfig("script_generation"))
+  });
   await setSchoolPhase(schoolId, "REPAIRING");
   await appendRepairIssueTraceBatch(issueIds, {
     stage: "CANDIDATE_TEST_RUNNING",
     level: "info",
     message: "模型 2 正在生成候选脚本",
     source: "queue_processor",
-    meta: {
-      schoolId,
-      scriptName,
-      previousVersion: Number(previousMeta?.version || 0),
-      modelRole: "script_repair",
-      provider: scriptProvider,
-      model: scriptModel,
-      action: "generate_candidate_script",
-      timeoutBudgetMs: scriptTimeoutMs
-    }
+    meta: scriptTraceMeta
   });
-  const generatedScriptResult = await generateParserScript(summary, patchGuidance, previousScript, schoolId);
+  const generatedScriptResult = await generateParserScript(summary, patchGuidance, previousScript, schoolId, scriptPayload);
   if (!generatedScriptResult.ok || !generatedScriptResult.text) {
     await appendRepairIssueTraceBatch(issueIds, {
       stage: "CANDIDATE_TEST_RESULT",
@@ -2884,31 +2917,17 @@ async function processQueueCluster(schoolId, items, normalizedIssues, state, now
       message: `模型 2 生成候选脚本失败：${generatedScriptResult.failureReason || "未生成脚本"}`,
       source: "queue_processor",
       meta: {
-        schoolId,
-        scriptName,
-        previousVersion: Number(previousMeta?.version || 0),
-        modelRole: "script_repair",
-        provider: generatedScriptResult.provider || scriptProvider,
-        model: generatedScriptResult.model || scriptModel,
-        action: "generate_candidate_script",
-        ok: false,
-        statusCode: Number(generatedScriptResult.statusCode || 0),
-        latencyMs: Number(generatedScriptResult.latencyMs || 0),
-        errorCode: generatedScriptResult.errorCode || "",
-        errorMessage: generatedScriptResult.errorMessage || "",
-        timeoutBudgetMs: scriptTimeoutMs,
-        inputChars: Number(generatedScriptResult.inputMeta?.totalInputChars || 0),
-        summaryChars: Number(generatedScriptResult.inputMeta?.summaryChars || 0),
-        originalSummaryChars: Number(generatedScriptResult.inputMeta?.originalSummaryChars || 0),
-        guidanceChars: Number(generatedScriptResult.inputMeta?.guidanceChars || 0),
-        originalGuidanceChars: Number(generatedScriptResult.inputMeta?.originalGuidanceChars || 0),
-        previousScriptChars: Number(generatedScriptResult.inputMeta?.previousScriptChars || 0),
-        originalPreviousScriptChars: Number(generatedScriptResult.inputMeta?.originalPreviousScriptChars || 0),
-        truncatedSummary: Boolean(generatedScriptResult.inputMeta?.summaryTruncated),
-        truncatedGuidance: Boolean(generatedScriptResult.inputMeta?.guidanceTruncated),
-        truncatedPreviousScript: Boolean(generatedScriptResult.inputMeta?.previousScriptTruncated),
-        previousScriptExtracted: Boolean(generatedScriptResult.inputMeta?.previousScriptExtracted),
-        contextStrategy: generatedScriptResult.inputMeta?.contextStrategy || ""
+        ...scriptTraceMeta,
+        ...buildScriptGenerationTraceMeta(generatedScriptResult.inputMeta, {}),
+        ...buildModelCallTraceMeta(generatedScriptResult, {
+          schoolId,
+          scriptName,
+          previousVersion: Number(previousMeta?.version || 0),
+          modelRole: "script_repair",
+          action: "generate_candidate_script",
+          ok: false
+        }),
+        manualSuggestion: "请人工检查模型2输入裁剪结果、旧脚本提炼片段与模型配置后再重试"
       }
     });
     return { state, applied: false };
@@ -2921,14 +2940,17 @@ async function processQueueCluster(schoolId, items, normalizedIssues, state, now
     message: "模型 2 候选脚本已生成，开始回放验证",
     source: "queue_processor",
     meta: {
-      schoolId,
-      scriptName,
-      previousVersion: Number(previousMeta?.version || 0),
-      sampleCount: Array.isArray(items) ? items.length : 0,
-      modelRole: "script_repair",
-      provider: scriptProvider,
-      model: scriptModel,
-      action: "replay_candidate_script"
+      ...scriptTraceMeta,
+      ...buildScriptGenerationTraceMeta(generatedScriptResult.inputMeta, {}),
+      ...buildModelCallTraceMeta(generatedScriptResult, {
+        schoolId,
+        scriptName,
+        previousVersion: Number(previousMeta?.version || 0),
+        sampleCount: Array.isArray(items) ? items.length : 0,
+        modelRole: "script_repair",
+        action: "generate_candidate_script",
+        ok: true
+      })
     }
   });
   const submissionReplay = runSubmissionReplay(generatedScript, items);
@@ -3024,6 +3046,9 @@ async function processIndividualSummaries(schoolId, queue, issueIds = []) {
   let totalOriginalChars = 0;
   let totalUsedChars = 0;
   let totalTruncatedSamples = 0;
+  let totalAttemptsUsed = 0;
+  let totalRetryCount = 0;
+  let maxAttemptsObserved = 0;
   await appendRepairIssueTraceBatch(issueIds, {
     stage: "CANDIDATE_TEST_RUNNING",
     level: "info",
@@ -3036,7 +3061,14 @@ async function processIndividualSummaries(schoolId, queue, issueIds = []) {
       provider: summaryProvider,
       model: summaryModel,
       action: "summarize_submissions_single",
-      timeoutBudgetMs: summaryTimeoutMs
+      llmStage: "summary",
+      llmStageLabel: formatLlmStageLabel("summary"),
+      timeoutBudgetMs: summaryTimeoutMs,
+      maxAttempts: summaryMaxRetries + 1,
+      attemptsUsed: 0,
+      retryCount: 0,
+      retryPolicy: buildModelRetryPolicy(getModelStageConfig("summary")),
+      inputClipStrategy: `逐条处理，每条最多 ${summaryMaxSampleChars} 字`
     }
   });
   for (const item of queue) {
@@ -3045,6 +3077,9 @@ async function processIndividualSummaries(schoolId, queue, issueIds = []) {
     totalUsedChars += singlePayload.usedChars;
     totalTruncatedSamples += singlePayload.truncatedSamples;
     const summaryResult = await summarizeSubmissions(singlePayload.text, schoolId);
+    totalAttemptsUsed += Number(summaryResult?.attemptsUsed || 0);
+    totalRetryCount += Number(summaryResult?.retryCount || 0);
+    maxAttemptsObserved = Math.max(maxAttemptsObserved, Number(summaryResult?.maxAttempts || 0));
     if (summaryResult.ok && summaryResult.text) {
       summaries.push(summaryResult.text);
     } else if (!lastSummaryFailure || summaryResult.failureReason) {
@@ -3055,26 +3090,31 @@ async function processIndividualSummaries(schoolId, queue, issueIds = []) {
     await appendRepairIssueTraceBatch(issueIds, {
       stage: "CANDIDATE_TEST_RESULT",
       level: "error",
-      message: `逐条汇总失败：${lastSummaryFailure?.failureReason || "未生成可用总结"}`,
+      message: `逐条汇总失败：${lastSummaryFailure?.failureReason || "未生成可用总结"}，需要人工介入`,
       source: "queue_processor",
       meta: {
         schoolId,
         modelRole: "summary",
-        provider: lastSummaryFailure?.provider || summaryProvider,
-        model: lastSummaryFailure?.model || summaryModel,
         action: "summarize_submissions_single",
-        ok: false,
-        statusCode: Number(lastSummaryFailure?.statusCode || 0),
-        latencyMs: Number(lastSummaryFailure?.latencyMs || 0),
-        errorCode: lastSummaryFailure?.errorCode || "",
-        errorMessage: lastSummaryFailure?.errorMessage || "",
+        ...buildModelCallTraceMeta(lastSummaryFailure, {
+          schoolId,
+          modelRole: "summary",
+          action: "summarize_submissions_single",
+          ok: false
+        }),
         originalInputChars: totalOriginalChars,
         inputChars: totalUsedChars,
         truncatedSamples: totalTruncatedSamples,
-        timeoutBudgetMs: summaryTimeoutMs
+        attemptsUsed: totalAttemptsUsed,
+        retryCount: totalRetryCount,
+        maxAttempts: Math.max(maxAttemptsObserved, summaryMaxRetries + 1),
+        timeoutBudgetMs: summaryTimeoutMs,
+        inputClipStrategy: `逐条处理，每条最多 ${summaryMaxSampleChars} 字`,
+        fallbackPath: "停止自动修复，保留现场等待人工处理",
+        manualSuggestion: "请人工查看失败样本、模型配置和脚本版本后，再决定是否重试或手动修复"
       }
     });
-    return;
+    return { applied: false, failed: true, manualInterventionRequired: true };
   }
   const mergedSummary = summaries.map((text, index) => `【总结 ${index + 1}】\n${text}`).join("\n");
   const scriptName = resolveScriptName(schoolId, queue);
@@ -3089,11 +3129,43 @@ async function processIndividualSummaries(schoolId, queue, issueIds = []) {
       schoolId,
       scriptName,
       modelRole: "summary",
-      provider: summaryProvider,
-      model: summaryModel,
-      action: "generate_patch_guidance_single",
-      ok: true
+      action: "summarize_submissions_single",
+      ...buildModelCallTraceMeta({}, {
+        schoolId,
+        modelRole: "summary",
+        provider: summaryProvider,
+        model: summaryModel,
+        action: "summarize_submissions_single",
+        llmStage: "summary",
+        llmStageLabel: formatLlmStageLabel("summary"),
+        ok: true,
+        timeoutBudgetMs: summaryTimeoutMs,
+        maxAttempts: Math.max(maxAttemptsObserved, summaryMaxRetries + 1),
+        attemptsUsed: totalAttemptsUsed,
+        retryCount: totalRetryCount,
+        retryPolicy: buildModelRetryPolicy(getModelStageConfig("summary"))
+      }),
+      originalInputChars: totalOriginalChars,
+      inputChars: totalUsedChars,
+      truncatedSamples: totalTruncatedSamples,
+      sampleCount: Array.isArray(queue) ? queue.length : 0,
+      inputClipStrategy: `逐条处理，每条最多 ${summaryMaxSampleChars} 字`
     }
+  });
+  const patchGuidanceSingleTraceMeta = buildPatchGuidanceTraceMeta(mergedSummary, {
+    schoolId,
+    scriptName,
+    modelRole: "summary",
+    provider: summaryProvider,
+    model: summaryModel,
+    action: "generate_patch_guidance_single",
+    llmStage: "patch_guidance",
+    llmStageLabel: formatLlmStageLabel("patch_guidance"),
+    timeoutBudgetMs: patchGuidanceTimeoutMs,
+    maxAttempts: patchGuidanceMaxRetries + 1,
+    attemptsUsed: 0,
+    retryCount: 0,
+    retryPolicy: buildModelRetryPolicy(getModelStageConfig("patch_guidance"))
   });
   const patchGuidanceResult = await generatePatchGuidance(mergedSummary, schoolId);
   await appendRepairIssueTraceBatch(issueIds, {
@@ -3101,40 +3173,56 @@ async function processIndividualSummaries(schoolId, queue, issueIds = []) {
     level: patchGuidanceResult.ok && patchGuidanceResult.text ? "info" : "warning",
     message: patchGuidanceResult.ok && patchGuidanceResult.text
       ? "逐条修复指令生成完成，准备调用模型 2"
-      : `逐条修复指令生成失败：${patchGuidanceResult.failureReason || "输出为空"}，仍继续调用模型 2`,
+      : `逐条修复指令生成失败：${patchGuidanceResult.failureReason || "输出为空"}，降级为“仅依赖总结+旧脚本”继续调用模型 2`,
     source: "queue_processor",
     meta: {
-      schoolId,
-      scriptName,
-      modelRole: "summary",
-      provider: patchGuidanceResult.provider || summaryProvider,
-      model: patchGuidanceResult.model || summaryModel,
-      action: "generate_patch_guidance_single",
-      ok: Boolean(patchGuidanceResult.ok && patchGuidanceResult.text),
-      statusCode: Number(patchGuidanceResult.statusCode || 0),
-      latencyMs: Number(patchGuidanceResult.latencyMs || 0),
-      errorCode: patchGuidanceResult.errorCode || "",
-      errorMessage: patchGuidanceResult.errorMessage || ""
+      ...patchGuidanceSingleTraceMeta,
+      ...buildModelCallTraceMeta(patchGuidanceResult, {
+        schoolId,
+        scriptName,
+        modelRole: "summary",
+        action: "generate_patch_guidance_single",
+        ok: Boolean(patchGuidanceResult.ok && patchGuidanceResult.text)
+      }),
+      fallbackPath: patchGuidanceResult.ok && patchGuidanceResult.text ? "" : "保留逐条总结，跳过修复指令，继续模型2脚本生成",
+      manualSuggestion:
+        patchGuidanceResult.ok && patchGuidanceResult.text
+          ? ""
+          : "若模型2仍失败，请人工梳理修复指令或直接手动修复脚本"
     }
   });
   const patchGuidance = patchGuidanceResult.text || "";
+  const scriptPayload = buildScriptGenerationPayload(mergedSummary, patchGuidance, previousScript);
+  const scriptTraceMeta = buildScriptGenerationTraceMeta(scriptPayload, {
+    schoolId,
+    scriptName,
+    previousVersion: Number(previousMeta?.version || 0),
+    modelRole: "script_repair",
+    provider: scriptProvider,
+    model: scriptModel,
+    action: "generate_candidate_script_single",
+    llmStage: "script_generation",
+    llmStageLabel: formatLlmStageLabel("script_generation"),
+    timeoutBudgetMs: scriptTimeoutMs,
+    maxAttempts: scriptMaxRetries + 1,
+    attemptsUsed: 0,
+    retryCount: 0,
+    retryPolicy: buildModelRetryPolicy(getModelStageConfig("script_generation"))
+  });
   await appendRepairIssueTraceBatch(issueIds, {
     stage: "CANDIDATE_TEST_RUNNING",
     level: "info",
     message: "模型 2 正在生成逐条修复候选脚本",
     source: "queue_processor",
-    meta: {
-      schoolId,
-      scriptName,
-      previousVersion: Number(previousMeta?.version || 0),
-      modelRole: "script_repair",
-      provider: scriptProvider,
-      model: scriptModel,
-      action: "generate_candidate_script_single",
-      timeoutBudgetMs: scriptTimeoutMs
-    }
+    meta: scriptTraceMeta
   });
-  const generatedScriptResult = await generateParserScript(mergedSummary, patchGuidance, previousScript, schoolId);
+  const generatedScriptResult = await generateParserScript(
+    mergedSummary,
+    patchGuidance,
+    previousScript,
+    schoolId,
+    scriptPayload
+  );
   if (!generatedScriptResult.ok || !generatedScriptResult.text) {
     await appendRepairIssueTraceBatch(issueIds, {
       stage: "CANDIDATE_TEST_RESULT",
@@ -3142,34 +3230,20 @@ async function processIndividualSummaries(schoolId, queue, issueIds = []) {
       message: `模型 2 生成逐条修复候选脚本失败：${generatedScriptResult.failureReason || "未生成脚本"}`,
       source: "queue_processor",
       meta: {
-        schoolId,
-        scriptName,
-        previousVersion: Number(previousMeta?.version || 0),
-        modelRole: "script_repair",
-        provider: generatedScriptResult.provider || scriptProvider,
-        model: generatedScriptResult.model || scriptModel,
-        action: "generate_candidate_script_single",
-        ok: false,
-        statusCode: Number(generatedScriptResult.statusCode || 0),
-        latencyMs: Number(generatedScriptResult.latencyMs || 0),
-        errorCode: generatedScriptResult.errorCode || "",
-        errorMessage: generatedScriptResult.errorMessage || "",
-        timeoutBudgetMs: scriptTimeoutMs,
-        inputChars: Number(generatedScriptResult.inputMeta?.totalInputChars || 0),
-        summaryChars: Number(generatedScriptResult.inputMeta?.summaryChars || 0),
-        originalSummaryChars: Number(generatedScriptResult.inputMeta?.originalSummaryChars || 0),
-        guidanceChars: Number(generatedScriptResult.inputMeta?.guidanceChars || 0),
-        originalGuidanceChars: Number(generatedScriptResult.inputMeta?.originalGuidanceChars || 0),
-        previousScriptChars: Number(generatedScriptResult.inputMeta?.previousScriptChars || 0),
-        originalPreviousScriptChars: Number(generatedScriptResult.inputMeta?.originalPreviousScriptChars || 0),
-        truncatedSummary: Boolean(generatedScriptResult.inputMeta?.summaryTruncated),
-        truncatedGuidance: Boolean(generatedScriptResult.inputMeta?.guidanceTruncated),
-        truncatedPreviousScript: Boolean(generatedScriptResult.inputMeta?.previousScriptTruncated),
-        previousScriptExtracted: Boolean(generatedScriptResult.inputMeta?.previousScriptExtracted),
-        contextStrategy: generatedScriptResult.inputMeta?.contextStrategy || ""
+        ...scriptTraceMeta,
+        ...buildScriptGenerationTraceMeta(generatedScriptResult.inputMeta, {}),
+        ...buildModelCallTraceMeta(generatedScriptResult, {
+          schoolId,
+          scriptName,
+          previousVersion: Number(previousMeta?.version || 0),
+          modelRole: "script_repair",
+          action: "generate_candidate_script_single",
+          ok: false
+        }),
+        manualSuggestion: "请人工检查逐条总结、修复指令与旧脚本提炼结果后再决定是否重试"
       }
     });
-    return;
+    return { applied: false, failed: true };
   }
   const generatedScript = generatedScriptResult.text;
   const replayStart = Date.now();
@@ -3179,13 +3253,16 @@ async function processIndividualSummaries(schoolId, queue, issueIds = []) {
     message: "模型 2 逐条修复候选脚本已生成，开始回放验证",
     source: "queue_processor",
     meta: {
-      schoolId,
-      scriptName,
-      sampleCount: Array.isArray(queue) ? queue.length : 0,
-      modelRole: "script_repair",
-      provider: scriptProvider,
-      model: scriptModel,
-      action: "replay_candidate_script_single"
+      ...scriptTraceMeta,
+      ...buildScriptGenerationTraceMeta(generatedScriptResult.inputMeta, {}),
+      ...buildModelCallTraceMeta(generatedScriptResult, {
+        schoolId,
+        scriptName,
+        sampleCount: Array.isArray(queue) ? queue.length : 0,
+        modelRole: "script_repair",
+        action: "generate_candidate_script_single",
+        ok: true
+      })
     }
   });
   const submissionReplay = runSubmissionReplay(generatedScript, queue);
@@ -3209,7 +3286,7 @@ async function processIndividualSummaries(schoolId, queue, issueIds = []) {
         scriptVersion: previousMeta?.version || 0
       }
     );
-    return;
+    return { applied: false, failed: true };
   }
   await appendRepairIssueTraceBatch(issueIds, {
     stage: "CANDIDATE_TEST_RESULT",
@@ -3243,7 +3320,7 @@ async function processIndividualSummaries(schoolId, queue, issueIds = []) {
       source: "queue_processor",
       meta: { schoolId, scriptName, releaseStage: "pending" }
     });
-    return;
+    return { applied: false, pending: true };
   }
   if (!applyResult.ok) {
     await appendRepairIssueTraceBatch(issueIds, {
@@ -3500,6 +3577,7 @@ async function callOpenAICompatible(systemPrompt, userPrompt, options = {}) {
     text,
     usage,
     raw: json,
+    stageId: (options.stageId || "").toString(),
     provider: requestProvider,
     model: requestModel,
     statusCode: Number(response.statusCode || 0),
@@ -3562,6 +3640,7 @@ async function callGemini(systemPrompt, userPrompt, options = {}) {
     text,
     usage,
     raw: json,
+    stageId: (options.stageId || "").toString(),
     provider: "gemini",
     model: requestModel,
     statusCode: Number(response.statusCode || 0),
@@ -3937,6 +4016,258 @@ function buildScriptGenerationPayload(summary, patchGuidance, previousScript) {
   };
 }
 
+/**
+ * 统一模型调用阶段标识，便于后端记录与前端展示
+ */
+function formatLlmStageLabel(stageId) {
+  const key = (stageId || "").toString().trim();
+  if (key === "summary") return "模型1总结";
+  if (key === "patch_guidance") return "模型1修复指令";
+  if (key === "script_generation") return "模型2脚本生成";
+  return key || "";
+}
+
+/**
+ * 获取不同阶段的独立模型调用配置
+ */
+function getModelStageConfig(stageId) {
+  const key = (stageId || "").toString().trim();
+  if (key === "script_generation") {
+    return {
+      stageId: key,
+      stageLabel: formatLlmStageLabel(key),
+      provider: scriptProvider,
+      apiKey: scriptApiKey,
+      model: scriptModel,
+      baseUrl: scriptBaseUrl,
+      extra: scriptRequestExtra,
+      apiStyle: scriptApiStyleRaw,
+      timeoutMs: scriptTimeoutMs,
+      maxRetries: scriptMaxRetries,
+      usageType: "script"
+    };
+  }
+  if (key === "patch_guidance") {
+    return {
+      stageId: key,
+      stageLabel: formatLlmStageLabel(key),
+      provider: summaryProvider,
+      apiKey: summaryApiKey,
+      model: summaryModel,
+      baseUrl: summaryBaseUrl,
+      extra: summaryRequestExtra,
+      apiStyle: summaryApiStyleRaw,
+      timeoutMs: patchGuidanceTimeoutMs,
+      maxRetries: patchGuidanceMaxRetries,
+      usageType: "summary"
+    };
+  }
+  return {
+    stageId: "summary",
+    stageLabel: formatLlmStageLabel("summary"),
+    provider: summaryProvider,
+    apiKey: summaryApiKey,
+    model: summaryModel,
+    baseUrl: summaryBaseUrl,
+    extra: summaryRequestExtra,
+    apiStyle: summaryApiStyleRaw,
+    timeoutMs: summaryTimeoutMs,
+    maxRetries: summaryMaxRetries,
+    usageType: "summary"
+  };
+}
+
+/**
+ * 统一重试策略描述，便于日志与管理后台展示
+ */
+function buildModelRetryPolicy(config) {
+  const maxAttempts = Math.max(1, Number(config?.maxRetries || 0) + 1);
+  if (maxAttempts <= 1) return "不重试";
+  return `超时/网络/429/5xx/空响应可重试，最多 ${maxAttempts} 次`;
+}
+
+/**
+ * 识别是否属于适合自动重试的失败
+ */
+function isRetryableModelFailure(result) {
+  const statusCode = Number(result?.statusCode || 0);
+  const errorCode = normalizeModelFailureText(result?.errorCode || "");
+  const errorMessage = normalizeModelFailureText(result?.errorMessage || "");
+  if (result?.ok === true) return false;
+  if (errorCode === "missing_api_key" || errorCode === "missing_model") return false;
+  if (statusCode === 401 || statusCode === 403 || statusCode === 404) return false;
+  if (errorCode === "timeout" || errorCode === "network_error" || errorCode === "invalid_response") return true;
+  if (errorMessage === "empty_content") return true;
+  if (statusCode === 429 || statusCode >= 500) return true;
+  return false;
+}
+
+/**
+ * 为模型调用结果补充统一元信息
+ */
+function buildModelCallTraceMeta(result, extra = {}) {
+  const info = result && typeof result === "object" ? result : {};
+  return {
+    ...extra,
+    llmStage: (info.stageId || extra.llmStage || "").toString(),
+    llmStageLabel: (info.stageLabel || extra.llmStageLabel || "").toString(),
+    provider: (info.provider || extra.provider || "").toString(),
+    model: (info.model || extra.model || "").toString(),
+    statusCode: Number(info.statusCode || extra.statusCode || 0),
+    latencyMs: Number(info.latencyMs || extra.latencyMs || 0),
+    lastAttemptLatencyMs: Number(info.lastAttemptLatencyMs || extra.lastAttemptLatencyMs || 0),
+    errorCode: (info.errorCode || extra.errorCode || "").toString(),
+    errorMessage: (info.errorMessage || extra.errorMessage || "").toString(),
+    timeoutBudgetMs: Number(info.timeoutBudgetMs || extra.timeoutBudgetMs || 0),
+    maxAttempts: Number(info.maxAttempts || extra.maxAttempts || 0),
+    attemptsUsed: Number(info.attemptsUsed || extra.attemptsUsed || 0),
+    retryCount: Number(info.retryCount || extra.retryCount || 0),
+    retryPolicy: (info.retryPolicy || extra.retryPolicy || "").toString(),
+    ok: info.ok === true || extra.ok === true
+  };
+}
+
+/**
+ * 汇总阶段输入统计
+ */
+function buildSummaryPayloadTraceMeta(payload, extra = {}) {
+  const info = payload && typeof payload === "object" ? payload : {};
+  return {
+    ...extra,
+    inputChars: Number(info.usedChars || 0),
+    originalInputChars: Number(info.originalChars || 0),
+    includedSamples: Number(info.includedSamples || 0),
+    droppedSamples: Number(info.droppedSamples || 0),
+    truncatedSamples: Number(info.truncatedSamples || 0),
+    inputClipStrategy: `最近 ${summaryMaxSamples} 条样本 + 单样本 ${summaryMaxSampleChars} 字 + 总计 ${summaryMaxInputChars} 字`
+  };
+}
+
+/**
+ * 修复指令阶段输入统计
+ */
+function buildPatchGuidanceTraceMeta(summaryText, extra = {}) {
+  const text = (summaryText || "").toString();
+  return {
+    ...extra,
+    inputChars: text.length,
+    originalInputChars: text.length,
+    inputClipStrategy: "直接使用模型1总结结果，不额外裁剪"
+  };
+}
+
+/**
+ * 模型 2 生成阶段输入统计
+ */
+function buildScriptGenerationTraceMeta(payload, extra = {}) {
+  const info = payload && typeof payload === "object" ? payload : {};
+  return {
+    ...extra,
+    inputChars: Number(info.totalInputChars || 0),
+    summaryChars: Number(info.summaryChars || 0),
+    originalSummaryChars: Number(info.originalSummaryChars || 0),
+    guidanceChars: Number(info.guidanceChars || 0),
+    originalGuidanceChars: Number(info.originalGuidanceChars || 0),
+    previousScriptChars: Number(info.previousScriptChars || 0),
+    originalPreviousScriptChars: Number(info.originalPreviousScriptChars || 0),
+    truncatedSummary: Boolean(info.summaryTruncated),
+    truncatedGuidance: Boolean(info.guidanceTruncated),
+    truncatedPreviousScript: Boolean(info.previousScriptTruncated),
+    previousScriptExtracted: Boolean(info.previousScriptExtracted),
+    contextStrategy: (info.contextStrategy || "").toString(),
+    inputClipStrategy: "总结/修复指令/旧脚本分段裁剪",
+    summaryClipStrategy: `总结最多 ${scriptMaxSummaryChars} 字`,
+    guidanceClipStrategy: `修复指令最多 ${scriptMaxGuidanceChars} 字`,
+    previousScriptClipStrategy: `旧脚本优先提炼关键片段，最多 ${scriptMaxPreviousScriptChars} 字`
+  };
+}
+
+/**
+ * 按阶段执行模型调用，并统一返回阶段、超时与重试结果
+ */
+async function callModelStage(systemPrompt, userPrompt, stageId) {
+  const config = getModelStageConfig(stageId);
+  const maxAttempts = Math.max(1, Number(config.maxRetries || 0) + 1);
+  const retryPolicy = buildModelRetryPolicy(config);
+  const attempts = [];
+  const startedAt = Date.now();
+  let lastResult = null;
+  for (let attemptIndex = 1; attemptIndex <= maxAttempts; attemptIndex += 1) {
+    const rawResult =
+      config.provider === "gemini"
+        ? await callGemini(systemPrompt, userPrompt, {
+            provider: config.provider,
+            apiKey: config.apiKey,
+            model: config.model,
+            baseUrl: config.baseUrl,
+            usageType: config.usageType,
+            extra: config.extra,
+            apiStyle: config.apiStyle,
+            timeoutMs: config.timeoutMs,
+            stageId: config.stageId
+          })
+        : await callOpenAICompatible(systemPrompt, userPrompt, {
+            provider: config.provider,
+            apiKey: config.apiKey,
+            model: config.model,
+            baseUrl: config.baseUrl,
+            usageType: config.usageType,
+            extra: config.extra,
+            apiStyle: config.apiStyle,
+            timeoutMs: config.timeoutMs,
+            stageId: config.stageId
+          });
+    lastResult = rawResult;
+    attempts.push({
+      attemptIndex,
+      ok: rawResult?.ok === true,
+      statusCode: Number(rawResult?.statusCode || 0),
+      latencyMs: Number(rawResult?.latencyMs || 0),
+      errorCode: (rawResult?.errorCode || "").toString(),
+      errorMessage: (rawResult?.errorMessage || "").toString()
+    });
+    if (rawResult?.ok && rawResult?.text) {
+      return {
+        ...rawResult,
+        stageId: config.stageId,
+        stageLabel: config.stageLabel,
+        timeoutBudgetMs: Number(config.timeoutMs || 0),
+        maxAttempts,
+        attemptsUsed: attemptIndex,
+        retryCount: Math.max(0, attemptIndex - 1),
+        retryPolicy,
+        attempts,
+        lastAttemptLatencyMs: Number(rawResult?.latencyMs || 0),
+        latencyMs: Date.now() - startedAt,
+        failureReason: ""
+      };
+    }
+    if (attemptIndex >= maxAttempts || !isRetryableModelFailure(rawResult)) {
+      break;
+    }
+  }
+  return {
+    ok: false,
+    text: "",
+    provider: lastResult?.provider || config.provider,
+    model: lastResult?.model || config.model,
+    statusCode: Number(lastResult?.statusCode || 0),
+    latencyMs: Date.now() - startedAt,
+    lastAttemptLatencyMs: Number(lastResult?.latencyMs || 0),
+    errorCode: (lastResult?.errorCode || "").toString(),
+    errorMessage: (lastResult?.errorMessage || "").toString(),
+    stageId: config.stageId,
+    stageLabel: config.stageLabel,
+    timeoutBudgetMs: Number(config.timeoutMs || 0),
+    maxAttempts,
+    attemptsUsed: Math.max(1, attempts.length),
+    retryCount: Math.max(0, attempts.length - 1),
+    retryPolicy,
+    attempts,
+    failureReason: formatModelFailureReason(lastResult)
+  };
+}
+
 async function summarizeSubmissions(content, schoolId) {
   const systemPrompt =
     "你是课表解析总结助手，目标是提炼教务系统课表页面结构的关键信息。" +
@@ -3945,31 +4276,9 @@ async function summarizeSubmissions(content, schoolId) {
     "请总结以下多条提交内容的共同结构特征、字段含义、课程信息位置与可能的异常点。" +
     "输出格式为 6-12 条中文要点列表，每条不超过 30 字。\n" +
     `内容如下：\n${content}`;
-  const startTime = Date.now();
-  const rawText =
-    summaryProvider === "gemini"
-      ? await callGemini(systemPrompt, userPrompt, {
-          provider: summaryProvider,
-          apiKey: summaryApiKey,
-          model: summaryModel,
-          baseUrl: summaryBaseUrl,
-          usageType: "summary",
-          extra: summaryRequestExtra,
-          apiStyle: summaryApiStyleRaw,
-          timeoutMs: summaryTimeoutMs
-        })
-      : await callOpenAICompatible(systemPrompt, userPrompt, {
-          provider: summaryProvider,
-          apiKey: summaryApiKey,
-          model: summaryModel,
-          baseUrl: summaryBaseUrl,
-          usageType: "summary",
-          extra: summaryRequestExtra,
-          apiStyle: summaryApiStyleRaw,
-          timeoutMs: summaryTimeoutMs
-        });
-  const latencyMs = Date.now() - startTime;
-  if (!rawText?.text) {
+  const result = await callModelStage(systemPrompt, userPrompt, "summary");
+  const latencyMs = Number(result?.latencyMs || 0);
+  if (!result?.text) {
     await recordMetric("summary_failed", latencyMs, summaryCostPerCall);
     if (schoolId) {
       await recordSchoolMetric(schoolId, "summary_failed", latencyMs, summaryCostPerCall);
@@ -3977,13 +4286,21 @@ async function summarizeSubmissions(content, schoolId) {
     return {
       ok: false,
       text: "",
-      provider: rawText?.provider || summaryProvider,
-      model: rawText?.model || summaryModel,
-      statusCode: Number(rawText?.statusCode || 0),
-      latencyMs: Number(rawText?.latencyMs || latencyMs),
-      errorCode: (rawText?.errorCode || "").toString(),
-      errorMessage: (rawText?.errorMessage || "").toString(),
-      failureReason: formatModelFailureReason(rawText)
+      provider: result?.provider || summaryProvider,
+      model: result?.model || summaryModel,
+      statusCode: Number(result?.statusCode || 0),
+      latencyMs,
+      errorCode: (result?.errorCode || "").toString(),
+      errorMessage: (result?.errorMessage || "").toString(),
+      stageId: result?.stageId || "summary",
+      stageLabel: result?.stageLabel || formatLlmStageLabel("summary"),
+      timeoutBudgetMs: Number(result?.timeoutBudgetMs || summaryTimeoutMs),
+      maxAttempts: Number(result?.maxAttempts || summaryMaxRetries + 1),
+      attemptsUsed: Number(result?.attemptsUsed || 1),
+      retryCount: Number(result?.retryCount || 0),
+      retryPolicy: (result?.retryPolicy || "").toString(),
+      attempts: Array.isArray(result?.attempts) ? result.attempts : [],
+      failureReason: (result?.failureReason || formatModelFailureReason(result)).toString()
     };
   }
   await recordMetric("summary_success", latencyMs, summaryCostPerCall);
@@ -3992,13 +4309,21 @@ async function summarizeSubmissions(content, schoolId) {
   }
   return {
     ok: true,
-    text: rawText.text,
-    provider: rawText?.provider || summaryProvider,
-    model: rawText?.model || summaryModel,
-    statusCode: Number(rawText?.statusCode || 200),
-    latencyMs: Number(rawText?.latencyMs || latencyMs),
+    text: result.text,
+    provider: result?.provider || summaryProvider,
+    model: result?.model || summaryModel,
+    statusCode: Number(result?.statusCode || 200),
+    latencyMs,
     errorCode: "",
     errorMessage: "",
+    stageId: result?.stageId || "summary",
+    stageLabel: result?.stageLabel || formatLlmStageLabel("summary"),
+    timeoutBudgetMs: Number(result?.timeoutBudgetMs || summaryTimeoutMs),
+    maxAttempts: Number(result?.maxAttempts || summaryMaxRetries + 1),
+    attemptsUsed: Number(result?.attemptsUsed || 1),
+    retryCount: Number(result?.retryCount || 0),
+    retryPolicy: (result?.retryPolicy || "").toString(),
+    attempts: Array.isArray(result?.attempts) ? result.attempts : [],
     failureReason: ""
   };
 }
@@ -4102,60 +4427,54 @@ async function generatePatchGuidance(summary, schoolId) {
   const userPrompt =
     "请基于以下总结给出修复指令要点，避免泛泛而谈，尽量指向字段、结构或规则。\n" +
     `${summary}`;
-  const startTime = Date.now();
-  const rawText =
-    summaryProvider === "gemini"
-      ? await callGemini(systemPrompt, userPrompt, {
-          provider: summaryProvider,
-          apiKey: summaryApiKey,
-          model: summaryModel,
-          baseUrl: summaryBaseUrl,
-          usageType: "summary",
-          extra: summaryRequestExtra,
-          apiStyle: summaryApiStyleRaw,
-          timeoutMs: summaryTimeoutMs
-        })
-      : await callOpenAICompatible(systemPrompt, userPrompt, {
-          provider: summaryProvider,
-          apiKey: summaryApiKey,
-          model: summaryModel,
-          baseUrl: summaryBaseUrl,
-          usageType: "summary",
-          extra: summaryRequestExtra,
-          apiStyle: summaryApiStyleRaw,
-          timeoutMs: summaryTimeoutMs
-        });
-  const latencyMs = Date.now() - startTime;
-  if (!rawText?.text) {
-    await recordMetric("summary_failed", latencyMs, summaryCostPerCall);
+  const result = await callModelStage(systemPrompt, userPrompt, "patch_guidance");
+  const latencyMs = Number(result?.latencyMs || 0);
+  if (!result?.text) {
+    await recordMetric("patch_guidance_failed", latencyMs, summaryCostPerCall);
     if (schoolId) {
-      await recordSchoolMetric(schoolId, "summary_failed", latencyMs, summaryCostPerCall);
+      await recordSchoolMetric(schoolId, "patch_guidance_failed", latencyMs, summaryCostPerCall);
     }
     return {
       ok: false,
       text: "",
-      provider: rawText?.provider || summaryProvider,
-      model: rawText?.model || summaryModel,
-      statusCode: Number(rawText?.statusCode || 0),
-      latencyMs: Number(rawText?.latencyMs || latencyMs),
-      errorCode: (rawText?.errorCode || "").toString(),
-      errorMessage: (rawText?.errorMessage || "").toString(),
-      failureReason: formatModelFailureReason(rawText)
+      provider: result?.provider || summaryProvider,
+      model: result?.model || summaryModel,
+      statusCode: Number(result?.statusCode || 0),
+      latencyMs,
+      errorCode: (result?.errorCode || "").toString(),
+      errorMessage: (result?.errorMessage || "").toString(),
+      stageId: result?.stageId || "patch_guidance",
+      stageLabel: result?.stageLabel || formatLlmStageLabel("patch_guidance"),
+      timeoutBudgetMs: Number(result?.timeoutBudgetMs || patchGuidanceTimeoutMs),
+      maxAttempts: Number(result?.maxAttempts || patchGuidanceMaxRetries + 1),
+      attemptsUsed: Number(result?.attemptsUsed || 1),
+      retryCount: Number(result?.retryCount || 0),
+      retryPolicy: (result?.retryPolicy || "").toString(),
+      attempts: Array.isArray(result?.attempts) ? result.attempts : [],
+      failureReason: (result?.failureReason || formatModelFailureReason(result)).toString()
     };
   }
-  await recordMetric("summary_success", latencyMs, summaryCostPerCall);
+  await recordMetric("patch_guidance_success", latencyMs, summaryCostPerCall);
   if (schoolId) {
-    await recordSchoolMetric(schoolId, "summary_success", latencyMs, summaryCostPerCall);
+    await recordSchoolMetric(schoolId, "patch_guidance_success", latencyMs, summaryCostPerCall);
   }
   return {
     ok: true,
-    text: rawText.text,
-    provider: rawText?.provider || summaryProvider,
-    model: rawText?.model || summaryModel,
-    statusCode: Number(rawText?.statusCode || 200),
-    latencyMs: Number(rawText?.latencyMs || latencyMs),
+    text: result.text,
+    provider: result?.provider || summaryProvider,
+    model: result?.model || summaryModel,
+    statusCode: Number(result?.statusCode || 200),
+    latencyMs,
     errorCode: "",
     errorMessage: "",
+    stageId: result?.stageId || "patch_guidance",
+    stageLabel: result?.stageLabel || formatLlmStageLabel("patch_guidance"),
+    timeoutBudgetMs: Number(result?.timeoutBudgetMs || patchGuidanceTimeoutMs),
+    maxAttempts: Number(result?.maxAttempts || patchGuidanceMaxRetries + 1),
+    attemptsUsed: Number(result?.attemptsUsed || 1),
+    retryCount: Number(result?.retryCount || 0),
+    retryPolicy: (result?.retryPolicy || "").toString(),
+    attempts: Array.isArray(result?.attempts) ? result.attempts : [],
     failureReason: ""
   };
 }
@@ -4168,8 +4487,8 @@ async function generatePatchGuidance(summary, schoolId) {
  * 接收：结构总结、具体的修复指令、先前的脚本内容
  * 输出：可执行的 JavaScript 字符串
  */
-async function generateParserScript(summary, patchGuidance, previousScript, schoolId) {
-  const payload = buildScriptGenerationPayload(summary, patchGuidance, previousScript);
+async function generateParserScript(summary, patchGuidance, previousScript, schoolId, preparedPayload = null) {
+  const payload = preparedPayload || buildScriptGenerationPayload(summary, patchGuidance, previousScript);
   const systemPrompt =
     "你是教务系统解析脚本工程师，输出必须是可直接运行的 JavaScript 解析脚本。" +
     "脚本运行环境为 QuickJS，无 DOM API，仅可使用字符串与正则。" +
@@ -4182,31 +4501,9 @@ async function generateParserScript(summary, patchGuidance, previousScript, scho
     `【修复指令】\n${payload.guidance || "无"}\n` +
     `【旧脚本】\n${payload.previousScript || "无"}\n` +
     "请仅输出 JS 源码。";
-  const startTime = Date.now();
-  const rawText =
-    scriptProvider === "gemini"
-      ? await callGemini(systemPrompt, userPrompt, {
-          provider: scriptProvider,
-          apiKey: scriptApiKey,
-          model: scriptModel,
-          baseUrl: scriptBaseUrl,
-          usageType: "script",
-          extra: scriptRequestExtra,
-          apiStyle: scriptApiStyleRaw,
-          timeoutMs: scriptTimeoutMs
-        })
-      : await callOpenAICompatible(systemPrompt, userPrompt, {
-          provider: scriptProvider,
-          apiKey: scriptApiKey,
-          model: scriptModel,
-          baseUrl: scriptBaseUrl,
-          usageType: "script",
-          extra: scriptRequestExtra,
-          apiStyle: scriptApiStyleRaw,
-          timeoutMs: scriptTimeoutMs
-        });
-  const latencyMs = Date.now() - startTime;
-  if (!rawText?.text) {
+  const result = await callModelStage(systemPrompt, userPrompt, "script_generation");
+  const latencyMs = Number(result?.latencyMs || 0);
+  if (!result?.text) {
     await recordMetric("script_failed", latencyMs, scriptCostPerCall);
     if (schoolId) {
       await recordSchoolMetric(schoolId, "script_failed", latencyMs, scriptCostPerCall);
@@ -4214,13 +4511,21 @@ async function generateParserScript(summary, patchGuidance, previousScript, scho
     return {
       ok: false,
       text: "",
-      provider: rawText?.provider || scriptProvider,
-      model: rawText?.model || scriptModel,
-      statusCode: Number(rawText?.statusCode || 0),
-      latencyMs: Number(rawText?.latencyMs || latencyMs),
-      errorCode: (rawText?.errorCode || "").toString(),
-      errorMessage: (rawText?.errorMessage || "").toString(),
-      failureReason: formatModelFailureReason(rawText),
+      provider: result?.provider || scriptProvider,
+      model: result?.model || scriptModel,
+      statusCode: Number(result?.statusCode || 0),
+      latencyMs,
+      errorCode: (result?.errorCode || "").toString(),
+      errorMessage: (result?.errorMessage || "").toString(),
+      stageId: result?.stageId || "script_generation",
+      stageLabel: result?.stageLabel || formatLlmStageLabel("script_generation"),
+      timeoutBudgetMs: Number(result?.timeoutBudgetMs || scriptTimeoutMs),
+      maxAttempts: Number(result?.maxAttempts || scriptMaxRetries + 1),
+      attemptsUsed: Number(result?.attemptsUsed || 1),
+      retryCount: Number(result?.retryCount || 0),
+      retryPolicy: (result?.retryPolicy || "").toString(),
+      attempts: Array.isArray(result?.attempts) ? result.attempts : [],
+      failureReason: (result?.failureReason || formatModelFailureReason(result)).toString(),
       inputMeta: payload
     };
   }
@@ -4230,14 +4535,22 @@ async function generateParserScript(summary, patchGuidance, previousScript, scho
   }
   return {
     ok: true,
-    text: cleanScriptOutput(rawText.text),
-    provider: rawText?.provider || scriptProvider,
-    model: rawText?.model || scriptModel,
-    statusCode: Number(rawText?.statusCode || 200),
-    latencyMs: Number(rawText?.latencyMs || latencyMs),
+    text: cleanScriptOutput(result.text),
+    provider: result?.provider || scriptProvider,
+    model: result?.model || scriptModel,
+    statusCode: Number(result?.statusCode || 200),
+    latencyMs,
     errorCode: "",
     errorMessage: "",
     failureReason: "",
+    stageId: result?.stageId || "script_generation",
+    stageLabel: result?.stageLabel || formatLlmStageLabel("script_generation"),
+    timeoutBudgetMs: Number(result?.timeoutBudgetMs || scriptTimeoutMs),
+    maxAttempts: Number(result?.maxAttempts || scriptMaxRetries + 1),
+    attemptsUsed: Number(result?.attemptsUsed || 1),
+    retryCount: Number(result?.retryCount || 0),
+    retryPolicy: (result?.retryPolicy || "").toString(),
+    attempts: Array.isArray(result?.attempts) ? result.attempts : [],
     inputMeta: payload
   };
 }

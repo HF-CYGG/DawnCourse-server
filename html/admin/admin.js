@@ -429,6 +429,8 @@ function normalizeRepairTraceMeta(meta) {
   return {
     ...info,
     modelRole: `${pickDefinedValue(info.modelRole, info.model_role) || ""}`,
+    llmStage: `${pickDefinedValue(info.llmStage, info.llm_stage, info.stageId, info.stage_id) || ""}`,
+    llmStageLabel: `${pickDefinedValue(info.llmStageLabel, info.llm_stage_label) || ""}`,
     action: `${pickDefinedValue(info.action, info.actionType, info.action_type) || ""}`,
     provider: `${pickDefinedValue(info.provider, info.providerName, info.provider_name) || ""}`,
     model: `${pickDefinedValue(info.model, info.modelName, info.model_name) || ""}`,
@@ -455,9 +457,22 @@ function normalizeRepairTraceMeta(meta) {
     previousScriptExtracted:
       pickDefinedValue(info.previousScriptExtracted, info.previous_script_extracted) === true,
     contextStrategy: `${pickDefinedValue(info.contextStrategy, info.context_strategy) || ""}`,
+    inputClipStrategy: `${pickDefinedValue(info.inputClipStrategy, info.input_clip_strategy, info.clipStrategy, info.clip_strategy) || ""}`,
+    summaryClipStrategy: `${pickDefinedValue(info.summaryClipStrategy, info.summary_clip_strategy) || ""}`,
+    guidanceClipStrategy: `${pickDefinedValue(info.guidanceClipStrategy, info.guidance_clip_strategy) || ""}`,
+    previousScriptClipStrategy: `${pickDefinedValue(info.previousScriptClipStrategy, info.previous_script_clip_strategy) || ""}`,
     statusCode: Number(pickDefinedValue(info.statusCode, info.status_code) || 0),
     errorCode: `${pickDefinedValue(info.errorCode, info.error_code) || ""}`,
     latencyMs: Number(pickDefinedValue(info.latencyMs, info.latency_ms, info.durationMs, info.duration_ms) || 0),
+    lastAttemptLatencyMs: Number(
+      pickDefinedValue(info.lastAttemptLatencyMs, info.last_attempt_latency_ms, info.attemptLatencyMs, info.attempt_latency_ms) || 0
+    ),
+    maxAttempts: Number(pickDefinedValue(info.maxAttempts, info.max_attempts) || 0),
+    attemptsUsed: Number(pickDefinedValue(info.attemptsUsed, info.attempts_used) || 0),
+    retryCount: Number(pickDefinedValue(info.retryCount, info.retry_count) || 0),
+    retryPolicy: `${pickDefinedValue(info.retryPolicy, info.retry_policy) || ""}`,
+    fallbackPath: `${pickDefinedValue(info.fallbackPath, info.fallback_path) || ""}`,
+    manualSuggestion: `${pickDefinedValue(info.manualSuggestion, info.manual_suggestion) || ""}`,
     releaseStage: `${pickDefinedValue(info.releaseStage, info.release_stage) || ""}`,
     ok: pickDefinedValue(info.ok, info.success) === true
   };
@@ -3011,6 +3026,16 @@ function formatRepairModelRoleLabel(role) {
   return "";
 }
 
+function formatRepairLlmStageLabel(stage) {
+  const key = (stage || "").toString().trim();
+  const map = {
+    summary: "总结阶段",
+    patch_guidance: "修复指令阶段",
+    script_generation: "脚本生成阶段"
+  };
+  return map[key] || key;
+}
+
 function formatRepairActionLabel(action) {
   const key = (action || "").toString().trim();
   const map = {
@@ -3068,7 +3093,9 @@ function buildRepairContextItem(label, value) {
 function buildRepairContextFromMeta(meta) {
   const info = normalizeRepairTraceMeta(meta);
   const parts = [];
+  const llmStageText = info.llmStageLabel || formatRepairLlmStageLabel(info.llmStage || "");
   if (info.provider || info.model) parts.push([info.provider, info.model].filter(Boolean).join(" / "));
+  if (llmStageText) parts.push(`阶段 ${llmStageText}`);
   if (info.scriptName) parts.push(`脚本 ${info.scriptName}`);
   if (Number(info.previousVersion || 0) > 0) parts.push(`基于 v${Number(info.previousVersion || 0)}`);
   if (Number(info.sampleCount || 0) > 0) parts.push(`样本 ${Number(info.sampleCount || 0)}`);
@@ -3094,10 +3121,24 @@ function buildRepairContextFromMeta(meta) {
         .join("/")}`
     );
   }
+  if ((info.inputClipStrategy || "").toString().trim()) parts.push(`输入策略 ${String(info.inputClipStrategy).trim()}`);
+  if ((info.summaryClipStrategy || "").toString().trim()) parts.push(`总结裁剪 ${String(info.summaryClipStrategy).trim()}`);
+  if ((info.guidanceClipStrategy || "").toString().trim()) parts.push(`指令裁剪 ${String(info.guidanceClipStrategy).trim()}`);
+  if ((info.previousScriptClipStrategy || "").toString().trim()) {
+    parts.push(`旧脚本裁剪 ${String(info.previousScriptClipStrategy).trim()}`);
+  }
   if (Number(info.timeoutBudgetMs || 0) > 0) parts.push(`超时 ${Number(info.timeoutBudgetMs || 0)}ms`);
+  if (Number(info.attemptsUsed || 0) > 0 || Number(info.maxAttempts || 0) > 0) {
+    parts.push(`尝试 ${Number(info.attemptsUsed || 0)}/${Number(info.maxAttempts || 0) || 1}`);
+  }
+  if (Number(info.retryCount || 0) > 0) parts.push(`重试 ${Number(info.retryCount || 0)} 次`);
+  if ((info.retryPolicy || "").toString().trim()) parts.push(`重试策略 ${String(info.retryPolicy).trim()}`);
   if (Number(info.statusCode || 0) > 0) parts.push(`HTTP ${Number(info.statusCode || 0)}`);
   if ((info.errorCode || "").toString().trim()) parts.push(`错误码 ${String(info.errorCode).trim()}`);
   if (Number(info.latencyMs || 0) > 0) parts.push(`耗时 ${Number(info.latencyMs || 0)}ms`);
+  if (Number(info.lastAttemptLatencyMs || 0) > 0) parts.push(`末次 ${Number(info.lastAttemptLatencyMs || 0)}ms`);
+  if ((info.fallbackPath || "").toString().trim()) parts.push(`降级 ${String(info.fallbackPath).trim()}`);
+  if ((info.manualSuggestion || "").toString().trim()) parts.push(`人工建议 ${String(info.manualSuggestion).trim()}`);
   if ((info.releaseStage || "").toString().trim()) parts.push(`发布阶段 ${String(info.releaseStage).trim()}`);
   return parts.join(" · ");
 }
@@ -3106,8 +3147,10 @@ function buildRepairTraceContext(meta) {
   const info = normalizeRepairTraceMeta(meta);
   const parts = [];
   const modelRole = formatRepairModelRoleLabel(info.modelRole);
+  const llmStageText = info.llmStageLabel || formatRepairLlmStageLabel(info.llmStage || "");
   const modelText = [info.provider, info.model].filter(Boolean).join(" / ");
   if (modelRole) parts.push(modelRole);
+  if (llmStageText) parts.push(llmStageText);
   if (modelText) parts.push(modelText);
   if (info.scriptName) parts.push(`脚本 ${info.scriptName}`);
   if (Number(info.previousVersion || 0) > 0) parts.push(`基于 v${Number(info.previousVersion || 0)}`);
@@ -3134,11 +3177,25 @@ function buildRepairTraceContext(meta) {
         .join("/")}`
     );
   }
+  if ((info.inputClipStrategy || "").toString().trim()) parts.push(`输入策略 ${String(info.inputClipStrategy).trim()}`);
+  if ((info.summaryClipStrategy || "").toString().trim()) parts.push(`总结裁剪 ${String(info.summaryClipStrategy).trim()}`);
+  if ((info.guidanceClipStrategy || "").toString().trim()) parts.push(`指令裁剪 ${String(info.guidanceClipStrategy).trim()}`);
+  if ((info.previousScriptClipStrategy || "").toString().trim()) {
+    parts.push(`旧脚本裁剪 ${String(info.previousScriptClipStrategy).trim()}`);
+  }
   if ((info.contextStrategy || "").toString().trim()) parts.push(`策略 ${String(info.contextStrategy).trim()}`);
   if (Number(info.timeoutBudgetMs || 0) > 0) parts.push(`超时 ${Number(info.timeoutBudgetMs || 0)}ms`);
+  if (Number(info.attemptsUsed || 0) > 0 || Number(info.maxAttempts || 0) > 0) {
+    parts.push(`尝试 ${Number(info.attemptsUsed || 0)}/${Number(info.maxAttempts || 0) || 1}`);
+  }
+  if (Number(info.retryCount || 0) > 0) parts.push(`重试 ${Number(info.retryCount || 0)} 次`);
+  if ((info.retryPolicy || "").toString().trim()) parts.push(`重试策略 ${String(info.retryPolicy).trim()}`);
   if (Number(info.statusCode || 0) > 0) parts.push(`HTTP ${Number(info.statusCode || 0)}`);
   if ((info.errorCode || "").toString().trim()) parts.push(`错误码 ${String(info.errorCode).trim()}`);
   if (Number(info.latencyMs || 0) > 0) parts.push(`耗时 ${Number(info.latencyMs || 0)}ms`);
+  if (Number(info.lastAttemptLatencyMs || 0) > 0) parts.push(`末次 ${Number(info.lastAttemptLatencyMs || 0)}ms`);
+  if ((info.fallbackPath || "").toString().trim()) parts.push(`降级 ${String(info.fallbackPath).trim()}`);
+  if ((info.manualSuggestion || "").toString().trim()) parts.push(`人工建议 ${String(info.manualSuggestion).trim()}`);
   return parts.join(" · ");
 }
 

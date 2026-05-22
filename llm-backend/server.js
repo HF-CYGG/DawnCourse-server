@@ -2062,7 +2062,7 @@ async function upsertRepairIssue({ session, pageFingerprint, attempt, finalFailu
     sourceUrlHost: previous?.sourceUrlHost || session.sourceUrlHost || "",
     pageFingerprintHash: previous?.pageFingerprintHash || session.pageFingerprintHash || "",
     affectedScriptId: canonicalParserName || previous?.affectedScriptId || "",
-    affectedVersion: Number(previous?.affectedVersion || attempt.parserVersion || 0),
+    affectedVersion: Number(shouldReplaceIssueKey ? attempt.parserVersion || 0 : previous?.affectedVersion || attempt.parserVersion || 0),
     failureType,
     sampleCount: Number(previous?.sampleCount || 0),
     userCount: Number(previous?.userCount || 0),
@@ -2110,9 +2110,44 @@ async function listRepairIssues(limit = 100) {
   for (const issueId of ids) {
     const raw = await redisClient.get(buildRepairIssueKey(issueId));
     const issue = raw ? safeJson(raw) : null;
-    if (issue) items.push(buildRepairIssueAdminView(issue));
+    if (issue) {
+      const { issue: normalizedIssue, changed } = normalizeRepairIssueScriptBinding(issue);
+      if (changed) {
+        await redisClient.set(buildRepairIssueKey(issueId), JSON.stringify(normalizedIssue));
+      }
+      items.push(buildRepairIssueAdminView(normalizedIssue));
+    }
   }
   return items.sort((a, b) => Number(b.lastSeenAt || 0) - Number(a.lastSeenAt || 0)).slice(0, limit);
+}
+
+function normalizeRepairIssueScriptBinding(issue) {
+  const info = issue && typeof issue === "object" ? { ...issue } : {};
+  const normalizedSystemType = normalizeReportSchoolSystemType(info.schoolSystemType || info.school_system_type || "");
+  const canonicalScriptName = resolveScriptNameBySchoolSystem(normalizedSystemType);
+  if (!canonicalScriptName) return { issue: info, changed: false };
+  const currentScriptName = normalizeScriptNameFromAny(info.affectedScriptId || "");
+  const changed = currentScriptName !== canonicalScriptName || info.schoolSystemType !== normalizedSystemType;
+  if (!changed) return { issue: info, changed: false };
+  const previousAttempt = info.lastAttempt && typeof info.lastAttempt === "object" ? { ...info.lastAttempt } : {};
+  const normalizedAttempt = normalizeParserAttempt(previousAttempt);
+  info.schoolSystemType = normalizedSystemType;
+  info.originalAffectedScriptId =
+    info.originalAffectedScriptId || (currentScriptName && currentScriptName !== canonicalScriptName ? currentScriptName : "");
+  info.affectedScriptId = canonicalScriptName;
+  info.affectedVersion = currentScriptName && currentScriptName !== canonicalScriptName ? 0 : Number(info.affectedVersion || 0);
+  info.lastParserName = canonicalScriptName;
+  info.lastAttempt = {
+    ...previousAttempt,
+    ...normalizedAttempt,
+    originalParserName:
+      previousAttempt.originalParserName ||
+      (normalizedAttempt.parserName && normalizedAttempt.parserName !== canonicalScriptName ? normalizedAttempt.parserName : ""),
+    parserName: canonicalScriptName,
+    parserVersion: info.affectedVersion
+  };
+  info.updatedAt = Date.now();
+  return { issue: info, changed: true };
 }
 
 /**
@@ -2169,8 +2204,13 @@ function buildRepairIssueAdminView(issue) {
 
 async function getRepairIssueDetail(issueId) {
   const raw = await redisClient.get(buildRepairIssueKey(issueId));
-  const issue = raw ? safeJson(raw) : null;
+  let issue = raw ? safeJson(raw) : null;
   if (!issue) return null;
+  const normalized = normalizeRepairIssueScriptBinding(issue);
+  if (normalized.changed) {
+    issue = normalized.issue;
+    await redisClient.set(buildRepairIssueKey(issueId), JSON.stringify(issue));
+  }
   const sampleIds = await redisClient.sMembers(buildRepairIssueSamplesKey(issueId));
   const samples = [];
   for (const sampleId of sampleIds.slice(0, 20)) {
@@ -2702,11 +2742,11 @@ async function resolveIssueIdsForScriptAction(scriptName, rawIssueIds) {
 
 function normalizeReportSchoolSystemType(value) {
   const raw = (value || "").toString().trim().toLowerCase();
-  if (raw === "zf" || raw === "zhengfang") return "zhengfang";
-  if (raw === "qiangzhi") return "qiangzhi";
-  if (raw === "kingosoft") return "kingosoft";
-  if (raw === "qidi") return "qidi";
-  if (raw === "chaoxing") return "chaoxing";
+  if (raw === "zf" || raw === "zhengfang" || raw.includes("正方")) return "zhengfang";
+  if (raw === "qiangzhi" || raw.includes("强智")) return "qiangzhi";
+  if (raw === "kingosoft" || raw.includes("青果")) return "kingosoft";
+  if (raw === "qidi" || raw.includes("启迪")) return "qidi";
+  if (raw === "chaoxing" || raw.includes("超星") || raw.includes("学习通")) return "chaoxing";
   return raw || "unknown";
 }
 

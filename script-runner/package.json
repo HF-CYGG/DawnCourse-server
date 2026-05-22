@@ -1,0 +1,9 @@
+{
+  "name": "dawncourse-script-runner",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "runner.js",
+  "scripts": {
+    "start": "node runner.js"
+  }
+}

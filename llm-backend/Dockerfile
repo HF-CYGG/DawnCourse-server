@@ -1,14 +1,19 @@
-FROM node:18-alpine
-# 工作目录
+FROM node:20-alpine AS build
 WORKDIR /app
-# 复制运行所需文件
-COPY package.json ./
-COPY server.js ./
-RUN npm install --only=production
+COPY package.json package-lock.json* ./
+RUN npm install
+COPY tsconfig.json ./
+COPY src ./src
+RUN npm run build
+
+FROM node:20-alpine
+WORKDIR /app
 ENV SCRIPT_OUTPUT_DIR=/shared/parsers
+COPY package.json package-lock.json* ./
+RUN npm install --omit=dev
+COPY --from=build /app/dist ./dist
+COPY migrations ./migrations
 RUN mkdir -p /shared/parsers/metrics
 VOLUME ["/shared/parsers"]
-# 对外暴露服务端口
 EXPOSE 8080
-# 启动服务
-CMD ["node", "server.js"]
+CMD ["node", "dist/main.js"]

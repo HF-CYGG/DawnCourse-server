@@ -1334,6 +1334,26 @@ async function loadConfig() {
       document.getElementById("conf_summaryCostUrl").value = conf.summaryCostUrl || "";
       document.getElementById("conf_scriptUsageUrl").value = conf.scriptUsageUrl || "";
       document.getElementById("conf_scriptCostUrl").value = conf.scriptCostUrl || "";
+      const publicBaseUrlEl = document.getElementById("conf_publicBaseUrl");
+      if (publicBaseUrlEl) publicBaseUrlEl.value = conf.publicBaseUrl || "";
+      const runnerUrlEl = document.getElementById("conf_runnerUrl");
+      if (runnerUrlEl) runnerUrlEl.value = conf.runnerUrl || "";
+      const minQueueSizeEl = document.getElementById("conf_minQueueSize");
+      if (minQueueSizeEl) minQueueSizeEl.value = conf.minQueueSize || "";
+      const runnerTimeoutMsEl = document.getElementById("conf_runnerTimeoutMs");
+      if (runnerTimeoutMsEl) runnerTimeoutMsEl.value = conf.runnerTimeoutMs || "";
+      const signingPublicKeyEl = document.getElementById("conf_signingPublicKey");
+      if (signingPublicKeyEl) signingPublicKeyEl.value = conf.signing?.publicKey || "";
+      const runtimeStatusEl = document.getElementById("conf_runtimeStatus");
+      if (runtimeStatusEl) {
+        runtimeStatusEl.textContent = [
+          `数据库 ${conf.runtime?.databaseConfigured ? "已配置" : "未配置"}`,
+          `Redis ${conf.runtime?.redisConfigured ? "已配置" : "未配置"}`,
+          `Runner ${conf.runtime?.runnerUrl || "-"}`,
+          `签名 ${conf.signing?.configured ? "可用" : "不可用"}`,
+          conf.signing?.generated ? "密钥由容器自动生成" : "密钥来自环境变量或持久化文件"
+        ].join(" | ");
+      }
 
       const summaryProviderEl = document.getElementById("conf_summaryProviderRaw");
       const summaryBaseUrlEl = document.getElementById("conf_summaryBaseUrl");
@@ -1456,7 +1476,11 @@ document.getElementById("saveConfigBtn").addEventListener("click", async () => {
     summaryUsageUrl: document.getElementById("conf_summaryUsageUrl").value,
     summaryCostUrl: document.getElementById("conf_summaryCostUrl").value,
     scriptUsageUrl: document.getElementById("conf_scriptUsageUrl").value,
-    scriptCostUrl: document.getElementById("conf_scriptCostUrl").value
+    scriptCostUrl: document.getElementById("conf_scriptCostUrl").value,
+    publicBaseUrl: document.getElementById("conf_publicBaseUrl")?.value || "",
+    runnerUrl: document.getElementById("conf_runnerUrl")?.value || "",
+    minQueueSize: Number(document.getElementById("conf_minQueueSize")?.value || 0) || "",
+    runnerTimeoutMs: Number(document.getElementById("conf_runnerTimeoutMs")?.value || 0) || ""
   };
 
   const btn = document.getElementById("saveConfigBtn");

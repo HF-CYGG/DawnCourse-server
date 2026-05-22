@@ -40,8 +40,6 @@ services:
   llm-backend:
     # LLM 异步解析服务
     build: ./llm-backend
-    env_file:
-      - .env
     environment:
       # 模型 1（总结）配置
       LLM_SUMMARY_PROVIDER: gpt
@@ -54,6 +52,8 @@ services:
       LLM_SCRIPT_MODEL: gpt-4o
       LLM_SCRIPT_BASE_URL: ""
       REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgres://dawn:${POSTGRES_PASSWORD:-dawn}@postgres:5432/dawn_course
+      RUNNER_URL: http://script-runner:8090
       # 脚本输出目录
       SCRIPT_OUTPUT_DIR: /shared/parsers
       # 挂载原始脚本以便自动迁移并生成 meta.json
@@ -87,6 +87,10 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
+      script-runner:
+        condition: service_healthy
     healthcheck:
       test:
         [
@@ -97,6 +101,41 @@ services:
       timeout: 5s
       retries: 8
       start_period: 20s
+    networks:
+      - dawn-net
+  script-runner:
+    build: ./script-runner
+    restart: ${RESTART_POLICY:-no}
+    environment:
+      PORT: 8090
+      MAX_RUNNER_BODY: 1048576
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "node -e \"fetch('http://127.0.0.1:8090/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 10s
+    networks:
+      - dawn-net
+  postgres:
+    image: postgres:16-alpine
+    restart: ${RESTART_POLICY:-no}
+    environment:
+      POSTGRES_DB: dawn_course
+      POSTGRES_USER: dawn
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dawn}
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dawn -d dawn_course"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
     networks:
       - dawn-net
   redis:

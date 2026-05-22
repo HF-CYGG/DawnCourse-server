@@ -251,6 +251,30 @@
               <div class="config-group">
                 <h3>模型深度适配与统计配置</h3>
                 <div class="config-row">
+                  <label>公网访问地址（PUBLIC_BASE_URL）</label>
+                  <input type="text" id="conf_publicBaseUrl" placeholder="留空则按当前访问域名自动生成 manifest 地址">
+                </div>
+                <div class="config-row">
+                  <label>Runner 服务地址</label>
+                  <input type="text" id="conf_runnerUrl" placeholder="默认 http://script-runner:8090">
+                </div>
+                <div class="config-row">
+                  <label>自动修复最小样本数</label>
+                  <input type="number" id="conf_minQueueSize" min="1" step="1" placeholder="默认 3">
+                </div>
+                <div class="config-row">
+                  <label>Runner 超时（毫秒）</label>
+                  <input type="number" id="conf_runnerTimeoutMs" min="1000" step="1000" placeholder="默认 5000">
+                </div>
+                <div class="config-row">
+                  <label>脚本签名公钥</label>
+                  <textarea id="conf_signingPublicKey" readonly placeholder="容器首次启动会自动生成"></textarea>
+                </div>
+                <div class="config-row">
+                  <label>运行状态</label>
+                  <div class="muted" id="conf_runtimeStatus">-</div>
+                </div>
+                <div class="config-row">
                   <label>别名映射 (JSON)</label>
                   <textarea id="conf_modelAliasJson" placeholder='如: {"glm5 5.1": "glm-5-1"}'></textarea>
                 </div>

@@ -1,4 +1,5 @@
 #!/bin/sh
+# 服务启动脚本：启动内置 redis、llm-backend 与 nginx，并渲染 nginx 模板中的上游与 DNS 配置。
 set -eu
 
 mkdir -p /shared/parsers /data /run/redis
@@ -10,6 +11,7 @@ export REDIS_URL="${REDIS_URL:-redis://127.0.0.1:6379}"
 export BACKEND_MIRROR_LOG_FILE="${BACKEND_MIRROR_LOG_FILE:-/shared/parsers/llm-backend.log}"
 export SCRIPT_OUTPUT_DIR="${SCRIPT_OUTPUT_DIR:-/shared/parsers}"
 export LLM_BACKEND_UPSTREAM="${LLM_BACKEND_UPSTREAM:-127.0.0.1:8080}"
+export NGINX_DNS_RESOLVER="${NGINX_DNS_RESOLVER:-127.0.0.11}"
 
 node /app/llm-backend/server.js &
 BACKEND_PID=$!
@@ -44,7 +46,10 @@ term_handler() {
 
 trap term_handler TERM INT
 
-sed "s#__LLM_BACKEND_UPSTREAM__#${LLM_BACKEND_UPSTREAM}#g" /etc/nginx/nginx.conf > /tmp/nginx.conf
+sed \
+  -e "s#__LLM_BACKEND_UPSTREAM__#${LLM_BACKEND_UPSTREAM}#g" \
+  -e "s#__NGINX_DNS_RESOLVER__#${NGINX_DNS_RESOLVER}#g" \
+  /etc/nginx/nginx.conf > /tmp/nginx.conf
 nginx -t -c /tmp/nginx.conf
 nginx -g "daemon off;" -c /tmp/nginx.conf &
 NGINX_PID=$!

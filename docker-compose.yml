@@ -9,6 +9,8 @@ services:
       - "15000:15000"
     restart: ${RESTART_POLICY:-no}
     environment:
+      # 使用 Docker 内置 DNS，供 nginx 在运行期动态解析 llm-backend 服务名
+      NGINX_DNS_RESOLVER: 127.0.0.11
       LLM_BACKEND_UPSTREAM: llm-backend:8080
     volumes:
       - ./data/parsers:/shared/parsers
@@ -20,7 +22,7 @@ services:
       [
         "/bin/sh",
         "-c",
-        "mkdir -p /shared/parsers /var/log/nginx && touch /shared/parsers/llm-backend.log /var/log/nginx/nginx_access.log /var/log/nginx/nginx_error.log && echo '[log-bridge] app-server bridge started'; i=0; until wget -q -O - http://llm-backend:8080/health >/dev/null 2>&1 || [ \"$i\" -ge 60 ]; do i=$((i+1)); sleep 1; done; sed \"s#__LLM_BACKEND_UPSTREAM__#$${LLM_BACKEND_UPSTREAM}#g\" /etc/nginx/nginx.conf > /tmp/nginx.conf; nginx -t -c /tmp/nginx.conf; tail -n +1 -F /shared/parsers/llm-backend.log /var/log/nginx/nginx_access.log /var/log/nginx/nginx_error.log & exec nginx -g 'daemon off;' -c /tmp/nginx.conf"
+        "mkdir -p /shared/parsers /var/log/nginx && touch /shared/parsers/llm-backend.log /var/log/nginx/nginx_access.log /var/log/nginx/nginx_error.log && echo '[log-bridge] app-server bridge started'; i=0; until wget -q -O - http://llm-backend:8080/health >/dev/null 2>&1 || [ \"$i\" -ge 60 ]; do i=$((i+1)); sleep 1; done; sed -e \"s#__LLM_BACKEND_UPSTREAM__#$${LLM_BACKEND_UPSTREAM}#g\" -e \"s#__NGINX_DNS_RESOLVER__#$${NGINX_DNS_RESOLVER}#g\" /etc/nginx/nginx.conf > /tmp/nginx.conf; nginx -t -c /tmp/nginx.conf; tail -n +1 -F /shared/parsers/llm-backend.log /var/log/nginx/nginx_access.log /var/log/nginx/nginx_error.log & exec nginx -g 'daemon off;' -c /tmp/nginx.conf"
       ]
     depends_on:
       llm-backend:

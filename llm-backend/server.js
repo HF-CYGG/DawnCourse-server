@@ -5887,6 +5887,72 @@ async function findLegacyMetaPath(scriptName, legacyScriptPath) {
 }
 
 /**
+ * 启动时补齐内置解析脚本与 meta 文件。
+ * 背景：
+ * 1. Nginx 对外静态暴露的是 /shared/parsers
+ * 2. 仓库内置脚本实际挂载在 /shared/scripts/parsers
+ * 3. 首次部署或清空 data/parsers 后，用户可能先访问静态脚本而不是走 llm-backend 动态迁移
+ * 因此需要在服务启动时主动把缺失脚本与 meta 同步到共享目录，避免 Nginx 持续报 open() failed。
+ */
+async function ensureBundledParserScripts() {
+  const scriptNames = new Set();
+  for (const legacyDir of legacyScriptOutputDirs) {
+    let entries = [];
+    try {
+      entries = await fs.readdir(legacyDir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry?.isFile?.()) continue;
+      if (!entry.name.toLowerCase().endsWith(".js")) continue;
+      scriptNames.add(sanitizeScriptName(entry.name));
+    }
+  }
+  if (!scriptNames.size) return;
+
+  let createdScriptCount = 0;
+  let createdMetaCount = 0;
+  for (const scriptName of scriptNames) {
+    const targetPath = buildScriptPath(scriptName);
+    const targetMetaPath = buildScriptMetaPath(scriptName);
+    const legacyPath = await findLegacyScriptPath(scriptName);
+    if (!legacyPath) continue;
+    const legacyContent = await readTextIfExists(legacyPath);
+    if (!legacyContent) continue;
+
+    if (!(await fileExists(targetPath))) {
+      await fs.mkdir(path.dirname(targetPath), { recursive: true });
+      await fs.writeFile(targetPath, legacyContent, "utf-8");
+      createdScriptCount += 1;
+    }
+
+    if (!(await fileExists(targetMetaPath))) {
+      const legacyMetaPath = await findLegacyMetaPath(scriptName, legacyPath);
+      const legacyMetaText = legacyMetaPath ? await readTextIfExists(legacyMetaPath) : "";
+      if (legacyMetaText) {
+        await fs.mkdir(path.dirname(targetMetaPath), { recursive: true });
+        await fs.writeFile(targetMetaPath, legacyMetaText, "utf-8");
+      } else {
+        const meta = await buildScriptMeta(scriptName, legacyContent, {
+          previousMeta: { version: 0, sha256: "" },
+          appliedBy: "bootstrap",
+          releaseStage: "active"
+        });
+        await writeScriptMeta(scriptName, meta);
+      }
+      createdMetaCount += 1;
+    }
+  }
+
+  if (createdScriptCount > 0 || createdMetaCount > 0) {
+    console.log(
+      `[bootstrap] synced bundled parser files: scripts=${createdScriptCount}, meta=${createdMetaCount}`
+    );
+  }
+}
+
+/**
  * 确保脚本与指标目录存在，避免首次启动写入失败
  */
 async function ensureStorageLayout() {
@@ -5905,6 +5971,7 @@ async function ensureStorageLayout() {
     await fs.mkdir(path.dirname(nginxErrorLogFile), { recursive: true });
     await fs.appendFile(nginxErrorLogFile, "");
   }
+  await ensureBundledParserScripts();
 }
 
 /**

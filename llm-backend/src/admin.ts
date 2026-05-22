@@ -1,6 +1,18 @@
+/**
+ * 文件说明：Dawn Course 服务端运维后台路由。
+ * 负责管理后台登录、会话校验、账号管理、配置管理与修复运维接口。
+ */
+
 import fs from "node:fs";
 import { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { config } from "./config.js";
+import {
+  buildRuntimeLogPayload,
+  buildScriptHistoryEntries,
+  formatAdminBufferLine,
+  type AdminBufferEntry,
+  type RuntimeLogSourceKey
+} from "./adminContracts.js";
 import { query } from "./db.js";
 import { addIssueEvent, setIssueStage } from "./events.js";
 import { chatCompletionsUrl, runReplayOnly, startRepairJob } from "./repair.js";
@@ -10,52 +22,73 @@ import { limitString, id, sha256 } from "./utils.js";
 
 type AdminRequest = FastifyRequest & { adminUser?: string };
 const eventStreamTokens = new Map<string, { username: string; expiresAt: number }>();
+const adminLogBuffer: AdminBufferEntry[] = [];
 
-export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
-  await ensureBuiltinAdminUser();
+/**
+ * 路由级依赖注入：
+ * - 让关键运维路由可以在无数据库、无外部服务时做轻量集成验证；
+ * - 默认仍然落回真实实现，不影响生产流程。
+ */
+export interface AdminRouteDeps {
+  ensureBuiltinAdminUser?: () => Promise<void>;
+  authRequired?: (request: AdminRequest, reply: FastifyReply) => Promise<void>;
+  runReplayOnly?: typeof runReplayOnly;
+  startRepairJob?: typeof startRepairJob;
+  addIssueEvent?: typeof addIssueEvent;
+}
 
-  app.post("/api/v1/admin/login", async (request) => {
+export async function registerAdminRoutes(app: FastifyInstance, deps: AdminRouteDeps = {}): Promise<void> {
+  const ensureBuiltinAdminUserFn = deps.ensureBuiltinAdminUser || ensureBuiltinAdminUser;
+  const authRequiredFn = deps.authRequired || authRequired;
+  const runReplayOnlyFn = deps.runReplayOnly || runReplayOnly;
+  const startRepairJobFn = deps.startRepairJob || startRepairJob;
+  const addIssueEventFn = deps.addIssueEvent || addIssueEvent;
+  await ensureBuiltinAdminUserFn();
+
+  app.post("/api/v1/admin/login", async (request, reply) => {
     const body = (request.body || {}) as Record<string, string>;
     const username = String(body.username || "").trim();
     const password = String(body.password || "");
     const target = await findAdminUser(username);
     if (!target || hashAdminPassword(password, target.passwordSalt) !== target.passwordHash) {
-      return { code: 401, msg: "invalid credentials", data: null };
+      return reply.code(401).send(apiError(401, "账号或密码错误"));
     }
     const token = id("adm");
     const expiresAt = new Date(Date.now() + config.adminSessionTtlMs);
     await query("INSERT INTO admin_sessions(token, username, expires_at) VALUES ($1,$2,$3)", [token, username, expiresAt]);
     await touchAdminUserLogin(username);
+    pushAdminLog("info", "管理后台登录成功", { source: "admin-auth", username });
     return apiOk({ token, username, expiresAt: expiresAt.getTime() });
   });
 
-  app.get("/api/v1/admin/session", { preHandler: authRequired }, async (request: AdminRequest) => {
+  app.get("/api/v1/admin/session", { preHandler: authRequiredFn }, async (request: AdminRequest) => {
     return apiOk({ authenticated: true, username: request.adminUser || "" });
   });
 
   app.route({
     method: ["GET", "POST"],
     url: "/api/v1/admin/logout",
-    preHandler: authRequired,
+    preHandler: authRequiredFn,
     handler: async (request: AdminRequest) => {
       const token = getBearer(request);
       if (token) await query("DELETE FROM admin_sessions WHERE token = $1", [token]);
+      pushAdminLog("info", "管理后台已退出登录", { source: "admin-auth", username: request.adminUser || "" });
       return apiOk({ loggedOut: true });
     }
   });
 
-  app.get("/api/v1/admin/users", { preHandler: authRequired }, async () => {
-    await ensureBuiltinAdminUser();
+  app.get("/api/v1/admin/users", { preHandler: authRequiredFn }, async () => {
+    await ensureBuiltinAdminUserFn();
     return apiOk({ list: await listAdminUsers() });
   });
 
-  app.post("/api/v1/admin/users", { preHandler: authRequired }, async (request: AdminRequest) => {
+  app.post("/api/v1/admin/users", { preHandler: authRequiredFn }, async (request: AdminRequest, reply) => {
     const body = (request.body || {}) as Record<string, unknown>;
     const username = String(body.username || "").trim();
     const password = String(body.password || "");
     const result = await createAdminUser(username, password);
     if (!result.ok) {
-      return { code: result.code, msg: result.msg, data: null };
+      return reply.code(result.code).send(apiError(result.code, result.msg));
     }
     await query("INSERT INTO audit_logs(actor, action, target_type, target_id, detail_json) VALUES ($1,$2,$3,$4,$5::jsonb)", [
       request.adminUser || "admin",
@@ -64,16 +97,17 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
       username,
       JSON.stringify({ username })
     ]);
+    pushAdminLog("info", "新增管理账号", { source: "admin-user", operator: request.adminUser || "admin", username });
     return apiOk({ created: true, username });
   });
 
-  app.post("/api/v1/admin/users/rename", { preHandler: authRequired }, async (request: AdminRequest) => {
+  app.post("/api/v1/admin/users/rename", { preHandler: authRequiredFn }, async (request: AdminRequest, reply) => {
     const body = (request.body || {}) as Record<string, unknown>;
     const oldUsername = String(body.oldUsername || "").trim();
     const newUsername = String(body.newUsername || "").trim();
     const result = await renameAdminUser(oldUsername, newUsername);
     if (!result.ok) {
-      return { code: result.code, msg: result.msg, data: null };
+      return reply.code(result.code).send(apiError(result.code, result.msg));
     }
     await query("INSERT INTO audit_logs(actor, action, target_type, target_id, detail_json) VALUES ($1,$2,$3,$4,$5::jsonb)", [
       request.adminUser || "admin",
@@ -82,16 +116,22 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
       oldUsername,
       JSON.stringify({ oldUsername, newUsername })
     ]);
+    pushAdminLog("warning", "修改管理账号", {
+      source: "admin-user",
+      operator: request.adminUser || "admin",
+      oldUsername,
+      newUsername
+    });
     return apiOk({ renamed: true, oldUsername, newUsername });
   });
 
-  app.post("/api/v1/admin/users/password", { preHandler: authRequired }, async (request: AdminRequest) => {
+  app.post("/api/v1/admin/users/password", { preHandler: authRequiredFn }, async (request: AdminRequest, reply) => {
     const body = (request.body || {}) as Record<string, unknown>;
     const username = String(body.username || "").trim();
     const newPassword = String(body.newPassword || "").trim();
     const result = await updateAdminUserPassword(username, newPassword);
     if (!result.ok) {
-      return { code: result.code, msg: result.msg, data: null };
+      return reply.code(result.code).send(apiError(result.code, result.msg));
     }
     await query("INSERT INTO audit_logs(actor, action, target_type, target_id, detail_json) VALUES ($1,$2,$3,$4,$5::jsonb)", [
       request.adminUser || "admin",
@@ -100,16 +140,21 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
       username,
       JSON.stringify({ username })
     ]);
+    pushAdminLog("warning", "重置管理账号密码", {
+      source: "admin-user",
+      operator: request.adminUser || "admin",
+      username
+    });
     return apiOk({ updated: true, username });
   });
 
-  app.post("/api/v1/admin/users/delete", { preHandler: authRequired }, async (request: AdminRequest) => {
+  app.post("/api/v1/admin/users/delete", { preHandler: authRequiredFn }, async (request: AdminRequest, reply) => {
     const body = (request.body || {}) as Record<string, unknown>;
     const username = String(body.username || "").trim();
     const actor = request.adminUser || "admin";
     const result = await deleteAdminUser(username, actor);
     if (!result.ok) {
-      return { code: result.code, msg: result.msg, data: null };
+      return reply.code(result.code).send(apiError(result.code, result.msg));
     }
     await query("INSERT INTO audit_logs(actor, action, target_type, target_id, detail_json) VALUES ($1,$2,$3,$4,$5::jsonb)", [
       actor,
@@ -118,10 +163,11 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
       username,
       JSON.stringify({ username })
     ]);
+    pushAdminLog("warning", "删除管理账号", { source: "admin-user", operator: actor, username });
     return apiOk({ deleted: true, username });
   });
 
-  app.post("/api/v1/admin/events/token", { preHandler: authRequired }, async (request: AdminRequest) => {
+  app.post("/api/v1/admin/events/token", { preHandler: authRequiredFn }, async (request: AdminRequest) => {
     const token = id("evt");
     const expiresAt = Date.now() + 5 * 60 * 1000;
     eventStreamTokens.set(token, { username: request.adminUser || "admin", expiresAt });
@@ -135,7 +181,7 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     const stream = eventStreamTokens.get(streamToken);
     if (!stream || stream.expiresAt <= Date.now()) {
       eventStreamTokens.delete(streamToken);
-      return reply.code(401).send({ code: 401, msg: "unauthorized", data: null });
+      return reply.code(401).send(apiError(401, "登录状态已失效，请重新登录"));
     }
 
     reply.hijack();
@@ -159,26 +205,32 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     });
   });
 
-  app.post("/api/v1/admin/client_error", { preHandler: authRequired }, async (request: AdminRequest) => {
+  app.post("/api/v1/admin/client_error", { preHandler: authRequiredFn }, async (request: AdminRequest) => {
     const body = (request.body || {}) as Record<string, unknown>;
     log.warn("admin client error", {
       actor: request.adminUser || "admin",
       message: limitString(String(body.message || ""), 300),
       stack: limitString(String(body.stack || ""), 1000)
     });
+    pushAdminLog("error", limitString(String(body.message || "client_error"), 300), {
+      source: "client",
+      username: request.adminUser || "admin",
+      stack: limitString(String(body.stack || ""), 1000),
+      url: limitString(String(body.url || ""), 300)
+    });
     return apiOk({ accepted: true });
   });
 
-  app.get("/api/v1/admin/data", { preHandler: authRequired }, async () => {
+  app.get("/api/v1/admin/data", { preHandler: authRequiredFn }, async () => {
     const stats = await loadAdminStats();
     return apiOk(stats);
   });
 
-  app.get("/api/v1/admin/config", { preHandler: authRequired }, async () => {
+  app.get("/api/v1/admin/config", { preHandler: authRequiredFn }, async () => {
     return apiOk(await loadModelConfig());
   });
 
-  app.post("/api/v1/admin/config", { preHandler: authRequired }, async (request) => {
+  app.post("/api/v1/admin/config", { preHandler: authRequiredFn }, async (request) => {
     const body = request.body || {};
     await query(
       `INSERT INTO system_config(key, value_json) VALUES ('model_config',$1::jsonb)
@@ -188,7 +240,7 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     return apiOk({ saved: true });
   });
 
-  app.post("/api/v1/admin/config/test", { preHandler: authRequired }, async (request) => {
+  app.post("/api/v1/admin/config/test", { preHandler: authRequiredFn }, async (request) => {
     const started = Date.now();
     const body = (request.body || {}) as Record<string, string>;
     const provider = body.provider || body.summaryProvider || body.scriptProvider || "gpt";
@@ -247,7 +299,7 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     }
   });
 
-  app.get("/api/v1/admin/repair/issues", { preHandler: authRequired }, async () => {
+  app.get("/api/v1/admin/repair/issues", { preHandler: authRequiredFn }, async () => {
     const rows = await query(
       `SELECT i.*, e.created_at AS last_step_at
        FROM repair_issues i
@@ -259,7 +311,7 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     return apiOk({ list: rows.rows.map(formatIssue) });
   });
 
-  app.get("/api/v1/admin/repair/issues/:id", { preHandler: authRequired }, async (request) => {
+  app.get("/api/v1/admin/repair/issues/:id", { preHandler: authRequiredFn }, async (request) => {
     const issueId = (request.params as { id: string }).id;
     const issue = await query("SELECT * FROM repair_issues WHERE issue_id = $1", [issueId]);
     const samples = await query(
@@ -271,7 +323,7 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     return apiOk({ issue: issue.rows[0] ? formatIssue(issue.rows[0]) : null, samples: samples.rows, reports: reports.rows, jobs: jobs.rows });
   });
 
-  app.get("/api/v1/admin/repair/issues/:id/timeline", { preHandler: authRequired }, async (request) => {
+  app.get("/api/v1/admin/repair/issues/:id/timeline", { preHandler: authRequiredFn }, async (request) => {
     const issueId = (request.params as { id: string }).id;
     const rows = await query(
       "SELECT * FROM repair_issue_events WHERE issue_id = $1 ORDER BY created_at ASC LIMIT 300",
@@ -280,7 +332,7 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     return apiOk({ list: rows.rows.map(formatEvent) });
   });
 
-  app.get("/api/v1/admin/repair/issues/:id/logs", { preHandler: authRequired }, async (request) => {
+  app.get("/api/v1/admin/repair/issues/:id/logs", { preHandler: authRequiredFn }, async (request) => {
     const issueId = (request.params as { id: string }).id;
     const q = request.query as Record<string, string | undefined>;
     const stage = q.stage || "";
@@ -294,32 +346,32 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     return apiOk({ list: rows.rows.map(formatEvent) });
   });
 
-  app.post("/api/v1/admin/repair/issues/:id/run-test", { preHandler: authRequired }, async (request: AdminRequest) => {
+  app.post("/api/v1/admin/repair/issues/:id/run-test", { preHandler: authRequiredFn }, async (request: AdminRequest) => {
     const issueId = (request.params as { id: string }).id;
-    const result = await runReplayOnly(issueId, request.adminUser || "admin");
+    const result = await runReplayOnlyFn(issueId, request.adminUser || "admin");
     return apiOk({ ...result, testedBy: request.adminUser || "admin" });
   });
 
-  app.post("/api/v1/admin/repair/issues/:id/retry", { preHandler: authRequired }, async (request: AdminRequest) => {
+  app.post("/api/v1/admin/repair/issues/:id/retry", { preHandler: authRequiredFn }, async (request: AdminRequest) => {
     const issueId = (request.params as { id: string }).id;
-    const result = await startRepairJob(issueId, { actor: request.adminUser || "admin", bypassMinQueue: false });
+    const result = await startRepairJobFn(issueId, { actor: request.adminUser || "admin", bypassMinQueue: false });
     return apiOk(result);
   });
 
-  app.post("/api/v1/admin/repair/issues/:id/force-repair", { preHandler: authRequired }, async (request: AdminRequest) => {
+  app.post("/api/v1/admin/repair/issues/:id/force-repair", { preHandler: authRequiredFn }, async (request: AdminRequest) => {
     const issueId = (request.params as { id: string }).id;
-    await addIssueEvent({ issueId, stage: "SAMPLE_READY", actor: request.adminUser || "admin", source: "admin_force_repair", message: "管理员立即修复，忽略最小样本数限制" });
-    const result = await startRepairJob(issueId, { actor: request.adminUser || "admin", bypassMinQueue: true });
+    await addIssueEventFn({ issueId, stage: "SAMPLE_READY", actor: request.adminUser || "admin", source: "admin_force_repair", message: "管理员立即修复，忽略最小样本数限制" });
+    const result = await startRepairJobFn(issueId, { actor: request.adminUser || "admin", bypassMinQueue: true });
     return apiOk(result);
   });
 
-  app.post("/api/v1/admin/repair/issues/:id/run", { preHandler: authRequired }, async (request: AdminRequest) => {
+  app.post("/api/v1/admin/repair/issues/:id/run", { preHandler: authRequiredFn }, async (request: AdminRequest) => {
     const issueId = (request.params as { id: string }).id;
-    const result = await startRepairJob(issueId, { actor: request.adminUser || "admin", bypassMinQueue: true });
+    const result = await startRepairJobFn(issueId, { actor: request.adminUser || "admin", bypassMinQueue: true });
     return apiOk(result);
   });
 
-  app.post("/api/v1/admin/repair/issues/:id/delete", { preHandler: authRequired }, async (request) => {
+  app.post("/api/v1/admin/repair/issues/:id/delete", { preHandler: authRequiredFn }, async (request) => {
     const issueId = (request.params as { id: string }).id;
     await query("DELETE FROM repair_issue_events WHERE issue_id = $1", [issueId]);
     await query("DELETE FROM failure_samples WHERE issue_id = $1", [issueId]);
@@ -329,7 +381,7 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     return apiOk({ deleted: true });
   });
 
-  app.get("/api/v1/admin/scripts", { preHandler: authRequired }, async () => {
+  app.get("/api/v1/admin/scripts", { preHandler: authRequiredFn }, async () => {
     const rows = await query(
       `SELECT r.*, a.content_sha256, a.signature
        FROM script_releases r JOIN script_artifacts a ON a.script_id = r.script_id AND a.version = r.version
@@ -338,13 +390,13 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     return apiOk({ list: rows.rows.map(formatRelease) });
   });
 
-  app.get("/api/v1/admin/script_content", { preHandler: authRequired }, async (request) => {
+  app.get("/api/v1/admin/script_content", { preHandler: authRequiredFn }, async (request) => {
     const q = request.query as Record<string, string | undefined>;
     const row = await query("SELECT content FROM script_artifacts WHERE name = $1 ORDER BY version DESC LIMIT 1", [q.scriptName || q.name || ""]);
     return apiOk({ content: row.rows[0]?.content || "" });
   });
 
-  app.post("/api/v1/admin/scripts/releases", { preHandler: authRequired }, async (request: AdminRequest) => {
+  app.post("/api/v1/admin/scripts/releases", { preHandler: authRequiredFn }, async (request: AdminRequest) => {
     const body = (request.body || {}) as Record<string, unknown>;
     const releaseId = String(body.releaseId || "");
     const targetStage = String(body.releaseStage || body.stage || "canary");
@@ -353,32 +405,103 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     return apiOk({ releaseId, releaseStage: targetStage });
   });
 
-  app.post("/api/v1/admin/promote_script", { preHandler: authRequired }, async (request: AdminRequest) => {
+  app.post("/api/v1/admin/promote_script", { preHandler: authRequiredFn }, async (request: AdminRequest) => {
     const body = (request.body || {}) as Record<string, unknown>;
     const releaseId = String(body.releaseId || "");
     if (releaseId) await publishRelease(releaseId, String(body.stage || "active"), request.adminUser || "admin");
     return apiOk({ promoted: Boolean(releaseId), releaseId });
   });
 
-  app.post("/api/v1/admin/scripts/releases/:id/rollback", { preHandler: authRequired }, async (request: AdminRequest) => {
+  app.post("/api/v1/admin/scripts/releases/:id/rollback", { preHandler: authRequiredFn }, async (request: AdminRequest) => {
     const releaseId = (request.params as { id: string }).id;
     await rollbackRelease(releaseId, request.adminUser || "admin");
     return apiOk({ rolledBack: true });
   });
 
-  app.post("/api/v1/admin/rollback_script", { preHandler: authRequired }, async (request: AdminRequest) => {
+  app.post("/api/v1/admin/rollback_script", { preHandler: authRequiredFn }, async (request: AdminRequest) => {
     const body = (request.body || {}) as Record<string, string>;
     const row = await query("SELECT release_id FROM script_releases WHERE name = $1 AND release_stage = 'active' ORDER BY version DESC LIMIT 1", [body.scriptName || ""]);
     if (row.rows[0]?.release_id) await rollbackRelease(String(row.rows[0].release_id), request.adminUser || "admin");
     return apiOk({ rolledBack: Boolean(row.rows[0]) });
   });
 
-  app.get("/api/v1/admin/runtime_logs", { preHandler: authRequired }, async (request) => {
+  app.get("/api/v1/admin/script_history", { preHandler: authRequiredFn }, async (request) => {
     const q = request.query as Record<string, string | undefined>;
-    const limit = Math.min(Number(q.limit || 500), 1000);
-    const file = config.backendMirrorLogFile;
-    const text = fs.existsSync(file) ? fs.readFileSync(file, "utf8").split(/\r?\n/).slice(-limit).join("\n") : "";
-    return apiOk({ source: q.source || "backend", list: text ? text.split(/\r?\n/).filter(Boolean) : [], text });
+    const scriptName = String(q.scriptName || q.script_name || "").trim();
+    if (!scriptName) {
+      return apiError(400, "缺少 scriptName");
+    }
+    const limit = Math.max(1, Math.min(500, Number(q.limit || 200)));
+    const releases = await query(
+      `SELECT
+         r.release_id,
+         r.name,
+         r.version,
+         r.release_stage,
+         r.parent_release_id,
+         pr.version AS parent_version,
+         r.issue_id,
+         r.changelog,
+         r.created_at,
+         r.approved_at,
+         r.published_at,
+         r.approved_by,
+         a.created_by,
+         i.school_id,
+         i.school_name
+       FROM script_releases r
+       LEFT JOIN script_releases pr ON pr.release_id = r.parent_release_id
+       LEFT JOIN script_artifacts a ON a.script_id = r.script_id AND a.version = r.version
+       LEFT JOIN repair_issues i ON i.issue_id = r.issue_id
+       WHERE r.name = $1
+       ORDER BY r.created_at DESC
+       LIMIT $2`,
+      [scriptName, limit]
+    );
+    const audits = await query(
+      `SELECT
+         al.actor,
+         al.action,
+         al.created_at AS audit_created_at,
+         al.detail_json->>'stage' AS detail_stage,
+         al.detail_json->>'parentReleaseId' AS detail_parent_release_id,
+         r.release_id,
+         r.name,
+         r.version,
+         r.release_stage,
+         r.parent_release_id,
+         pr.version AS parent_version,
+         r.issue_id,
+         r.approved_by,
+         r.published_at,
+         i.school_id,
+         i.school_name
+       FROM audit_logs al
+       JOIN script_releases r ON r.release_id = al.target_id
+       LEFT JOIN script_releases pr ON pr.release_id = r.parent_release_id
+       LEFT JOIN repair_issues i ON i.issue_id = r.issue_id
+       WHERE al.target_type = 'script_release'
+         AND al.action IN ('publish_release', 'rollback_release')
+         AND r.name = $1
+       ORDER BY al.created_at DESC
+       LIMIT $2`,
+      [scriptName, Math.max(limit * 2, 20)]
+    );
+    const list = buildScriptHistoryEntries({
+      scriptName,
+      releaseRows: releases.rows as Array<Record<string, unknown>>,
+      auditRows: audits.rows as Array<Record<string, unknown>>,
+      limit
+    });
+    return apiOk({ list });
+  });
+
+  app.get("/api/v1/admin/runtime_logs", { preHandler: authRequiredFn }, async (request) => {
+    const q = request.query as Record<string, string | undefined>;
+    const source = String(q.source || "all").trim() || "all";
+    const limit = Math.max(1, Math.min(20000, Number(q.limit || 1000)));
+    const payload = await loadRuntimeLogsPayload(source, limit);
+    return apiOk(payload);
   });
 }
 
@@ -528,7 +651,7 @@ async function authOptional(request: AdminRequest): Promise<void> {
 async function authRequired(request: AdminRequest, reply: FastifyReply): Promise<void> {
   await authOptional(request);
   if (!request.adminUser) {
-    reply.code(401).send({ code: 401, msg: "unauthorized", data: null });
+    reply.code(401).send(apiError(401, "登录状态已失效，请重新登录"));
   }
 }
 
@@ -542,6 +665,116 @@ function cleanupEventStreamTokens(): void {
   for (const [token, info] of eventStreamTokens.entries()) {
     if (info.expiresAt <= now) eventStreamTokens.delete(token);
   }
+}
+
+/**
+ * 写入管理后台内存日志缓冲区。
+ * 该缓冲区是 `runtime_logs?source=admin` 的数据来源，同时也会参与“全部来源”聚合。
+ */
+function pushAdminLog(level: string, message: string, extra: Record<string, unknown> = {}): void {
+  adminLogBuffer.push({
+    id: id("admin_log"),
+    level,
+    message,
+    extra,
+    createdAt: Date.now()
+  });
+  if (adminLogBuffer.length > config.adminLogBufferLimit) {
+    adminLogBuffer.splice(0, adminLogBuffer.length - config.adminLogBufferLimit);
+  }
+}
+
+/**
+ * 从文件尾部读取指定行数。
+ * 只读取最后一个窗口的字节，避免大日志文件被一次性全部读入内存。
+ */
+async function readTailLinesFromFile(filePath: string, maxLines: number): Promise<{ lines: string[]; exists: boolean }> {
+  if (!filePath) return { lines: [], exists: false };
+  try {
+    const stats = await fs.promises.stat(filePath);
+    if (!stats.isFile()) return { lines: [], exists: false };
+    if (stats.size <= 0) return { lines: [], exists: true };
+    const readBytes = Math.min(stats.size, config.runtimeLogReadBytes);
+    const handle = await fs.promises.open(filePath, "r");
+    try {
+      const buffer = Buffer.alloc(readBytes);
+      await handle.read(buffer, 0, readBytes, stats.size - readBytes);
+      const lines = buffer
+        .toString("utf8")
+        .split(/\r?\n/)
+        .filter(Boolean)
+        .slice(-maxLines);
+      return { lines, exists: true };
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return { lines: [], exists: false };
+  }
+}
+
+/**
+ * 组装运行日志页的统一响应。
+ * 兼容旧版 Node 实现的字段集合，保证当前 `admin.js` 可直接消费。
+ */
+async function loadRuntimeLogsPayload(source: string, limit: number) {
+  const files: Record<RuntimeLogSourceKey, string> = {
+    backend: config.backendMirrorLogFile,
+    nginx_access: config.nginxAccessLogFile,
+    nginx_error: config.nginxErrorLogFile,
+    admin: "adminLogBuffer"
+  };
+  const memoryLines = adminLogBuffer.slice(-limit).map((item) => formatAdminBufferLine(item));
+  if (source === "admin") {
+    return buildRuntimeLogPayload({
+      requestedSource: source,
+      resolvedSource: "admin",
+      requestedLimit: limit,
+      files,
+      lines: memoryLines,
+      sourceCounts: { admin: memoryLines.length },
+      missingSources: []
+    });
+  }
+  if (source === "backend" || source === "nginx_access" || source === "nginx_error") {
+    const result = await readTailLinesFromFile(files[source], limit);
+    return buildRuntimeLogPayload({
+      requestedSource: source,
+      resolvedSource: source,
+      requestedLimit: limit,
+      files,
+      lines: result.lines,
+      sourceCounts: { [source]: result.lines.length },
+      missingSources: result.exists ? [] : [source]
+    });
+  }
+  const backendResult = await readTailLinesFromFile(files.backend, limit);
+  const accessResult = await readTailLinesFromFile(files.nginx_access, limit);
+  const errorResult = await readTailLinesFromFile(files.nginx_error, limit);
+  const missingSources: string[] = [];
+  if (!backendResult.exists) missingSources.push("backend");
+  if (!accessResult.exists) missingSources.push("nginx_access");
+  if (!errorResult.exists) missingSources.push("nginx_error");
+  const lines = [
+    ...backendResult.lines.map((line) => `[backend] ${line}`),
+    ...accessResult.lines.map((line) => `[nginx-access] ${line}`),
+    ...errorResult.lines.map((line) => `[nginx-error] ${line}`),
+    ...memoryLines.map((line) => `[admin-buffer] ${line}`)
+  ];
+  return buildRuntimeLogPayload({
+    requestedSource: source,
+    resolvedSource: "all",
+    requestedLimit: limit,
+    files,
+    lines,
+    sourceCounts: {
+      backend: backendResult.lines.length,
+      nginx_access: accessResult.lines.length,
+      nginx_error: errorResult.lines.length,
+      admin: memoryLines.length
+    },
+    missingSources
+  });
 }
 
 async function loadAdminStats(): Promise<Record<string, unknown>> {
@@ -592,6 +825,7 @@ async function publishRelease(releaseId: string, stage: string, actor: string): 
     releaseId,
     JSON.stringify({ stage })
   ]);
+  pushAdminLog("info", "发布脚本版本", { source: "script-release", actor, releaseId, stage });
   if (row.issue_id) {
     await setIssueStage(row.issue_id, stage === "active" ? "ACTIVE" : "CANARY", `published ${stage}`);
     await addIssueEvent({ issueId: row.issue_id, stage: stage === "active" ? "ACTIVE" : "CANARY", actor, message: `发布 ${releaseId} 到 ${stage}` });
@@ -616,6 +850,12 @@ async function rollbackRelease(releaseId: string, actor: string): Promise<void> 
     releaseId,
     JSON.stringify({ parentReleaseId: row.parent_release_id })
   ]);
+  pushAdminLog("warning", "回滚脚本版本", {
+    source: "script-release",
+    actor,
+    releaseId,
+    parentReleaseId: row.parent_release_id || ""
+  });
   if (row.issue_id) {
     await setIssueStage(row.issue_id, "ROLLED_BACK", "rolled back");
     await addIssueEvent({ issueId: row.issue_id, stage: "ROLLED_BACK", actor, message: `已回滚 ${releaseId}` });
@@ -694,4 +934,8 @@ function safeParse(text: string): any {
 
 function apiOk(data: unknown): { code: number; msg: string; data: unknown } {
   return { code: 200, msg: "ok", data };
+}
+
+function apiError(code: number, msg: string): { code: number; msg: string; data: null } {
+  return { code, msg, data: null };
 }

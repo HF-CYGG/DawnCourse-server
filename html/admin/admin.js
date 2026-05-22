@@ -3,6 +3,8 @@
  * 负责导航切换、运维文案映射、数据拉取、页面渲染以及主要运维操作交互。
  */
 
+import { normalizeStoredAdminToken, resolveAdminApiError } from "./admin-auth-utils.js";
+
 const overlay = document.getElementById("loginOverlay");
 const loginBtn = document.getElementById("loginBtn");
 const loginHint = document.getElementById("loginHint");
@@ -775,17 +777,23 @@ async function performLogin() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ username, password })
     });
-    if (!res.ok) {
-      setLoginHint("账号或密码错误", "error");
+    const result = await parseAdminApiResponse(res);
+    const token = normalizeStoredAdminToken(result?.data?.token);
+    if (!token) {
+      throw buildAdminRequestError("error", "登录成功，但未返回有效会话");
+    }
+    setToken(token);
+    if (loginPassInput) {
+      loginPassInput.value = "";
+    }
+    await bootstrapAdminWorkbench("initial");
+  } catch (error) {
+    if (isUnauthorizedError(error)) {
+      clearToken();
+      setLoginHint(error?.detailMessage || "账号或密码错误", "error");
       return;
     }
-    const result = await res.json();
-    setToken(result.data.token);
-    overlay.style.display = "none";
-    await connectAdminEvents();
-    await performPageRefresh("page-dashboard", "initial");
-  } catch {
-    setLoginHint("网络异常，请稍后重试", "error");
+    setLoginHint(error?.detailMessage || "网络异常，请稍后重试", "error");
   } finally {
     setLoginLoading(false);
   }
@@ -1553,13 +1561,110 @@ const sourceTypeLabels = {
 };
 
 function getToken() {
-  return localStorage.getItem("dawn_admin_token") || "";
+  const stored = localStorage.getItem("dawn_admin_token");
+  const token = normalizeStoredAdminToken(stored);
+  if (!token && stored !== null) {
+    clearToken();
+  }
+  return token;
 }
 function setToken(token) {
-  localStorage.setItem("dawn_admin_token", token);
+  const normalized = normalizeStoredAdminToken(token);
+  if (!normalized) {
+    clearToken();
+    return;
+  }
+  localStorage.setItem("dawn_admin_token", normalized);
 }
 function clearToken() {
   localStorage.removeItem("dawn_admin_token");
+}
+
+/**
+ * 统一创建管理后台请求错误对象，方便上层根据 kind 做登录态和普通错误分流。
+ *
+ * @param {"unauthorized" | "error"} kind 错误类型
+ * @param {string} message 面向用户的错误信息
+ * @returns {Error & { kind: "unauthorized" | "error"; detailMessage: string }}
+ */
+function buildAdminRequestError(kind, message) {
+  const error = new Error(kind === "unauthorized" ? "unauthorized" : message || "request_failed");
+  error.kind = kind;
+  error.detailMessage = message || "";
+  return error;
+}
+
+/**
+ * 解析管理后台 JSON 接口，兼容 HTTP 状态码与业务状态码不一致的情况。
+ *
+ * @param {Response} res fetch 返回的响应对象
+ * @returns {Promise<Record<string, any>>}
+ */
+async function parseAdminApiResponse(res) {
+  const text = await res.text();
+  let parsed = {};
+  try {
+    parsed = text ? JSON.parse(text) : {};
+  } catch {
+    throw buildAdminRequestError("error", text || `unexpected_response_${res.status}`);
+  }
+  const apiError = resolveAdminApiError(res.status, parsed);
+  if (apiError) {
+    throw buildAdminRequestError(apiError.kind, apiError.message);
+  }
+  return parsed;
+}
+
+/**
+ * 判断当前错误是否为未授权错误。
+ *
+ * @param {unknown} error 运行时错误对象
+ * @returns {boolean}
+ */
+function isUnauthorizedError(error) {
+  return error?.kind === "unauthorized" || error?.message === "unauthorized";
+}
+
+/**
+ * 显示登录面板，并在需要时同步提示文案和焦点。
+ *
+ * @param {string} hintText 提示文本
+ * @param {"error" | "success" | ""} hintType 提示类型
+ */
+function showLoginOverlay(hintText = "", hintType = "") {
+  if (overlay) {
+    overlay.style.display = "flex";
+  }
+  closeAdminEvents();
+  setLoginHint(hintText, hintType);
+  requestAnimationFrame(() => {
+    if (loginUserInput) loginUserInput.focus();
+  });
+}
+
+/**
+ * 统一处理登录态失效。
+ *
+ * @param {string} message 失效提示
+ */
+function handleUnauthorizedSession(message = "登录状态已失效，请重新登录") {
+  clearToken();
+  showLoginOverlay(message, "error");
+}
+
+/**
+ * 登录成功或会话校验通过后，使用同一条初始化链路恢复工作台状态。
+ *
+ * @param {"initial" | "manual" | "auto"} refreshSource 刷新来源
+ * @returns {Promise<void>}
+ */
+async function bootstrapAdminWorkbench(refreshSource = "initial") {
+  if (overlay) {
+    overlay.style.display = "none";
+  }
+  setLoginHint("", "");
+  await connectAdminEvents();
+  await performPageRefresh(getActivePageId() || "page-dashboard", refreshSource);
 }
 async function copyText(text) {
   const value = (text ?? "").toString();
@@ -2170,6 +2275,9 @@ function renderFailureSummary(failures) {
 
 async function fetchWithAuth(requestPath, init = {}) {
   const token = getToken();
+  if (!token) {
+    throw buildAdminRequestError("unauthorized", "登录状态已失效，请重新登录");
+  }
   const headers = {
     ...(init.headers || {}),
     Authorization: `Bearer ${token}`
@@ -2178,24 +2286,14 @@ async function fetchWithAuth(requestPath, init = {}) {
     ...init,
     headers
   });
-  if (res.status === 401) {
-    throw new Error("unauthorized");
-  }
-  const text = await res.text();
-  let parsed = null;
-  try {
-    parsed = text ? JSON.parse(text) : {};
-  } catch {
-    throw new Error(text || `unexpected_response_${res.status}`);
-  }
-  if (!res.ok) {
-    throw new Error(parsed?.msg || `http_${res.status}`);
-  }
-  return parsed;
+  return parseAdminApiResponse(res);
 }
 
 async function postWithAuth(requestPath, payload) {
   const token = getToken();
+  if (!token) {
+    throw buildAdminRequestError("unauthorized", "登录状态已失效，请重新登录");
+  }
   const res = await fetch(requestPath, {
     method: "POST",
     headers: {
@@ -2204,20 +2302,7 @@ async function postWithAuth(requestPath, payload) {
     },
     body: JSON.stringify(payload || {})
   });
-  if (res.status === 401) {
-    throw new Error("unauthorized");
-  }
-  const text = await res.text();
-  let parsed = {};
-  try {
-    parsed = text ? JSON.parse(text) : {};
-  } catch {
-    throw new Error(text || `unexpected_response_${res.status}`);
-  }
-  if (!res.ok) {
-    throw new Error(parsed?.msg || `http_${res.status}`);
-  }
-  return parsed;
+  return parseAdminApiResponse(res);
 }
 
 function escapeHtml(value) {
@@ -2316,13 +2401,11 @@ async function loadUsersPage() {
     renderUsersTable(result.data?.list || []);
     return true;
   } catch (e) {
-    if (e?.message === "unauthorized") {
-      clearToken();
-      overlay.style.display = "flex";
-      closeAdminEvents();
+    if (isUnauthorizedError(e)) {
+      handleUnauthorizedSession(e?.detailMessage);
       return false;
     }
-    showToast("error", "加载用户失败", e?.message || "网络错误");
+    showToast("error", "加载用户失败", e?.detailMessage || e?.message || "网络错误");
     return false;
   }
 }
@@ -2411,19 +2494,17 @@ async function loadRuntimeLogs() {
     }
     return true;
   } catch (e) {
-    if (e?.message === "unauthorized") {
-      clearToken();
-      overlay.style.display = "flex";
-      closeAdminEvents();
+    if (isUnauthorizedError(e)) {
+      handleUnauthorizedSession(e?.detailMessage);
       return false;
     }
     runtimeLogContent.textContent = "日志加载失败";
     if (runtimeLogMeta) runtimeLogMeta.textContent = "日志读取失败，请检查接口与服务端文件路径。";
     if (runtimeLogCallout) {
       runtimeLogCallout.className = "info-callout danger";
-      runtimeLogCallout.textContent = `日志加载失败：${e?.message || "网络错误"}`;
+      runtimeLogCallout.textContent = `日志加载失败：${e?.detailMessage || e?.message || "网络错误"}`;
     }
-    showToast("error", "加载日志失败", e?.message || "网络错误");
+    showToast("error", "加载日志失败", e?.detailMessage || e?.message || "网络错误");
     return false;
   }
 }
@@ -2763,13 +2844,11 @@ async function loadScriptsPage() {
     renderScriptsTable(list);
     return true;
   } catch (e) {
-    if (e?.message === "unauthorized") {
-      clearToken();
-      overlay.style.display = "flex";
-      closeAdminEvents();
+    if (isUnauthorizedError(e)) {
+      handleUnauthorizedSession(e?.detailMessage);
       return false;
     }
-    showToast("error", "加载脚本列表失败", e?.message || "网络错误");
+    showToast("error", "加载脚本列表失败", e?.detailMessage || e?.message || "网络错误");
     return false;
   }
 }
@@ -4269,22 +4348,32 @@ async function performPageRefresh(pageId, source = "manual") {
     detail: source === "auto" ? "后台静默刷新中" : "正在读取最新数据"
   });
   let ok = false;
-  if (targetPageId === "page-scripts") {
-    ok = await loadScriptsPage();
-  } else if (targetPageId === "page-repair-issues") {
-    ok = await loadRepairIssuesPage({ silent: source === "auto", preserveSelection: true });
-    if (ok && activeRepairIssueId) {
-      await loadRepairIssueDetail(activeRepairIssueId);
+  try {
+    if (targetPageId === "page-scripts") {
+      ok = await loadScriptsPage();
+    } else if (targetPageId === "page-repair-issues") {
+      ok = await loadRepairIssuesPage({ silent: source === "auto", preserveSelection: true });
+      if (ok && activeRepairIssueId) {
+        await loadRepairIssueDetail(activeRepairIssueId);
+      }
+    } else if (targetPageId === "page-users") {
+      ok = await loadUsersPage();
+    } else if (targetPageId === "page-runtime-logs") {
+      ok = await loadRuntimeLogs();
+    } else if (targetPageId === "page-config") {
+      await loadConfig();
+      ok = true;
+    } else {
+      ok = await refreshData();
     }
-  } else if (targetPageId === "page-users") {
-    ok = await loadUsersPage();
-  } else if (targetPageId === "page-runtime-logs") {
-    ok = await loadRuntimeLogs();
-  } else if (targetPageId === "page-config") {
-    await loadConfig();
-    ok = true;
-  } else {
-    ok = await refreshData();
+  } catch (error) {
+    if (isUnauthorizedError(error)) {
+      handleUnauthorizedSession(error?.detailMessage);
+      ok = false;
+    } else {
+      ok = false;
+      showToast("error", "刷新失败", error?.detailMessage || error?.message || "网络错误");
+    }
   }
   updatePageRefreshStatus({
     pageId: targetPageId,
@@ -4296,17 +4385,23 @@ async function performPageRefresh(pageId, source = "manual") {
 }
 
 async function checkSession() {
+  const token = getToken();
+  if (!token) {
+    showLoginOverlay("", "");
+    return;
+  }
   try {
-    await fetchWithAuth("/api/v1/admin/session");
-    overlay.style.display = "none";
-    await connectAdminEvents();
-    await performPageRefresh("page-dashboard", "initial");
-  } catch {
-    overlay.style.display = "flex";
-    closeAdminEvents();
-    requestAnimationFrame(() => {
-      if (loginUserInput) loginUserInput.focus();
-    });
+    const result = await fetchWithAuth("/api/v1/admin/session");
+    if (result?.data?.authenticated !== true) {
+      throw buildAdminRequestError("unauthorized", "登录状态已失效，请重新登录");
+    }
+    await bootstrapAdminWorkbench("initial");
+  } catch (error) {
+    if (isUnauthorizedError(error)) {
+      handleUnauthorizedSession(error?.detailMessage);
+      return;
+    }
+    showLoginOverlay("会话校验失败，请稍后重试", "error");
   }
 }
 
@@ -4667,13 +4762,11 @@ if (userTableBody) {
         });
       }
     } catch (err) {
-      if (err?.message === "unauthorized") {
-        clearToken();
-        overlay.style.display = "flex";
-        closeAdminEvents();
+      if (isUnauthorizedError(err)) {
+        handleUnauthorizedSession(err?.detailMessage);
         return;
       }
-      showToast("error", "操作失败", err?.message || "网络错误");
+      showToast("error", "操作失败", err?.detailMessage || err?.message || "网络错误");
     }
   });
 }
@@ -4718,10 +4811,13 @@ if (runtimeLogSource) {
 logoutBtn.addEventListener("click", async () => {
   try {
     await postWithAuth("/api/v1/admin/logout", {});
-  } catch {}
+  } catch (error) {
+    if (!isUnauthorizedError(error)) {
+      showToast("warning", "退出登录提醒", error?.detailMessage || error?.message || "服务端未确认退出，但本地会话已清除");
+    }
+  }
   clearToken();
-  closeAdminEvents();
-  overlay.style.display = "flex";
+  showLoginOverlay("已退出登录", "success");
 });
 
 renderRepairStageFilterOptions();

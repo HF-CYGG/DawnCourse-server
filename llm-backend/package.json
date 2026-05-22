@@ -6,7 +6,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node dist/main.js",
-    "dev": "node --enable-source-maps dist/main.js"
+    "dev": "node --enable-source-maps dist/main.js",
+    "test": "npm run build && node --test test/*.test.mjs"
   },
   "dependencies": {
     "@fastify/cors": "^9.0.1",

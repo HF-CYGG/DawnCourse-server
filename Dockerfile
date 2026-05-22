@@ -29,4 +29,6 @@ RUN chmod +x /app/start.sh && mkdir -p /shared/parsers /data /run/redis /run/pos
 VOLUME ["/shared/parsers", "/data"]
 EXPOSE 80
 EXPOSE 15000
+# 单容器镜像与 docker-compose 共用同一健康检查口径，确认 nginx 与后端链路都可用。
+HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=5 CMD wget -q -O - http://127.0.0.1/health >/dev/null 2>&1 || exit 1
 CMD ["/app/start.sh"]

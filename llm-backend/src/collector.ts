@@ -282,12 +282,20 @@ export async function ingestParseReport(body: ParseReportInput, source: string):
       );
     }
 
+    const sessionIssue = await client.query<{ issue_id: string | null }>(
+      "SELECT issue_id FROM parse_sessions WHERE parse_session_id = $1 FOR UPDATE",
+      [parseSessionId]
+    );
     const existing = await client.query<{ issue_id: string; sample_count: number; user_count: number }>(
       "SELECT issue_id, sample_count, user_count FROM repair_issues WHERE issue_key = $1 FOR UPDATE",
       [resolution.issueKey]
     );
-    if (existing.rows[0]) {
-      issueId = existing.rows[0].issue_id;
+    const reused = resolveIssueReuse({
+      sessionIssueId: String(sessionIssue.rows[0]?.issue_id || ""),
+      issueKeyIssueId: String(existing.rows[0]?.issue_id || "")
+    });
+    if (reused) {
+      issueId = reused.issueId;
       await client.query(
         `UPDATE repair_issues
          SET sample_count = sample_count + 1, user_count = GREATEST(user_count, 1),
@@ -322,6 +330,7 @@ export async function ingestParseReport(body: ParseReportInput, source: string):
         ]
       );
     }
+    await client.query("UPDATE parse_sessions SET issue_id = $2, updated_at = now() WHERE parse_session_id = $1", [parseSessionId, issueId]);
 
     if (body.sanitizedSample?.hasUserConsent && content) {
       sampleId = id("sample");
@@ -383,6 +392,24 @@ export async function triggerRepairIfReady(
   }
   await addIssueEventFn({ issueId: input.issueId, stage: "SAMPLE_READY", level: "info", message: `样本已保存，等待达到最小样本数 ${runtime.minQueueSize}` });
   return false;
+}
+
+/**
+ * Issue 归并决策：
+ * - 同一个 parseSession 已经归并过 issue 时，后续上报必须优先复用，避免单次提交裂单；
+ * - 若当前会话还没有 issue，再退回 issue_key 归并；
+ * - 两者都没有时，由上层创建新 issue。
+ */
+export function resolveIssueReuse(input: { sessionIssueId: string; issueKeyIssueId: string }): { issueId: string; reason: "parse_session" | "issue_key" } | null {
+  const sessionIssueId = input.sessionIssueId.trim();
+  if (sessionIssueId) {
+    return { issueId: sessionIssueId, reason: "parse_session" };
+  }
+  const issueKeyIssueId = input.issueKeyIssueId.trim();
+  if (issueKeyIssueId) {
+    return { issueId: issueKeyIssueId, reason: "issue_key" };
+  }
+  return null;
 }
 
 function normalizeAttemptList(value: unknown): string[] {

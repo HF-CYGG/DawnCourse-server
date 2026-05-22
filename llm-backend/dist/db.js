@@ -29,6 +29,10 @@ export async function withTx(fn) {
     }
 }
 export async function migrate() {
+    await query(`CREATE TABLE IF NOT EXISTS schema_migrations (
+      version TEXT PRIMARY KEY,
+      applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`);
     const files = fs
         .readdirSync(config.migrationsDir)
         .filter((file) => file.endsWith(".sql"))

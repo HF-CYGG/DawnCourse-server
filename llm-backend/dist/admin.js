@@ -4,20 +4,154 @@ import { query } from "./db.js";
 import { addIssueEvent, setIssueStage } from "./events.js";
 import { chatCompletionsUrl, runReplayOnly, startRepairJob } from "./repair.js";
 import { getAdminConfigPayload } from "./runtimeConfig.js";
-import { limitString, id } from "./utils.js";
+import { log } from "./log.js";
+import { limitString, id, sha256 } from "./utils.js";
+const eventStreamTokens = new Map();
 export async function registerAdminRoutes(app) {
+    await ensureBuiltinAdminUser();
     app.post("/api/v1/admin/login", async (request) => {
         const body = (request.body || {});
-        if (body.username !== config.adminUsername || body.password !== config.adminPassword) {
+        const username = String(body.username || "").trim();
+        const password = String(body.password || "");
+        const target = await findAdminUser(username);
+        if (!target || hashAdminPassword(password, target.passwordSalt) !== target.passwordHash) {
             return { code: 401, msg: "invalid credentials", data: null };
         }
         const token = id("adm");
         const expiresAt = new Date(Date.now() + config.adminSessionTtlMs);
-        await query("INSERT INTO admin_sessions(token, username, expires_at) VALUES ($1,$2,$3)", [token, body.username, expiresAt]);
-        return apiOk({ token, username: body.username, expiresAt: expiresAt.getTime() });
+        await query("INSERT INTO admin_sessions(token, username, expires_at) VALUES ($1,$2,$3)", [token, username, expiresAt]);
+        await touchAdminUserLogin(username);
+        return apiOk({ token, username, expiresAt: expiresAt.getTime() });
     });
-    app.get("/api/v1/admin/session", { preHandler: authOptional }, async (request) => {
-        return apiOk({ authenticated: Boolean(request.adminUser), username: request.adminUser || "" });
+    app.get("/api/v1/admin/session", { preHandler: authRequired }, async (request) => {
+        return apiOk({ authenticated: true, username: request.adminUser || "" });
+    });
+    app.route({
+        method: ["GET", "POST"],
+        url: "/api/v1/admin/logout",
+        preHandler: authRequired,
+        handler: async (request) => {
+            const token = getBearer(request);
+            if (token)
+                await query("DELETE FROM admin_sessions WHERE token = $1", [token]);
+            return apiOk({ loggedOut: true });
+        }
+    });
+    app.get("/api/v1/admin/users", { preHandler: authRequired }, async () => {
+        await ensureBuiltinAdminUser();
+        return apiOk({ list: await listAdminUsers() });
+    });
+    app.post("/api/v1/admin/users", { preHandler: authRequired }, async (request) => {
+        const body = (request.body || {});
+        const username = String(body.username || "").trim();
+        const password = String(body.password || "");
+        const result = await createAdminUser(username, password);
+        if (!result.ok) {
+            return { code: result.code, msg: result.msg, data: null };
+        }
+        await query("INSERT INTO audit_logs(actor, action, target_type, target_id, detail_json) VALUES ($1,$2,$3,$4,$5::jsonb)", [
+            request.adminUser || "admin",
+            "create_admin_user",
+            "admin_user",
+            username,
+            JSON.stringify({ username })
+        ]);
+        return apiOk({ created: true, username });
+    });
+    app.post("/api/v1/admin/users/rename", { preHandler: authRequired }, async (request) => {
+        const body = (request.body || {});
+        const oldUsername = String(body.oldUsername || "").trim();
+        const newUsername = String(body.newUsername || "").trim();
+        const result = await renameAdminUser(oldUsername, newUsername);
+        if (!result.ok) {
+            return { code: result.code, msg: result.msg, data: null };
+        }
+        await query("INSERT INTO audit_logs(actor, action, target_type, target_id, detail_json) VALUES ($1,$2,$3,$4,$5::jsonb)", [
+            request.adminUser || "admin",
+            "rename_admin_user",
+            "admin_user",
+            oldUsername,
+            JSON.stringify({ oldUsername, newUsername })
+        ]);
+        return apiOk({ renamed: true, oldUsername, newUsername });
+    });
+    app.post("/api/v1/admin/users/password", { preHandler: authRequired }, async (request) => {
+        const body = (request.body || {});
+        const username = String(body.username || "").trim();
+        const newPassword = String(body.newPassword || "").trim();
+        const result = await updateAdminUserPassword(username, newPassword);
+        if (!result.ok) {
+            return { code: result.code, msg: result.msg, data: null };
+        }
+        await query("INSERT INTO audit_logs(actor, action, target_type, target_id, detail_json) VALUES ($1,$2,$3,$4,$5::jsonb)", [
+            request.adminUser || "admin",
+            "reset_admin_user_password",
+            "admin_user",
+            username,
+            JSON.stringify({ username })
+        ]);
+        return apiOk({ updated: true, username });
+    });
+    app.post("/api/v1/admin/users/delete", { preHandler: authRequired }, async (request) => {
+        const body = (request.body || {});
+        const username = String(body.username || "").trim();
+        const actor = request.adminUser || "admin";
+        const result = await deleteAdminUser(username, actor);
+        if (!result.ok) {
+            return { code: result.code, msg: result.msg, data: null };
+        }
+        await query("INSERT INTO audit_logs(actor, action, target_type, target_id, detail_json) VALUES ($1,$2,$3,$4,$5::jsonb)", [
+            actor,
+            "delete_admin_user",
+            "admin_user",
+            username,
+            JSON.stringify({ username })
+        ]);
+        return apiOk({ deleted: true, username });
+    });
+    app.post("/api/v1/admin/events/token", { preHandler: authRequired }, async (request) => {
+        const token = id("evt");
+        const expiresAt = Date.now() + 5 * 60 * 1000;
+        eventStreamTokens.set(token, { username: request.adminUser || "admin", expiresAt });
+        cleanupEventStreamTokens();
+        return apiOk({ token, expiresAt });
+    });
+    app.get("/api/v1/admin/events", async (request, reply) => {
+        const q = request.query;
+        const streamToken = q.streamToken || q.token || "";
+        const stream = eventStreamTokens.get(streamToken);
+        if (!stream || stream.expiresAt <= Date.now()) {
+            eventStreamTokens.delete(streamToken);
+            return reply.code(401).send({ code: 401, msg: "unauthorized", data: null });
+        }
+        reply.hijack();
+        const res = reply.raw;
+        res.writeHead(200, {
+            "Content-Type": "text/event-stream; charset=utf-8",
+            "Cache-Control": "no-cache, no-transform",
+            Connection: "keep-alive",
+            "X-Accel-Buffering": "no"
+        });
+        res.write(`event: hello\ndata: ${JSON.stringify({ ok: true, username: stream.username, ts: Date.now() })}\n\n`);
+        const timer = setInterval(() => {
+            if (res.destroyed) {
+                clearInterval(timer);
+                return;
+            }
+            res.write(`event: ping\ndata: ${JSON.stringify({ ts: Date.now() })}\n\n`);
+        }, 25000);
+        request.raw.on("close", () => {
+            clearInterval(timer);
+        });
+    });
+    app.post("/api/v1/admin/client_error", { preHandler: authRequired }, async (request) => {
+        const body = (request.body || {});
+        log.warn("admin client error", {
+            actor: request.adminUser || "admin",
+            message: limitString(String(body.message || ""), 300),
+            stack: limitString(String(body.stack || ""), 1000)
+        });
+        return apiOk({ accepted: true });
     });
     app.get("/api/v1/admin/data", { preHandler: authRequired }, async () => {
         const stats = await loadAdminStats();
@@ -201,6 +335,125 @@ export async function registerAdminRoutes(app) {
         return apiOk({ source: q.source || "backend", list: text ? text.split(/\r?\n/).filter(Boolean) : [], text });
     });
 }
+function hashAdminPassword(password, salt) {
+    return sha256(`${salt}:${password}`);
+}
+async function ensureBuiltinAdminUser() {
+    const username = config.adminUsername.trim();
+    if (!username)
+        return;
+    const existing = await findAdminUser(username);
+    if (existing)
+        return;
+    const salt = id("salt");
+    await query(`INSERT INTO admin_users(username, password_hash, password_salt, is_builtin)
+     VALUES ($1,$2,$3,true)
+     ON CONFLICT (username) DO NOTHING`, [username, hashAdminPassword(config.adminPassword, salt), salt]);
+}
+async function findAdminUser(username) {
+    const normalized = username.trim();
+    if (!normalized)
+        return null;
+    const result = await query("SELECT username, password_hash, password_salt, is_builtin, created_at, updated_at, last_login_at FROM admin_users WHERE username = $1", [normalized]);
+    const row = result.rows[0];
+    if (!row)
+        return null;
+    return {
+        username: row.username,
+        passwordHash: row.password_hash,
+        passwordSalt: row.password_salt,
+        isBuiltin: Boolean(row.is_builtin)
+    };
+}
+async function touchAdminUserLogin(username) {
+    const normalized = username.trim();
+    if (!normalized)
+        return;
+    await query("UPDATE admin_users SET last_login_at = now(), updated_at = now() WHERE username = $1", [normalized]);
+}
+async function listAdminUsers() {
+    await ensureBuiltinAdminUser();
+    const result = await query(`SELECT username, password_hash, password_salt, is_builtin, created_at, updated_at, last_login_at
+     FROM admin_users
+     ORDER BY is_builtin DESC, created_at ASC`);
+    return result.rows.map((row) => ({
+        username: row.username,
+        isBuiltin: Boolean(row.is_builtin),
+        createdAt: row.created_at ? new Date(String(row.created_at)).getTime() : 0,
+        updatedAt: row.updated_at ? new Date(String(row.updated_at)).getTime() : 0,
+        lastLoginAt: row.last_login_at ? new Date(String(row.last_login_at)).getTime() : 0
+    }));
+}
+async function createAdminUser(username, password) {
+    const normalized = username.trim();
+    if (!normalized)
+        return { ok: false, code: 400, msg: "账号不能为空" };
+    if (!/^[a-zA-Z0-9_.-]{3,32}$/.test(normalized)) {
+        return { ok: false, code: 400, msg: "账号仅支持 3-32 位字母、数字、下划线、点和横杠" };
+    }
+    if (password.trim().length < 4) {
+        return { ok: false, code: 400, msg: "密码至少 4 位" };
+    }
+    const existing = await findAdminUser(normalized);
+    if (existing)
+        return { ok: false, code: 409, msg: "账号已存在" };
+    const salt = id("salt");
+    await query(`INSERT INTO admin_users(username, password_hash, password_salt, is_builtin, created_at, updated_at)
+     VALUES ($1,$2,$3,false,now(),now())`, [normalized, hashAdminPassword(password, salt), salt]);
+    return { ok: true, code: 200, msg: "ok" };
+}
+async function renameAdminUser(oldUsername, newUsername) {
+    const oldName = oldUsername.trim();
+    const nextName = newUsername.trim();
+    if (!oldName || !nextName)
+        return { ok: false, code: 400, msg: "账号不能为空" };
+    if (!/^[a-zA-Z0-9_.-]{3,32}$/.test(nextName)) {
+        return { ok: false, code: 400, msg: "新账号仅支持 3-32 位字母、数字、下划线、点和横杠" };
+    }
+    const target = await findAdminUser(oldName);
+    if (!target)
+        return { ok: false, code: 404, msg: "账号不存在" };
+    if (target.isBuiltin)
+        return { ok: false, code: 400, msg: "内置管理员账号不允许改名" };
+    const duplicate = await findAdminUser(nextName);
+    if (duplicate)
+        return { ok: false, code: 409, msg: "新账号已存在" };
+    await query("UPDATE admin_users SET username = $2, updated_at = now() WHERE username = $1", [oldName, nextName]);
+    await query("UPDATE admin_sessions SET username = $2 WHERE username = $1", [oldName, nextName]);
+    return { ok: true, code: 200, msg: "ok" };
+}
+async function updateAdminUserPassword(username, newPassword) {
+    const normalized = username.trim();
+    if (!normalized)
+        return { ok: false, code: 400, msg: "账号不能为空" };
+    if (newPassword.trim().length < 4)
+        return { ok: false, code: 400, msg: "密码至少 4 位" };
+    const target = await findAdminUser(normalized);
+    if (!target)
+        return { ok: false, code: 404, msg: "账号不存在" };
+    const salt = id("salt");
+    await query("UPDATE admin_users SET password_hash = $2, password_salt = $3, updated_at = now() WHERE username = $1", [
+        normalized,
+        hashAdminPassword(newPassword, salt),
+        salt
+    ]);
+    return { ok: true, code: 200, msg: "ok" };
+}
+async function deleteAdminUser(username, actor) {
+    const normalized = username.trim();
+    if (!normalized)
+        return { ok: false, code: 400, msg: "账号不能为空" };
+    if (normalized === actor.trim())
+        return { ok: false, code: 400, msg: "不允许删除当前登录账号" };
+    const target = await findAdminUser(normalized);
+    if (!target)
+        return { ok: false, code: 404, msg: "账号不存在" };
+    if (target.isBuiltin)
+        return { ok: false, code: 400, msg: "内置管理员账号不允许删除" };
+    await query("DELETE FROM admin_sessions WHERE username = $1", [normalized]);
+    await query("DELETE FROM admin_users WHERE username = $1", [normalized]);
+    return { ok: true, code: 200, msg: "ok" };
+}
 async function authOptional(request) {
     const token = getBearer(request);
     if (!token)
@@ -218,6 +471,13 @@ async function authRequired(request, reply) {
 function getBearer(request) {
     const header = request.headers.authorization || "";
     return header.startsWith("Bearer ") ? header.slice(7) : "";
+}
+function cleanupEventStreamTokens() {
+    const now = Date.now();
+    for (const [token, info] of eventStreamTokens.entries()) {
+        if (info.expiresAt <= now)
+            eventStreamTokens.delete(token);
+    }
 }
 async function loadAdminStats() {
     const issues = await query("SELECT count(*)::int AS count FROM repair_issues");

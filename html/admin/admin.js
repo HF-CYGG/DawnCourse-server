@@ -3318,12 +3318,16 @@ function collectRepairModelSnapshots(issue, timelineItems, logItems) {
   const currentStage = (issue?.currentStage || "").toString();
   const summaryEntry = getLatestRepairEntry(combined, (item) => item?.meta?.modelRole === "summary");
   const scriptEntry = getLatestRepairEntry(combined, (item) => item?.meta?.modelRole === "script_repair");
-  const verifyEntry = getLatestRepairEntry(
+  const rawVerifyEntry = getLatestRepairEntry(
     combined,
     (item) =>
       ["replay_candidate_script", "replay_candidate_script_single"].includes((item?.meta?.action || "").toString()) ||
       ((item?.stage || "").toString() === "CANDIDATE_TEST_RESULT" && /回放/.test((item?.message || "").toString()))
   );
+  const verifyEntry =
+    rawVerifyEntry && scriptEntry && Number(rawVerifyEntry?.ts || 0) < Number(scriptEntry?.ts || 0)
+      ? null
+      : rawVerifyEntry;
   const releaseEntry = getLatestRepairEntry(
     combined,
     (item) => ["PENDING_RELEASE", "PUBLISHED", "ROLLED_BACK", "DISABLED"].includes((item?.stage || "").toString())

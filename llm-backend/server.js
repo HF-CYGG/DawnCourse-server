@@ -1968,6 +1968,7 @@ async function recordParseTaskFailureIssue({
       pageFingerprint,
       schoolId: storedSession.schoolId,
       schoolSystemType: storedSession.schoolSystemType,
+      sourceUrl,
       sourceUrlHost,
       createdAt: Date.now()
     });
@@ -2549,7 +2550,13 @@ async function retryRepairIssue(issueId, username) {
     await enqueueSchoolSubmission(schoolId, sanitizeContent(sample.content || ""), scriptName, {
       schoolName: detail.issue.schoolName || "",
       schoolSystemType: detail.issue.schoolSystemType || "unknown",
-      sourceUrl: detail.issue.sourceUrlHost || "",
+      sourceUrl:
+        (sample?.sourceUrl || "").toString() ||
+        (sample?.pageFingerprint?.host && sample?.pageFingerprint?.pathPattern
+          ? `${sample.pageFingerprint.host}${sample.pageFingerprint.pathPattern}`
+          : "") ||
+        detail.issue.sourceUrlHost ||
+        "",
       failureType: detail.issue.failureType || "unknown",
       clientVersion: "",
       parseSessionId: sample.parseSessionId || "",
@@ -2572,7 +2579,13 @@ function buildIssueRepairItems(detail, samples) {
     hash: (sample?.contentSha256 || sample?.sampleId || hashText(sample?.content || "")).toString(),
     schoolName: issue.schoolName || "",
     schoolSystemType: issue.schoolSystemType || "unknown",
-    sourceUrl: issue.sourceUrlHost || "",
+    sourceUrl:
+      (sample?.sourceUrl || "").toString() ||
+      (sample?.pageFingerprint?.host && sample?.pageFingerprint?.pathPattern
+        ? `${sample.pageFingerprint.host}${sample.pageFingerprint.pathPattern}`
+        : "") ||
+      issue.sourceUrlHost ||
+      "",
     scriptVersion: Number(issue.affectedVersion || 0),
     scriptSource: "",
     failureType: issue.failureType || "unknown",
@@ -3031,11 +3044,103 @@ async function processSchoolQueue(schoolId) {
  * - 修复指令生成（模型 1）：将总结转化为具体的脚本修复动作要点。
  * - 脚本修复（模型 2）：高成本模型基于原脚本和修复指令生成新脚本。
  */
+function buildReplaySampleEligibility(samples) {
+  const list = (Array.isArray(samples) ? samples : []).filter(
+    (item) => item && typeof item.content === "string" && item.content.trim().length > 0
+  );
+  if (!list.length) {
+    return { ok: false, reason: "提交回放样本为空", sampleCount: 0, eligibleCount: 0 };
+  }
+  let eligibleCount = 0;
+  let timetableSignalCount = 0;
+  const blockers = {};
+  for (const sample of list) {
+    const failureType = normalizeSubmissionFailureType(sample.classifiedFailureType || sample.failureType || "");
+    const fingerprint = sample.pageFingerprint && typeof sample.pageFingerprint === "object" ? sample.pageFingerprint : {};
+    const sourceUrl = [
+      sample.sourceUrl,
+      sample.sourceUrlHost,
+      fingerprint.host && fingerprint.pathPattern ? `${fingerprint.host}${fingerprint.pathPattern}` : "",
+      fingerprint.pathPattern
+    ]
+      .filter(Boolean)
+      .join("\n");
+    const content = sample.content || "";
+    const signals = detectSubmissionSignals(content, sourceUrl);
+    const strongTimetableSignal =
+      signals.timetableLike ||
+      /(?:xskbcx|xsxkbcx|xskb|kbcx|kbtable|kbList|courseTable|timetable|schedule)/i.test(`${content}\n${sourceUrl}`);
+    if (strongTimetableSignal) {
+      timetableSignalCount += 1;
+    }
+    const nonParserState =
+      failureType === "login_required" ||
+      failureType === "captcha_required" ||
+      failureType === "non_timetable" ||
+      failureType === "unsupported_format" ||
+      failureType === "extractor_empty";
+    if (nonParserState && !strongTimetableSignal) {
+      blockers[failureType || "non_timetable"] = (blockers[failureType || "non_timetable"] || 0) + 1;
+      continue;
+    }
+    if (strongTimetableSignal) {
+      eligibleCount += 1;
+    }
+  }
+  if (eligibleCount <= 0) {
+    const blockerNames = Object.keys(blockers);
+    return {
+      ok: false,
+      reason: blockerNames.length
+        ? `样本不是可回放课表页：${blockerNames.join(", ")}`
+        : "样本缺少课表特征，不能用于课表 parser 自动修复",
+      sampleCount: list.length,
+      eligibleCount,
+      timetableSignalCount,
+      blockers
+    };
+  }
+  return {
+    ok: true,
+    reason: "",
+    sampleCount: list.length,
+    eligibleCount,
+    timetableSignalCount,
+    blockers
+  };
+}
+
+async function stopParserRepairForIneligibleSamples(schoolId, issueIds, eligibility, source) {
+  await setSchoolPhase(schoolId, "FAILED_RETRYING");
+  await appendRepairIssueTraceBatch(issueIds, {
+    stage: "CANDIDATE_TEST_RESULT",
+    level: "error",
+    message: `${eligibility.reason || "样本不能用于课表 parser 自动修复"}；已停止本轮自动修复`,
+    source: source || "queue_processor",
+    meta: {
+      schoolId,
+      ok: false,
+      failureType: "non_replayable_sample",
+      sampleCount: Number(eligibility.sampleCount || 0),
+      eligibleCount: Number(eligibility.eligibleCount || 0),
+      timetableSignalCount: Number(eligibility.timetableSignalCount || 0),
+      blockers: eligibility.blockers || {},
+      manualSuggestion:
+        "请采集实际课表页面样本后再修复课表 parser；如果失败点是学年学期选项或导航入口，请优先修复自动同步 extractor/nav 脚本。"
+    }
+  });
+}
+
 async function processQueueCluster(schoolId, items, normalizedIssues, state, now, issueIds = []) {
   await setSchoolPhase(schoolId, "MERGING");
   if (shouldDegradeHighCost()) {
     await setSchoolPhase(schoolId, "WAITING_WINDOW");
     return { state, applied: false, deferred: true };
+  }
+  const replayEligibility = buildReplaySampleEligibility(items);
+  if (!replayEligibility.ok) {
+    await stopParserRepairForIneligibleSamples(schoolId, issueIds, replayEligibility, "queue_processor");
+    return { state, applied: false, failed: true, manualInterventionRequired: true };
   }
   const hasConflict = detectConflict(normalizedIssues);
   if (hasConflict) {
@@ -3426,6 +3531,11 @@ async function processQueueCluster(schoolId, items, normalizedIssues, state, now
  * 当无法聚类或存在严重冲突时，放弃汇总，直接针对单条用户的错误进行针对性修复
  */
 async function processIndividualSummaries(schoolId, queue, issueIds = []) {
+  const replayEligibility = buildReplaySampleEligibility(queue);
+  if (!replayEligibility.ok) {
+    await stopParserRepairForIneligibleSamples(schoolId, issueIds, replayEligibility, "queue_processor");
+    return { applied: false, failed: true, manualInterventionRequired: true };
+  }
   const summaries = [];
   let lastSummaryFailure = null;
   let totalOriginalChars = 0;
@@ -5851,6 +5961,7 @@ async function loadArchivedFailureSamplesForIssue(issueId, issue, parseSessionId
         pageFingerprint: body?.pageFingerprint || body?.page_fingerprint || null,
         schoolId: (issue?.schoolId || "").toString(),
         schoolSystemType: (issue?.schoolSystemType || "").toString(),
+        sourceUrl: (record?.body?.sourceUrl || record?.body?.source_url || issue?.sourceUrl || "").toString(),
         sourceUrlHost: (issue?.sourceUrlHost || "").toString(),
         createdAt: Number(record?.receivedAt || 0) || now,
         contentPreview: content.slice(0, 4000),
@@ -5906,6 +6017,7 @@ async function loadArchivedSubmissionSamplesForIssue(issueId, issue, limit = 20)
         pageFingerprint: data?.pageFingerprint || null,
         schoolId: (issue?.schoolId || "").toString(),
         schoolSystemType: (issue?.schoolSystemType || "").toString(),
+        sourceUrl: (data?.sourceUrl || issue?.sourceUrl || "").toString(),
         sourceUrlHost: (issue?.sourceUrlHost || "").toString(),
         createdAt: Number(data?.receivedAt || 0) || now,
         contentPreview: content.slice(0, 4000),
@@ -8552,7 +8664,10 @@ function detectSubmissionSignals(content, sourceUrl) {
 
 function classifyFailureByRule({ content, sourceUrl, failureTypeInput, attemptedParsers }) {
   const normalizedInput = normalizeSubmissionFailureType(failureTypeInput);
-  if (normalizedInput) {
+  const signals = detectSubmissionSignals(content, sourceUrl);
+  const inputCanBeCorrectedByPageState =
+    !normalizedInput || normalizedInput === "unknown" || normalizedInput === "parser_empty" || normalizedInput === "parser_crash";
+  if (normalizedInput && !inputCanBeCorrectedByPageState) {
     return {
       failureType: normalizedInput,
       failureCategory: mapFailureCategory(normalizedInput),
@@ -8560,7 +8675,6 @@ function classifyFailureByRule({ content, sourceUrl, failureTypeInput, attempted
       confident: normalizedInput !== "unknown"
     };
   }
-  const signals = detectSubmissionSignals(content, sourceUrl);
   const trimmed = (content || "").toString().trim();
   if (!trimmed) {
     return {
@@ -8576,6 +8690,14 @@ function classifyFailureByRule({ content, sourceUrl, failureTypeInput, attempted
       failureCategory: mapFailureCategory("extractor_empty"),
       failureSource: "rule",
       confident: true
+    };
+  }
+  if (normalizedInput && signals.timetableLike) {
+    return {
+      failureType: normalizedInput,
+      failureCategory: mapFailureCategory(normalizedInput),
+      failureSource: "client",
+      confident: normalizedInput !== "unknown"
     };
   }
   if (signals.captchaLike) {

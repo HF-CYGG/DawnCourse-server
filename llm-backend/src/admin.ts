@@ -9,6 +9,7 @@ import { log } from "./log.js";
 import { limitString, id } from "./utils.js";
 
 type AdminRequest = FastifyRequest & { adminUser?: string };
+const eventStreamTokens = new Map<string, { username: string; expiresAt: number }>();
 
 export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
   app.post("/api/v1/admin/login", async (request) => {
@@ -24,6 +25,60 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
 
   app.get("/api/v1/admin/session", { preHandler: authOptional }, async (request: AdminRequest) => {
     return apiOk({ authenticated: Boolean(request.adminUser), username: request.adminUser || "" });
+  });
+
+  app.post("/api/v1/admin/logout", { preHandler: authRequired }, async (request: AdminRequest) => {
+    const token = getBearer(request);
+    if (token) await query("DELETE FROM admin_sessions WHERE token = $1", [token]);
+    return apiOk({ loggedOut: true });
+  });
+
+  app.post("/api/v1/admin/events/token", { preHandler: authRequired }, async (request: AdminRequest) => {
+    const token = id("evt");
+    const expiresAt = Date.now() + 5 * 60 * 1000;
+    eventStreamTokens.set(token, { username: request.adminUser || "admin", expiresAt });
+    cleanupEventStreamTokens();
+    return apiOk({ token, expiresAt });
+  });
+
+  app.get("/api/v1/admin/events", async (request, reply) => {
+    const q = request.query as Record<string, string | undefined>;
+    const streamToken = q.streamToken || q.token || "";
+    const stream = eventStreamTokens.get(streamToken);
+    if (!stream || stream.expiresAt <= Date.now()) {
+      eventStreamTokens.delete(streamToken);
+      return reply.code(401).send({ code: 401, msg: "unauthorized", data: null });
+    }
+
+    reply.hijack();
+    const res = reply.raw;
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no"
+    });
+    res.write(`event: hello\ndata: ${JSON.stringify({ ok: true, username: stream.username, ts: Date.now() })}\n\n`);
+    const timer = setInterval(() => {
+      if (res.destroyed) {
+        clearInterval(timer);
+        return;
+      }
+      res.write(`event: ping\ndata: ${JSON.stringify({ ts: Date.now() })}\n\n`);
+    }, 25000);
+    request.raw.on("close", () => {
+      clearInterval(timer);
+    });
+  });
+
+  app.post("/api/v1/admin/client_error", { preHandler: authRequired }, async (request: AdminRequest) => {
+    const body = (request.body || {}) as Record<string, unknown>;
+    log.warn("admin client error", {
+      actor: request.adminUser || "admin",
+      message: limitString(String(body.message || ""), 300),
+      stack: limitString(String(body.stack || ""), 1000)
+    });
+    return apiOk({ accepted: true });
   });
 
   app.get("/api/v1/admin/data", { preHandler: authRequired }, async () => {
@@ -256,6 +311,13 @@ async function authRequired(request: AdminRequest, reply: FastifyReply): Promise
 function getBearer(request: FastifyRequest): string {
   const header = request.headers.authorization || "";
   return header.startsWith("Bearer ") ? header.slice(7) : "";
+}
+
+function cleanupEventStreamTokens(): void {
+  const now = Date.now();
+  for (const [token, info] of eventStreamTokens.entries()) {
+    if (info.expiresAt <= now) eventStreamTokens.delete(token);
+  }
 }
 
 async function loadAdminStats(): Promise<Record<string, unknown>> {

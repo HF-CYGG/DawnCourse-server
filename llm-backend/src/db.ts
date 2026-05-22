@@ -33,6 +33,12 @@ export async function withTx<T>(fn: (client: pg.PoolClient) => Promise<T>): Prom
 }
 
 export async function migrate(): Promise<void> {
+  await query(
+    `CREATE TABLE IF NOT EXISTS schema_migrations (
+      version TEXT PRIMARY KEY,
+      applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`
+  );
   const files = fs
     .readdirSync(config.migrationsDir)
     .filter((file) => file.endsWith(".sql"))

@@ -9,7 +9,7 @@ RUN npm run build && npm prune --omit=dev
 
 FROM nginx:alpine
 ARG NPM_REGISTRY=https://registry.npmjs.org/
-RUN apk add --no-cache nodejs npm redis
+RUN apk add --no-cache nodejs npm redis postgresql postgresql-client
 WORKDIR /app
 
 COPY ./html /usr/share/nginx/html
@@ -25,7 +25,7 @@ COPY ./script-runner/package.json /app/script-runner/package.json
 COPY ./script-runner/runner.js /app/script-runner/runner.js
 
 COPY ./start.sh /app/start.sh
-RUN chmod +x /app/start.sh && mkdir -p /shared/parsers /data /run/redis
+RUN chmod +x /app/start.sh && mkdir -p /shared/parsers /data /run/redis /run/postgresql
 VOLUME ["/shared/parsers", "/data"]
 EXPOSE 80
 EXPOSE 15000

@@ -1,5 +1,7 @@
 import path from "node:path";
-const rootDir = process.cwd();
+import { fileURLToPath } from "node:url";
+const moduleDir = path.dirname(fileURLToPath(import.meta.url));
+const rootDir = path.resolve(moduleDir, "..");
 export const config = {
     port: Number(process.env.PORT || 8080),
     databaseUrl: process.env.DATABASE_URL ||
@@ -37,5 +39,5 @@ export const config = {
         baseUrl: process.env.LLM_SCRIPT_BASE_URL || "",
         timeoutMs: Number(process.env.LLM_SCRIPT_TIMEOUT_MS || process.env.LLM_TIMEOUT_MS || 60000)
     },
-    migrationsDir: path.join(rootDir, "migrations")
+    migrationsDir: process.env.MIGRATIONS_DIR || path.join(rootDir, "migrations")
 };

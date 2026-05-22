@@ -7,7 +7,7 @@ touch /shared/parsers/llm-backend.log /shared/parsers/nginx_access.log /shared/p
 
 redis-server --bind 127.0.0.1 --port 6379 --dir /data --appendonly yes --save 60 1 --daemonize yes
 
-export PORT="${PORT:-8080}"
+export BACKEND_PORT="${PORT:-8080}"
 export REDIS_URL="${REDIS_URL:-redis://127.0.0.1:6379}"
 export RUNNER_URL="${RUNNER_URL:-http://127.0.0.1:8090}"
 export DATABASE_URL="${DATABASE_URL:-postgres://dawn:${POSTGRES_PASSWORD:-dawn}@postgres:5432/dawn_course}"
@@ -16,10 +16,10 @@ export SCRIPT_OUTPUT_DIR="${SCRIPT_OUTPUT_DIR:-/shared/parsers}"
 export LLM_BACKEND_UPSTREAM="${LLM_BACKEND_UPSTREAM:-127.0.0.1:8080}"
 export NGINX_DNS_RESOLVER="${NGINX_DNS_RESOLVER:-127.0.0.11}"
 
-node /app/script-runner/runner.js &
+(cd /app/script-runner && PORT=8090 node runner.js) &
 RUNNER_PID=$!
 
-node /app/llm-backend/dist/main.js &
+(cd /app/llm-backend && PORT="${BACKEND_PORT}" node dist/main.js) &
 BACKEND_PID=$!
 
 # Follow only new log lines after startup to avoid replaying old logs on restart.
@@ -29,7 +29,7 @@ TAIL_PID=$!
 READY=0
 TRY=0
 while [ "$TRY" -lt 60 ]; do
-  if wget -q -O - http://127.0.0.1:8080/health >/dev/null 2>&1; then
+  if wget -q -O - "http://127.0.0.1:${BACKEND_PORT}/health" >/dev/null 2>&1; then
     READY=1
     break
   fi

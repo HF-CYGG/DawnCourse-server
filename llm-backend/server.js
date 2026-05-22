@@ -1362,13 +1362,54 @@ const server = http.createServer((req, res) => {
     if (existingTaskId) {
       const existingTask = await getTask(existingTaskId);
       if (existingTask) {
+        if (!issueId && parseSessionId) {
+          const mappedIssueId = await redisClient.get(buildParseSessionIssueKey(parseSessionId));
+          if (mappedIssueId) {
+            issueId = mappedIssueId.toString().trim();
+          }
+        }
+        if (!issueId && !existingTask.issueId) {
+          issueId = await recordParseTaskFailureIssue({
+            existingIssueId: "",
+            queueSchoolId,
+            schoolName,
+            schoolSystemType: classification.schoolSystemType,
+            sourceUrl,
+            scriptName,
+            scriptVersion,
+            scriptSource,
+            failureTypeInput,
+            classification,
+            parseSessionId,
+            attemptedParsers,
+            clientVersion,
+            contentHash,
+            safeContent
+          });
+          await saveTask(existingTaskId, { ...existingTask, issueId });
+          await appendRepairIssueTrace(issueId, {
+            stage: "QUEUED",
+            level: "info",
+            message: "复用既有云端解析任务并补建修复链路",
+            source: "parse_task",
+            meta: {
+              taskId: existingTaskId,
+              schoolId: queueSchoolId,
+              scriptName: sanitizeScriptName(scriptName || ""),
+              parseSessionId
+            }
+          });
+        } else {
+          issueId = issueId || existingTask.issueId || "";
+        }
         return sendJson(res, 200, {
           code: 200,
           msg: "ok",
           taskId: existingTaskId,
           schoolId: existingTask.schoolId || queueSchoolId,
           schoolName: existingTask.schoolName || schoolName,
-          schoolSystemType: existingTask.schoolSystemType || "unknown"
+          schoolSystemType: existingTask.schoolSystemType || "unknown",
+          issueId: existingTask.issueId || issueId || ""
         });
       }
     }
@@ -1380,10 +1421,27 @@ const server = http.createServer((req, res) => {
     }
     const schoolSystemType = classification.schoolSystemType;
     if (queueSchoolId) {
-      await saveSchoolInfo(queueSchoolId, schoolName || extractHost(sourceUrl), schoolSystemType, candidateUrls, {
+      await saveSchoolInfo(queueSchoolId, schoolName || getSourceHost(sourceUrl), schoolSystemType, candidateUrls, {
         systemSource: classification.schoolSystemSource
       });
     }
+    issueId = await recordParseTaskFailureIssue({
+      existingIssueId: issueId,
+      queueSchoolId,
+      schoolName,
+      schoolSystemType,
+      sourceUrl,
+      scriptName,
+      scriptVersion,
+      scriptSource,
+      failureTypeInput,
+      classification,
+      parseSessionId,
+      attemptedParsers,
+      clientVersion,
+      contentHash,
+      safeContent
+    });
     await persistSubmissionSnapshot({
       schoolId: queueSchoolId,
       schoolName,
@@ -1519,6 +1577,7 @@ const server = http.createServer((req, res) => {
       schoolId: queueSchoolId,
       schoolName,
       schoolSystemType,
+      issueId,
       parseProviderReady
     });
   }
@@ -1767,6 +1826,151 @@ async function recordParseReport(body) {
     });
   }
   return { issueId: issue.issueId };
+}
+
+async function recordParseTaskFailureIssue({
+  existingIssueId,
+  queueSchoolId,
+  schoolName,
+  schoolSystemType,
+  sourceUrl,
+  scriptName,
+  scriptVersion,
+  scriptSource,
+  failureTypeInput,
+  classification,
+  parseSessionId,
+  attemptedParsers,
+  clientVersion,
+  contentHash,
+  safeContent
+}) {
+  const traceSessionId =
+    (parseSessionId || "").toString().trim() || `submission_${(contentHash || hashText(safeContent || "")).slice(0, 16)}`;
+  const sourceUrlHost = getSourceHost(sourceUrl);
+  const pageFingerprint = buildSubmissionPageFingerprint({
+    sourceUrl,
+    sourceUrlHost,
+    content: safeContent,
+    contentHash
+  });
+  const failureType = normalizeParseFailureType(
+    classification?.failureType || failureTypeInput || "parser_empty"
+  );
+  const resolvedScriptName = normalizeScriptNameFromAny(
+    scriptName || (Array.isArray(attemptedParsers) ? attemptedParsers[0] : "") || "unknown.js"
+  );
+  const storedSession = {
+    parseSessionId: traceSessionId,
+    appVersionCode: 0,
+    appVersionName: clientVersion || "",
+    installBucketIdHash: "",
+    schoolId: queueSchoolId || buildFallbackSchoolId(schoolSystemType, sourceUrlHost || sourceUrl, schoolName),
+    schoolName: schoolName || sourceUrlHost || "",
+    schoolSystemType: normalizeReportSchoolSystemType(schoolSystemType || ""),
+    importSource: "WEBVIEW",
+    sourceUrlHost,
+    pageFingerprintHash: hashText(JSON.stringify(pageFingerprint || {})),
+    finalSuccess: false,
+    finalFailureType: failureType,
+    createdAt: Date.now(),
+    updatedAt: Date.now()
+  };
+  const attempt = normalizeParserAttempt({
+    parserName: resolvedScriptName,
+    category: "parsers",
+    parserVersion: Number(scriptVersion || 0),
+    scriptSource,
+    durationMs: 0,
+    success: false,
+    resultCount: 0,
+    failureType,
+    safeErrorCode: classification?.failureCategory || failureType,
+    schemaValid: false,
+    confidence: 0
+  });
+  const issue = await upsertRepairIssue({
+    session: storedSession,
+    pageFingerprint,
+    attempt,
+    finalFailureType: failureType,
+    parseSessionId: traceSessionId,
+    preferredIssueId: existingIssueId
+  });
+  if (parseSessionId) {
+    await redisClient.set(buildParseSessionIssueKey(parseSessionId), issue.issueId, { PX: queueItemTtlMs });
+  }
+  await appendRepairIssueTrace(issue.issueId, {
+    stage: "REPORT_RECEIVED",
+    level: "info",
+    message: "收到云端兜底解析失败样本",
+    source: "parse_task",
+    meta: {
+      parseSessionId: traceSessionId,
+      schoolId: storedSession.schoolId || "",
+      schoolSystemType: storedSession.schoolSystemType || "unknown",
+      sourceUrlHost,
+      failureType,
+      failureSource: classification?.failureSource || "",
+      clientVersion: clientVersion || ""
+    }
+  });
+  await appendRepairIssueTrace(issue.issueId, {
+    stage: "ISSUE_MERGED",
+    level: "info",
+    message: "授权样本已归并到 Repair Issue",
+    source: "parse_task",
+    meta: {
+      issueKey: issue.issueKey || "",
+      affectedScriptId: issue.affectedScriptId || "",
+      affectedVersion: Number(issue.affectedVersion || 0),
+      sampleHash: contentHash || ""
+    }
+  });
+  if (safeContent) {
+    await saveFailureSample(issue.issueId, {
+      parseSessionId: traceSessionId,
+      content: safeContent.toString(),
+      contentSha256: contentHash || hashText(safeContent.toString()),
+      sanitizerVersion: 0,
+      pageFingerprint,
+      schoolId: storedSession.schoolId,
+      schoolSystemType: storedSession.schoolSystemType,
+      sourceUrlHost,
+      createdAt: Date.now()
+    });
+  }
+  return issue.issueId;
+}
+
+function buildSubmissionPageFingerprint({ sourceUrl, sourceUrlHost, content, contentHash }) {
+  const signals = detectSubmissionSignals(content || "", sourceUrl || "");
+  return {
+    host: sourceUrlHost || getSourceHost(sourceUrl),
+    pathPattern: buildSourcePathPattern(sourceUrl),
+    contentHash: contentHash || hashText(content || ""),
+    hasCaptcha: signals.captchaLike === true,
+    hasLoginKeyword: signals.loginLike === true,
+    hasCourseKeyword: signals.timetableLike === true,
+    hasHtml: signals.hasHtml === true,
+    systemFromUrl: signals.systemFromUrl || "",
+    systemFromContent: signals.systemFromContent || "unknown"
+  };
+}
+
+function buildSourcePathPattern(sourceUrl) {
+  const text = (sourceUrl || "").toString().trim();
+  if (!text) return "";
+  try {
+    const parsed = new URL(text);
+    return parsed.pathname.replace(/[A-Za-z0-9_-]{12,}/g, "*").slice(0, 240);
+  } catch {
+    return text
+      .replace(/^[a-z][a-z0-9+.-]*:\/\/[^/]+/i, "")
+      .replace(/[?#].*$/, "")
+      .replace(/[A-Za-z0-9_-]{12,}/g, "*")
+      .slice(0, 240);
+  }
 }
 
 function normalizeParserAttempt(item) {
@@ -6847,9 +7051,27 @@ function buildFallbackSchoolId(schoolSystemType, sourceUrlOrHost, schoolName) {
   const directName = normalizeSchoolNameFull(schoolName);
   if (directName) return directName;
   const normalizedType = normalizeReportSchoolSystemType(schoolSystemType || "") || "unknown";
-  const host = extractHost(sourceUrlOrHost || "") || (sourceUrlOrHost || "").toString().trim().toLowerCase();
+  const host = getSourceHost(sourceUrlOrHost || "") || (sourceUrlOrHost || "").toString().trim().toLowerCase();
   if (!host) return "";
   return `host_${normalizedType}_${host.replace(/[^a-z0-9.-]+/gi, "_")}`;
+}
+
+function getSourceHost(sourceUrlOrHost) {
+  const text = (sourceUrlOrHost || "").toString().trim();
+  if (!text) return "";
+  try {
+    const parsed = new URL(text);
+    return (parsed.hostname || "").toString().trim().toLowerCase();
+  } catch {
+    // 客户端可能只上报裸 host、host:port 或 host/path，这里统一收敛为 host。
+  }
+  const normalized = text
+    .replace(/^[a-z][a-z0-9+.-]*:\/\//i, "")
+    .replace(/[/?#].*$/, "")
+    .replace(/:\d+$/, "")
+    .trim()
+    .toLowerCase();
+  return /^[a-z0-9.-]+$/.test(normalized) ? normalized : "";
 }
 
 /**

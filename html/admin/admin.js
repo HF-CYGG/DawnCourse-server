@@ -3339,6 +3339,21 @@ function collectRepairModelSnapshots(issue, timelineItems, logItems) {
   ];
 }
 
+function collectRepairCurrentStepSnapshot(issue, timelineItems, logItems) {
+  const combined = []
+    .concat((Array.isArray(timelineItems) ? timelineItems : []).map((item) => normalizeRepairTraceEntry(item)))
+    .concat((Array.isArray(logItems) ? logItems : []).map((item) => normalizeRepairTraceEntry(item)))
+    .sort((a, b) => Number(a?.ts || 0) - Number(b?.ts || 0));
+  const currentStage = (issue?.currentStage || "").toString();
+  const entry =
+    getLatestRepairEntry(combined, (item) => (item?.stage || "").toString() === currentStage) ||
+    combined[combined.length - 1] ||
+    null;
+  const stageLabel = entry?.stage ? formatRepairStageLabel(entry.stage) : formatRepairStageLabel(currentStage);
+  const name = `当前步骤：${stageLabel || currentStage || "-"}`;
+  return buildRepairStatusSnapshot(name, entry, "暂无步骤记录");
+}
+
 function collectRepairFailureInsights(issue, timelineItems, logItems) {
   const issueInfo = normalizeRepairIssueRecord(issue);
   const list = [];
@@ -3395,6 +3410,7 @@ function renderRepairOverview(detail, timelineItems, logItems) {
   if (!repairIssueOverviewGrid) return;
   const issue = normalizeRepairIssueRecord(detail?.issue || {});
   const modelSnapshots = collectRepairModelSnapshots(issue, timelineItems, logItems);
+  const currentStepSnapshot = collectRepairCurrentStepSnapshot(issue, timelineItems, logItems);
   const failureItems = collectRepairFailureInsights(issue, timelineItems, logItems);
   const overviewTags = buildRepairStateBadges(issue);
   const contextHtml = [
@@ -3424,8 +3440,7 @@ function renderRepairOverview(detail, timelineItems, logItems) {
   ]
     .map(([label, value]) => buildRepairContextItem(label, value))
     .join("");
-  const modelHtml = modelSnapshots
-    .map(
+  const modelHtml = [currentStepSnapshot].concat(modelSnapshots).filter(Boolean).map(
       (item) => `
         <div class="repair-model-status-item ${item.tone}">
           <div class="repair-model-status-head">
@@ -3436,8 +3451,7 @@ function renderRepairOverview(detail, timelineItems, logItems) {
           <div class="repair-model-status-meta">${escapeHtml(item.meta || "暂无补充信息")}</div>
         </div>
       `
-    )
-    .join("");
+    ).join("");
   const failureHtml = failureItems
     .map(
       (item) => `
@@ -3635,21 +3649,28 @@ function renderRepairProgress(issue, timelineItems) {
 
   repairIssueProgressSteps.innerHTML = REPAIR_STAGE_FLOW.map((step, idx) => {
     const ts = stageTimeMap.get(step.stage) || 0;
-    const entry = stageEntryMap.get(step.stage) || null;
-    const display = buildRepairTraceDisplay(entry);
     const meta = ts ? formatTime(ts) : "未发生";
     const classes = ["progress-step"];
     if (idx < normalizedStageIndex) classes.push("completed");
     if (idx === normalizedStageIndex) classes.push("active");
     if (idx === normalizedStageIndex && info.lastErrorMessage) classes.push("failed");
+    const statusText =
+      idx < normalizedStageIndex
+        ? "已完成"
+        : idx === normalizedStageIndex
+          ? info.lastErrorMessage
+            ? "失败"
+            : ["CANDIDATE_TEST_RUNNING", "REPLAY_RUNNING"].includes((step.stage || "").toString())
+              ? "进行中"
+              : "当前"
+          : "待执行";
     return `
       <div class="${classes.join(" ")}" data-stage="${escapeHtml(step.stage)}">
         <div class="dot"></div>
         <div class="content">
           <div class="stage">${escapeHtml(step.label)}</div>
           <div class="meta">${escapeHtml(step.stage)} · ${escapeHtml(meta)}</div>
-          <div class="detail">${escapeHtml(display.title || "等待执行")}</div>
-          <div class="submeta">${escapeHtml(display.subtitle || "")}</div>
+          <div class="detail">${escapeHtml(statusText)}</div>
         </div>
       </div>
     `;

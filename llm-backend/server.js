@@ -606,7 +606,7 @@ const server = http.createServer((req, res) => {
   // ---------------------------------------------------------------------------
   // [管理后台接口] 退出
   // ---------------------------------------------------------------------------
-  if (req.method === "POST" && url.pathname === "/api/v1/admin/logout") {
+  if ((req.method === "POST" || req.method === "GET") && url.pathname === "/api/v1/admin/logout") {
     const auth = await requireAdminAuth(req);
     if (!auth.ok) {
       return sendJson(res, 401, { code: 401, msg: "未登录" });

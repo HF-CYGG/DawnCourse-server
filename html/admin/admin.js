@@ -2182,11 +2182,16 @@ async function fetchWithAuth(requestPath, init = {}) {
     throw new Error("unauthorized");
   }
   const text = await res.text();
+  let parsed = null;
   try {
-    return text ? JSON.parse(text) : {};
+    parsed = text ? JSON.parse(text) : {};
   } catch {
     throw new Error(text || `unexpected_response_${res.status}`);
   }
+  if (!res.ok) {
+    throw new Error(parsed?.msg || `http_${res.status}`);
+  }
+  return parsed;
 }
 
 async function postWithAuth(requestPath, payload) {
@@ -2202,7 +2207,17 @@ async function postWithAuth(requestPath, payload) {
   if (res.status === 401) {
     throw new Error("unauthorized");
   }
-  return res.json();
+  const text = await res.text();
+  let parsed = {};
+  try {
+    parsed = text ? JSON.parse(text) : {};
+  } catch {
+    throw new Error(text || `unexpected_response_${res.status}`);
+  }
+  if (!res.ok) {
+    throw new Error(parsed?.msg || `http_${res.status}`);
+  }
+  return parsed;
 }
 
 function escapeHtml(value) {
@@ -4702,7 +4717,7 @@ if (runtimeLogSource) {
 
 logoutBtn.addEventListener("click", async () => {
   try {
-    await fetchWithAuth("/api/v1/admin/logout");
+    await postWithAuth("/api/v1/admin/logout", {});
   } catch {}
   clearToken();
   closeAdminEvents();

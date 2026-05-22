@@ -1313,6 +1313,10 @@ async function loadConfig() {
       document.getElementById("conf_summaryApiStyleRaw").value = conf.summaryApiStyleRaw || "";
       document.getElementById("conf_summaryRequestExtraJson").value =
         conf.summaryRequestExtraJson || "";
+      const summaryTimeoutEl = document.getElementById("conf_summaryTimeoutMs");
+      if (summaryTimeoutEl) summaryTimeoutEl.value = conf.summaryTimeoutMs || conf.timeoutMs || "";
+      const patchTimeoutEl = document.getElementById("conf_patchGuidanceTimeoutMs");
+      if (patchTimeoutEl) patchTimeoutEl.value = conf.patchGuidanceTimeoutMs || conf.timeoutMs || "";
 
       document.getElementById("conf_scriptProviderRaw").value = conf.scriptProviderRaw || "auto";
       document.getElementById("conf_scriptModelRaw").value = conf.scriptModelRaw || "";
@@ -1321,6 +1325,8 @@ async function loadConfig() {
       document.getElementById("conf_scriptApiStyleRaw").value = conf.scriptApiStyleRaw || "";
       document.getElementById("conf_scriptRequestExtraJson").value =
         conf.scriptRequestExtraJson || "";
+      const scriptTimeoutEl = document.getElementById("conf_scriptTimeoutMs");
+      if (scriptTimeoutEl) scriptTimeoutEl.value = conf.scriptTimeoutMs || conf.timeoutMs || "";
 
       document.getElementById("conf_modelAliasJson").value = conf.modelAliasJson || "";
       document.getElementById("conf_usageEnabled").checked = conf.usageEnabled;
@@ -1367,7 +1373,10 @@ function buildModelTestPayload(target) {
     apiKey: document.getElementById(summary ? "conf_summaryApiKey" : "conf_scriptApiKey").value,
     baseUrl: document.getElementById(summary ? "conf_summaryBaseUrl" : "conf_scriptBaseUrl").value,
     apiStyle: document.getElementById(summary ? "conf_summaryApiStyleRaw" : "conf_scriptApiStyleRaw").value,
-    extraBody: document.getElementById(summary ? "conf_summaryRequestExtraJson" : "conf_scriptRequestExtraJson").value
+    extraBody: document.getElementById(summary ? "conf_summaryRequestExtraJson" : "conf_scriptRequestExtraJson").value,
+    timeoutMs: Number(
+      document.getElementById(summary ? "conf_summaryTimeoutMs" : "conf_scriptTimeoutMs")?.value || 0
+    ) || undefined
   };
 }
 
@@ -1431,6 +1440,8 @@ document.getElementById("saveConfigBtn").addEventListener("click", async () => {
     summaryBaseUrl: document.getElementById("conf_summaryBaseUrl").value,
     summaryApiStyleRaw: document.getElementById("conf_summaryApiStyleRaw").value,
     summaryRequestExtraJson: document.getElementById("conf_summaryRequestExtraJson").value,
+    summaryTimeoutMs: Number(document.getElementById("conf_summaryTimeoutMs")?.value || 0) || "",
+    patchGuidanceTimeoutMs: Number(document.getElementById("conf_patchGuidanceTimeoutMs")?.value || 0) || "",
 
     scriptProviderRaw: document.getElementById("conf_scriptProviderRaw").value,
     scriptModelRaw: document.getElementById("conf_scriptModelRaw").value,
@@ -1438,6 +1449,7 @@ document.getElementById("saveConfigBtn").addEventListener("click", async () => {
     scriptBaseUrl: document.getElementById("conf_scriptBaseUrl").value,
     scriptApiStyleRaw: document.getElementById("conf_scriptApiStyleRaw").value,
     scriptRequestExtraJson: document.getElementById("conf_scriptRequestExtraJson").value,
+    scriptTimeoutMs: Number(document.getElementById("conf_scriptTimeoutMs")?.value || 0) || "",
 
     modelAliasJson: document.getElementById("conf_modelAliasJson").value,
     usageEnabled: document.getElementById("conf_usageEnabled").checked,

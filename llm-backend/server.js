@@ -9,13 +9,13 @@ import { createClient } from "redis";
 // 服务端监听端口
 const port = Number(process.env.PORT || 8080);
 // 单次请求超时
-const timeoutMs = Number(process.env.LLM_TIMEOUT_MS || 3600000);
+let timeoutMs = Number(process.env.LLM_TIMEOUT_MS || 3600000);
 // 模型 1 汇总相关请求单独放宽超时，避免真实样本汇总过早中断
-const summaryTimeoutMs = Number(process.env.LLM_SUMMARY_TIMEOUT_MS || Math.max(timeoutMs, 3600000));
+let summaryTimeoutMs = Number(process.env.LLM_SUMMARY_TIMEOUT_MS || Math.max(timeoutMs, 3600000));
 // 模型 1 修复指令生成通常比总结更短，但仍需要独立预算，避免与总结/脚本生成共用同一超时策略
-const patchGuidanceTimeoutMs = Number(process.env.LLM_PATCH_GUIDANCE_TIMEOUT_MS || Math.max(timeoutMs, 3600000));
+let patchGuidanceTimeoutMs = Number(process.env.LLM_PATCH_GUIDANCE_TIMEOUT_MS || Math.max(timeoutMs, 3600000));
 // 模型 2 生成脚本通常更慢，允许比通用超时更长
-const scriptTimeoutMs = Number(process.env.LLM_SCRIPT_TIMEOUT_MS || Math.max(timeoutMs, 3600000));
+let scriptTimeoutMs = Number(process.env.LLM_SCRIPT_TIMEOUT_MS || Math.max(timeoutMs, 3600000));
 // 三类调用分别配置独立重试次数，重试次数表示“失败后额外再试几次”
 const summaryMaxRetries = Math.max(0, Number(process.env.LLM_SUMMARY_MAX_RETRIES || 1));
 const patchGuidanceMaxRetries = Math.max(0, Number(process.env.LLM_PATCH_GUIDANCE_MAX_RETRIES || 2));
@@ -58,7 +58,8 @@ const redisConnectMaxAttempts = Math.max(1, Number(process.env.REDIS_CONNECT_MAX
 const scriptOutputDir = process.env.SCRIPT_OUTPUT_DIR || "/shared/parsers";
 // 老版本脚本目录（支持逗号分隔多个目录），用于升级时回退读取与自动迁移
 const legacyScriptOutputDirs = parseCommaList(
-  process.env.LEGACY_SCRIPT_OUTPUT_DIRS || "/shared/scripts/parsers,/shared/scripts/js"
+  process.env.LEGACY_SCRIPT_OUTPUT_DIRS ||
+    "/shared/scripts/parsers,/shared/scripts/js,/usr/share/nginx/html/scripts/parsers,/usr/share/nginx/html/scripts/js"
 );
 const submissionArchiveDir =
   (process.env.SUBMISSION_ARCHIVE_DIR || path.join(scriptOutputDir, "submissions")).toString().trim();
@@ -295,6 +296,13 @@ function applyDynamicConfig(conf) {
   if (conf.summaryBaseUrl !== undefined) summaryBaseUrl = conf.summaryBaseUrl;
   if (conf.summaryRequestExtraJson !== undefined) summaryRequestExtraJson = conf.summaryRequestExtraJson;
   if (conf.summaryApiStyleRaw !== undefined) summaryApiStyleRaw = conf.summaryApiStyleRaw;
+  if (conf.timeoutMs !== undefined) timeoutMs = normalizeConfigTimeoutMs(conf.timeoutMs, timeoutMs);
+  if (conf.summaryTimeoutMs !== undefined) {
+    summaryTimeoutMs = normalizeConfigTimeoutMs(conf.summaryTimeoutMs, summaryTimeoutMs);
+  }
+  if (conf.patchGuidanceTimeoutMs !== undefined) {
+    patchGuidanceTimeoutMs = normalizeConfigTimeoutMs(conf.patchGuidanceTimeoutMs, patchGuidanceTimeoutMs);
+  }
 
   summaryModel = resolveModelName(summaryModelRaw || defaultSummaryModel(summaryProviderRaw === "auto" ? "gpt" : summaryProviderRaw));
   summaryProvider = normalizeProvider(summaryProviderRaw, summaryModel);
@@ -307,6 +315,9 @@ function applyDynamicConfig(conf) {
   if (conf.scriptBaseUrl !== undefined) scriptBaseUrl = conf.scriptBaseUrl;
   if (conf.scriptRequestExtraJson !== undefined) scriptRequestExtraJson = conf.scriptRequestExtraJson;
   if (conf.scriptApiStyleRaw !== undefined) scriptApiStyleRaw = conf.scriptApiStyleRaw;
+  if (conf.scriptTimeoutMs !== undefined) {
+    scriptTimeoutMs = normalizeConfigTimeoutMs(conf.scriptTimeoutMs, scriptTimeoutMs);
+  }
 
   scriptModel = resolveModelName(scriptModelRaw || defaultScriptModel(scriptProviderRaw === "auto" ? "gpt" : scriptProviderRaw));
   scriptProvider = normalizeProvider(scriptProviderRaw, scriptModel);
@@ -323,6 +334,14 @@ function applyDynamicConfig(conf) {
   if (conf.scriptUsageUrl !== undefined) scriptUsageUrl = conf.scriptUsageUrl;
   if (conf.summaryCostUrl !== undefined) summaryCostUrl = conf.summaryCostUrl;
   if (conf.scriptCostUrl !== undefined) scriptCostUrl = conf.scriptCostUrl;
+}
+
+function normalizeConfigTimeoutMs(value, fallback) {
+  const text = (value ?? "").toString().trim();
+  if (!text) return fallback;
+  const parsed = Number(text);
+  if (!Number.isFinite(parsed) || parsed < 1000) return fallback;
+  return Math.min(Math.max(1000, Math.floor(parsed)), 6 * 60 * 60 * 1000);
 }
 
 async function loadDynamicConfig() {
@@ -1166,12 +1185,16 @@ const server = http.createServer((req, res) => {
       summaryBaseUrl,
       summaryRequestExtraJson,
       summaryApiStyleRaw,
+      timeoutMs,
+      summaryTimeoutMs,
+      patchGuidanceTimeoutMs,
       scriptProviderRaw,
       scriptApiKey,
       scriptModelRaw,
       scriptBaseUrl,
       scriptRequestExtraJson,
       scriptApiStyleRaw,
+      scriptTimeoutMs,
       usageEnabled,
       summaryUsageUrl,
       scriptUsageUrl,
@@ -1286,7 +1309,8 @@ const server = http.createServer((req, res) => {
       apiKey: apiKeyValue,
       baseUrl: baseUrlValue,
       apiStyle: apiStyleRaw,
-      extra: extraBody
+      extra: extraBody,
+      timeoutMs: Number(body?.timeoutMs || body?.timeout_ms || 0) || undefined
     });
     return sendJson(res, 200, { code: 200, data: result });
   }
@@ -4033,6 +4057,7 @@ async function testModelConnectivity(config = {}) {
   const baseUrlValue = ((config.baseUrl || "").toString().trim() || defaultBaseUrl(providerName)).replace(/\/+$/, "");
   const apiStyleRaw = (config.apiStyle || "").toString().trim();
   const extraBody = config.extra && typeof config.extra === "object" ? config.extra : null;
+  const requestTimeoutMs = normalizeConfigTimeoutMs(config.timeoutMs, 30000);
   if (!apiKeyValue) {
     return {
       ok: false,
@@ -4069,7 +4094,7 @@ async function testModelConnectivity(config = {}) {
       },
       extraBody
     );
-    const result = await httpPostJsonDetailed(endpoint, body, {});
+    const result = await httpPostJsonDetailed(endpoint, body, {}, requestTimeoutMs);
     const parsed = safeJson(result.text || "");
     const text =
       parsed?.candidates?.[0]?.content?.parts?.[0]?.text ||
@@ -4125,7 +4150,7 @@ async function testModelConnectivity(config = {}) {
   );
   const result = await httpPostJsonDetailed(endpoint, body, {
     Authorization: `Bearer ${apiKeyValue}`
-  });
+  }, requestTimeoutMs);
   const parsed = safeJson(result.text || "");
   const text = apiStyle === "responses" ? extractResponsesText(parsed) : parsed?.choices?.[0]?.message?.content || "";
   if (!result.ok) {

@@ -187,6 +187,14 @@
                   <label>扩展请求参数（JSON）</label>
                   <textarea id="conf_summaryRequestExtraJson" placeholder='如: {"response_format": {"type": "json_object"}}'></textarea>
                 </div>
+                <div class="config-row">
+                  <label>模型 1 超时（毫秒）</label>
+                  <input type="number" id="conf_summaryTimeoutMs" min="1000" step="1000" placeholder="默认 3600000">
+                </div>
+                <div class="config-row">
+                  <label>修复指令超时（毫秒）</label>
+                  <input type="number" id="conf_patchGuidanceTimeoutMs" min="1000" step="1000" placeholder="默认 3600000">
+                </div>
                 <div class="config-actions">
                   <button class="btn secondary" id="testSummaryConfigBtn" type="button">测试模型 1 连通性</button>
                   <span class="muted" id="testSummaryConfigResult">-</span>
@@ -229,6 +237,10 @@
                 <div class="config-row">
                   <label>扩展请求参数（JSON）</label>
                   <textarea id="conf_scriptRequestExtraJson" placeholder='如: {"response_format": {"type": "json_object"}}'></textarea>
+                </div>
+                <div class="config-row">
+                  <label>模型 2 超时（毫秒）</label>
+                  <input type="number" id="conf_scriptTimeoutMs" min="1000" step="1000" placeholder="默认 3600000">
                 </div>
                 <div class="config-actions">
                   <button class="btn secondary" id="testScriptConfigBtn" type="button">测试模型 2 连通性</button>

@@ -16,7 +16,8 @@ export NGINX_DNS_RESOLVER="${NGINX_DNS_RESOLVER:-127.0.0.11}"
 node /app/llm-backend/server.js &
 BACKEND_PID=$!
 
-tail -n +1 -F /shared/parsers/llm-backend.log /shared/parsers/nginx_access.log /shared/parsers/nginx_error.log &
+# 只追踪启动后的新增日志，避免每次重启都把历史日志整段重放到控制台。
+tail -n 0 -F /shared/parsers/llm-backend.log /shared/parsers/nginx_access.log /shared/parsers/nginx_error.log &
 TAIL_PID=$!
 
 READY=0

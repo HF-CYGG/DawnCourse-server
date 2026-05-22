@@ -1790,10 +1790,16 @@ async function recordParseReport(body) {
   if (finalSuccess) return { issueId: "" };
   const existingIssueId = (await redisClient.get(buildParseSessionIssueKey(parseSessionId)))?.toString().trim() || "";
   const failedAttempt = attempts.find((item) => item && item.success !== true) || attempts[0] || {};
+  const normalizedFailedAttempt = normalizeParserAttempt(failedAttempt);
+  const preferredScriptName = resolveScriptNameBySchoolSystem(storedSession.schoolSystemType);
+  if (preferredScriptName) {
+    normalizedFailedAttempt.originalParserName = normalizedFailedAttempt.parserName || "";
+    normalizedFailedAttempt.parserName = preferredScriptName;
+  }
   const issue = await upsertRepairIssue({
     session: storedSession,
     pageFingerprint,
-    attempt: normalizeParserAttempt(failedAttempt),
+    attempt: normalizedFailedAttempt,
     finalFailureType,
     parseSessionId,
     preferredIssueId: existingIssueId
@@ -1881,9 +1887,11 @@ async function recordParseTaskFailureIssue({
   const failureType = normalizeParseFailureType(
     classification?.failureType || failureTypeInput || "parser_empty"
   );
-  const resolvedScriptName = normalizeScriptNameFromAny(
-    scriptName || (Array.isArray(attemptedParsers) ? attemptedParsers[0] : "") || "unknown.js"
-  );
+  const resolvedScriptName =
+    resolveScriptNameBySchoolSystem(schoolSystemType) ||
+    normalizeScriptNameFromAny(
+      scriptName || (Array.isArray(attemptedParsers) ? attemptedParsers[0] : "") || "unknown.js"
+    );
   const storedSession = {
     parseSessionId: traceSessionId,
     appVersionCode: 0,
@@ -2018,12 +2026,18 @@ function normalizeParserAttempt(item) {
 
 async function upsertRepairIssue({ session, pageFingerprint, attempt, finalFailureType, parseSessionId, preferredIssueId }) {
   const failureType = normalizeParseFailureType(attempt.failureType || finalFailureType || "unknown");
+  const canonicalParserName = resolveScriptNameBySchoolSystem(session.schoolSystemType) || attempt.parserName || "unknown.js";
+  const storedAttempt = {
+    ...attempt,
+    originalParserName: attempt.originalParserName || (attempt.parserName !== canonicalParserName ? attempt.parserName : ""),
+    parserName: canonicalParserName
+  };
   const preferredId = (preferredIssueId || "").toString().trim();
   const calculatedIssueKey = [
     session.schoolSystemType || "unknown",
     session.sourceUrlHost || "unknown",
     session.pageFingerprintHash || hashText(JSON.stringify(pageFingerprint || {})),
-    attempt.parserName || "unknown.js",
+    canonicalParserName,
     attempt.parserVersion || 0,
     failureType
   ].join("|");
@@ -2032,7 +2046,12 @@ async function upsertRepairIssue({ session, pageFingerprint, attempt, finalFailu
   const key = buildRepairIssueKey(issueId);
   const previousRaw = await redisClient.get(key);
   const previous = previousRaw ? safeJson(previousRaw) : null;
-  const issueKey = previous?.issueKey || calculatedIssueKey;
+  const previousAffectedScript = normalizeScriptNameFromAny(previous?.affectedScriptId || "");
+  const shouldReplaceIssueKey =
+    Boolean(resolveScriptNameBySchoolSystem(session.schoolSystemType)) &&
+    Boolean(previousAffectedScript) &&
+    previousAffectedScript !== canonicalParserName;
+  const issueKey = shouldReplaceIssueKey ? calculatedIssueKey : previous?.issueKey || calculatedIssueKey;
   const now = Date.now();
   const issue = {
     issueId,
@@ -2042,7 +2061,7 @@ async function upsertRepairIssue({ session, pageFingerprint, attempt, finalFailu
     schoolSystemType: previous?.schoolSystemType || session.schoolSystemType || "unknown",
     sourceUrlHost: previous?.sourceUrlHost || session.sourceUrlHost || "",
     pageFingerprintHash: previous?.pageFingerprintHash || session.pageFingerprintHash || "",
-    affectedScriptId: previous?.affectedScriptId || attempt.parserName || "",
+    affectedScriptId: canonicalParserName || previous?.affectedScriptId || "",
     affectedVersion: Number(previous?.affectedVersion || attempt.parserVersion || 0),
     failureType,
     sampleCount: Number(previous?.sampleCount || 0),
@@ -2053,7 +2072,7 @@ async function upsertRepairIssue({ session, pageFingerprint, attempt, finalFailu
     lastStepAt: Number(previous?.lastStepAt || now),
     lastErrorMessage: (previous?.lastErrorMessage || "").toString(),
     lastParseSessionId: parseSessionId,
-    lastAttempt: attempt,
+    lastAttempt: storedAttempt,
     createdAt: Number(previous?.createdAt || now),
     updatedAt: now,
     lastSeenAt: now
@@ -2105,7 +2124,19 @@ async function listRepairIssues(limit = 100) {
  */
 function buildRepairIssueAdminView(issue) {
   const info = issue && typeof issue === "object" ? { ...issue } : {};
+  const canonicalScriptName = resolveScriptNameBySchoolSystem(info.schoolSystemType || info.school_system_type || "");
+  if (canonicalScriptName) {
+    info.originalAffectedScriptId =
+      info.originalAffectedScriptId || (info.affectedScriptId && info.affectedScriptId !== canonicalScriptName
+        ? info.affectedScriptId
+        : "");
+    info.affectedScriptId = canonicalScriptName;
+  }
   const lastAttempt = normalizeParserAttempt(info.lastAttempt || info.last_attempt || {});
+  if (canonicalScriptName && lastAttempt.parserName !== canonicalScriptName) {
+    lastAttempt.originalParserName = lastAttempt.parserName || "";
+    lastAttempt.parserName = canonicalScriptName;
+  }
   const lastStatusCode = Number(info.lastStatusCode || info.last_status_code || 0);
   const lastErrorCode = (info.lastErrorCode || info.last_error_code || "").toString();
   const lastDurationMs = Number(info.lastDurationMs || info.last_duration_ms || 0);
@@ -2121,7 +2152,7 @@ function buildRepairIssueAdminView(issue) {
     lastStatusCode: lastStatusCode || Number(lastAttempt.statusCode || 0),
     lastErrorCode: lastErrorCode || (lastAttempt.safeErrorCode || "").toString(),
     lastDurationMs: lastDurationMs || Number(lastAttempt.durationMs || 0),
-    lastParserName: lastParserName || (lastAttempt.parserName || "").toString(),
+    lastParserName: canonicalScriptName || lastParserName || (lastAttempt.parserName || "").toString(),
     lastParserVersion: lastParserVersion || Number(lastAttempt.parserVersion || 0),
     lastScriptSource: lastScriptSource || (lastAttempt.scriptSource || "").toString(),
     lastResultCount: lastResultCount || Number(lastAttempt.resultCount || 0),
@@ -2215,16 +2246,11 @@ async function runRepairIssueTest(issueId, username) {
   if (!detail) {
     return { ok: false, code: 404, reason: "issue_not_found" };
   }
-  const primaryName = normalizeScriptNameFromAny(detail.issue?.affectedScriptId || "");
+  const primaryName =
+    resolveScriptNameBySchoolSystem(detail.issue?.schoolSystemType || "") ||
+    normalizeScriptNameFromAny(detail.issue?.affectedScriptId || "");
   const systemType = (detail.issue?.schoolSystemType || "").toString();
-  const fallbackMapped =
-    normalizeSchoolSystemType(systemType) === "qiangzhi"
-      ? "qiangzhi.js"
-      : normalizeSchoolSystemType(systemType) === "zhengfang"
-        ? "zhengfang.js"
-        : normalizeSchoolSystemType(systemType) === "kingosoft"
-          ? "kingosoft.js"
-          : "";
+  const fallbackMapped = resolveScriptNameBySchoolSystem(systemType);
   const candidates = Array.from(
     new Set(
       [
@@ -2479,7 +2505,8 @@ async function retryRepairIssue(issueId, username) {
     meta: { sampleCount: samples.length }
   });
   for (const sample of samples) {
-    await enqueueSchoolSubmission(schoolId, sanitizeContent(sample.content || ""), detail.issue.affectedScriptId || "", {
+    const scriptName = resolveScriptNameBySchoolSystem(detail.issue.schoolSystemType || "") || detail.issue.affectedScriptId || "";
+    await enqueueSchoolSubmission(schoolId, sanitizeContent(sample.content || ""), scriptName, {
       schoolName: detail.issue.schoolName || "",
       schoolSystemType: detail.issue.schoolSystemType || "unknown",
       sourceUrl: detail.issue.sourceUrlHost || "",
@@ -2487,7 +2514,7 @@ async function retryRepairIssue(issueId, username) {
       clientVersion: "",
       parseSessionId: sample.parseSessionId || "",
       issueId,
-      attemptedParsers: detail.issue.affectedScriptId ? [detail.issue.affectedScriptId] : [],
+      attemptedParsers: scriptName ? [scriptName] : [],
       candidateUrls: [],
       forceQueue: true
     });
@@ -2497,9 +2524,10 @@ async function retryRepairIssue(issueId, username) {
 
 function buildIssueRepairItems(detail, samples) {
   const issue = detail?.issue || {};
+  const scriptName = resolveScriptNameBySchoolSystem(issue.schoolSystemType || "") || issue.affectedScriptId || "";
   return (samples || []).map((sample) => ({
     content: sanitizeContent(sample?.content || ""),
-    scriptName: issue.affectedScriptId || "",
+    scriptName,
     createdAt: Number(sample?.createdAt || Date.now()),
     hash: (sample?.contentSha256 || sample?.sampleId || hashText(sample?.content || "")).toString(),
     schoolName: issue.schoolName || "",
@@ -2515,7 +2543,7 @@ function buildIssueRepairItems(detail, samples) {
     clientVersion: "",
     parseSessionId: (sample?.parseSessionId || "").toString(),
     issueId: issue.issueId || "",
-    attemptedParsers: issue.affectedScriptId ? [issue.affectedScriptId] : [],
+    attemptedParsers: scriptName ? [scriptName] : [],
     candidateUrls: []
   }));
 }
@@ -5615,23 +5643,24 @@ async function generateParserScript(summary, patchGuidance, previousScript, scho
  * 解析脚本名
  */
 function resolveScriptName(schoolId, queue) {
+  const systemTypeRaw = (queue.find((item) => item.schoolSystemType)?.schoolSystemType || "").toString();
+  const normalizedSystemType =
+    normalizeSchoolSystemType(systemTypeRaw) || detectSchoolSystemType((queue?.[0]?.content || "").toString());
+  const mapped = resolveScriptNameBySchoolSystem(normalizedSystemType);
+  if (mapped) return sanitizeScriptName(mapped);
   const withName = queue.find((item) => item.scriptName);
   if (withName?.scriptName) return sanitizeScriptName(withName.scriptName);
   const withAttempted = queue.find((item) => Array.isArray(item.attemptedParsers) && item.attemptedParsers.length > 0);
   if (withAttempted?.attemptedParsers?.[0]) return sanitizeScriptName(withAttempted.attemptedParsers[0]);
-  const systemTypeRaw = (queue.find((item) => item.schoolSystemType)?.schoolSystemType || "").toString();
-  const normalizedSystemType =
-    normalizeSchoolSystemType(systemTypeRaw) || detectSchoolSystemType((queue?.[0]?.content || "").toString());
-  const mapped =
-    normalizedSystemType === "zhengfang"
-      ? "zhengfang.js"
-      : normalizedSystemType === "qiangzhi"
-        ? "qiangzhi.js"
-        : normalizedSystemType === "kingosoft"
-          ? "kingosoft.js"
-          : "";
-  if (mapped) return sanitizeScriptName(mapped);
   return sanitizeScriptName(`${schoolId}.js`);
+}
+
+function resolveScriptNameBySchoolSystem(value) {
+  const normalizedSystemType = normalizeSchoolSystemType(value);
+  if (normalizedSystemType === "zhengfang") return "zhengfang.js";
+  if (normalizedSystemType === "qiangzhi") return "qiangzhi.js";
+  if (normalizedSystemType === "kingosoft") return "kingosoft.js";
+  return "";
 }
 
 /**

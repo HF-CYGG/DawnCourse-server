@@ -42,7 +42,7 @@ jobs:
           submodules: false
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Validate required Aliyun ACR secrets
         shell: bash
@@ -133,7 +133,7 @@ jobs:
           } >> "${GITHUB_OUTPUT}"
 
       - name: Build and push image to GHCR
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
@@ -144,7 +144,7 @@ jobs:
 
       - name: Build and push image to Docker Hub
         if: ${{ steps.tags.outputs.dockerhub != '' }}
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
@@ -154,7 +154,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Build and push image to Aliyun ACR
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile

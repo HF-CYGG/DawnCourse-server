@@ -24,10 +24,39 @@ interface SampleRow {
   sanitized_content: string;
 }
 
+/**
+ * 自动修复适用性判断：
+ * - 登录/验证码页面、非课表页面、以及没有明确脚本目标的问题，不应进入脚本自动修复流水线；
+ * - 返回空字符串表示允许自动修复，返回非空字符串表示应直接阻止并给出用户可读原因。
+ */
+export function getAutoRepairBlockedReason(
+  issue: Pick<IssueRow, "repair_domain" | "target_type"> | null | undefined
+): string {
+  if (!issue) return "问题不存在";
+  if (issue.target_type === "none") return "该失败类型不适合自动修脚本";
+  if (issue.repair_domain === "LOGIN_OR_CAPTCHA" || issue.repair_domain === "NON_TIMETABLE_PAGE") {
+    return "该失败类型不适合自动修脚本";
+  }
+  return "";
+}
+
 export async function startRepairJob(
   issueId: string,
   options: { actor?: string; bypassMinQueue?: boolean } = {}
-): Promise<{ jobId: string; started: boolean }> {
+): Promise<{ jobId: string; started: boolean; reason?: string }> {
+  const issue = await loadIssue(issueId);
+  const blockedReason = getAutoRepairBlockedReason(issue);
+  if (blockedReason) {
+    await addIssueEvent({
+      issueId,
+      stage: "ISSUE_MERGED",
+      level: "warning",
+      actor: options.actor || "system",
+      message: blockedReason
+    });
+    await setIssueStage(issueId, "ISSUE_MERGED", "repair blocked", blockedReason);
+    return { jobId: "", started: false, reason: blockedReason };
+  }
   const lock = await query("SELECT pg_try_advisory_lock(hashtext($1)) AS locked", [`repair:${issueId}`]);
   if (!lock.rows[0]?.locked) {
     await addIssueEvent({ issueId, stage: "SAMPLE_READY", level: "warning", message: "已有修复任务正在运行", actor: options.actor || "system" });
@@ -76,8 +105,9 @@ async function runRepairJob(issueId: string, jobId: string, options: { actor?: s
   try {
     const issue = await loadIssue(issueId);
     if (!issue) throw new Error("issue_not_found");
-    if (issue.target_type === "none" || issue.repair_domain === "LOGIN_OR_CAPTCHA" || issue.repair_domain === "NON_TIMETABLE_PAGE") {
-      await failJob(jobId, issueId, "该失败类型不适合自动修脚本");
+    const blockedReason = getAutoRepairBlockedReason(issue);
+    if (blockedReason) {
+      await failJob(jobId, issueId, blockedReason);
       return;
     }
     const runtime = await getRuntimePlatformConfig();

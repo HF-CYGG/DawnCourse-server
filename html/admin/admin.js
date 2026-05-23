@@ -425,7 +425,10 @@ function normalizeRepairIssueRecord(item) {
     ) || ""}`,
     affectedScriptId: `${pickDefinedValue(info.affectedScriptId, info.affected_script_id, lastAttempt.parserName) || ""}`,
     affectedVersion: Number(pickDefinedValue(info.affectedVersion, info.affected_version, lastAttempt.parserVersion) || 0),
+    repairDomain: `${pickDefinedValue(info.repairDomain, info.repair_domain) || ""}`,
+    targetType: `${pickDefinedValue(info.targetType, info.target_type) || ""}`,
     failureType: `${pickDefinedValue(info.failureType, info.failure_type) || "unknown"}`,
+    autoRepairBlockedReason: `${pickDefinedValue(info.autoRepairBlockedReason, info.auto_repair_blocked_reason) || ""}`,
     sampleCount: Number(pickDefinedValue(info.sampleCount, info.sample_count) || 0),
     userCount: Number(pickDefinedValue(info.userCount, info.user_count) || 0),
     priority: `${pickDefinedValue(info.priority) || "P2"}`,
@@ -453,6 +456,52 @@ function normalizeRepairIssueRecord(item) {
         : lastAttempt.schemaValid,
     lastAttempt
   };
+}
+
+function getAutoRepairBlockedReason(issue) {
+  const info = normalizeRepairIssueRecord(issue);
+  if ((info.autoRepairBlockedReason || "").trim()) return info.autoRepairBlockedReason.trim();
+  if ((info.targetType || "").trim() === "none") return "该失败类型不适合自动修脚本";
+  const repairDomain = (info.repairDomain || "").toUpperCase();
+  if (repairDomain === "LOGIN_OR_CAPTCHA" || repairDomain === "NON_TIMETABLE_PAGE") {
+    return "该失败类型不适合自动修脚本";
+  }
+  const failureType = (info.failureType || "").toLowerCase();
+  if (failureType === "login_or_captcha" || failureType === "non_timetable_page") {
+    return "该失败类型不适合自动修脚本";
+  }
+  return "";
+}
+
+function isAutoRepairBlockedIssue(issue) {
+  return Boolean(getAutoRepairBlockedReason(issue));
+}
+
+function buildBlockedRepairEntry(issue) {
+  const info = normalizeRepairIssueRecord(issue);
+  return {
+    stage: "ISSUE_MERGED",
+    level: "warning",
+    message: getAutoRepairBlockedReason(info) || "该失败类型不适合自动修脚本",
+    source: "repair-policy",
+    ts: Number(info.lastStepAt || info.updatedAt || info.lastSeenAt || Date.now()),
+    meta: {
+      failureType: info.failureType || "",
+      repairDomain: info.repairDomain || "",
+      targetType: info.targetType || "",
+      manualSuggestion: "请人工检查登录流程、跳转页面或样本来源是否正确。"
+    }
+  };
+}
+
+function filterRepairEntriesForIssue(issue, list) {
+  const items = (Array.isArray(list) ? list : []).map((item) => normalizeRepairTraceEntry(item));
+  if (!isAutoRepairBlockedIssue(issue)) return items;
+  const maxStageIndex = getRepairStageIndex("ISSUE_MERGED");
+  return items.filter((item) => {
+    const stageIndex = getRepairStageIndex(item?.stage || "");
+    return stageIndex < 0 || stageIndex <= maxStageIndex;
+  });
 }
 
 function normalizeRepairTraceMeta(meta) {
@@ -3496,6 +3545,20 @@ function buildRepairStatusSnapshot(name, entry, fallbackText) {
 }
 
 function collectRepairModelSnapshots(issue, timelineItems, logItems) {
+  const issueInfo = normalizeRepairIssueRecord(issue);
+  const blockedReason = getAutoRepairBlockedReason(issueInfo);
+  if (blockedReason) {
+    const metaText = [
+      `失败类型 ${formatFailureType(issueInfo.failureType || "unknown")}`,
+      `更新时间 ${formatTime(issueInfo.lastStepAt || issueInfo.updatedAt || 0)}`
+    ].join(" | ");
+    return [
+      { name: "模型 1：总结与修复指令", tone: "warning", badgeText: "不适用", detail: blockedReason, meta: metaText },
+      { name: "模型 2：候选脚本生成", tone: "warning", badgeText: "不适用", detail: "该问题不会进入候选脚本生成阶段。", meta: metaText },
+      { name: "候选验证：提交样本回放", tone: "warning", badgeText: "不适用", detail: "该问题不进入自动回放验证阶段。", meta: metaText },
+      { name: "发布状态：Pending / Publish / Rollback", tone: "warning", badgeText: "不适用", detail: "该问题不会进入自动修复发布链路。", meta: metaText }
+    ];
+  }
   const combined = []
     .concat((Array.isArray(timelineItems) ? timelineItems : []).map((item) => normalizeRepairTraceEntry(item)))
     .concat((Array.isArray(logItems) ? logItems : []).map((item) => normalizeRepairTraceEntry(item)))
@@ -3544,11 +3607,20 @@ function collectRepairModelSnapshots(issue, timelineItems, logItems) {
 }
 
 function collectRepairCurrentStepSnapshot(issue, timelineItems, logItems) {
+  const issueInfo = normalizeRepairIssueRecord(issue);
+  const blockedReason = getAutoRepairBlockedReason(issueInfo);
+  if (blockedReason) {
+    return buildRepairStatusSnapshot(
+      `当前步骤：${formatRepairStageLabel("ISSUE_MERGED")}`,
+      buildBlockedRepairEntry(issueInfo),
+      blockedReason
+    );
+  }
   const combined = []
     .concat((Array.isArray(timelineItems) ? timelineItems : []).map((item) => normalizeRepairTraceEntry(item)))
     .concat((Array.isArray(logItems) ? logItems : []).map((item) => normalizeRepairTraceEntry(item)))
     .sort((a, b) => Number(a?.ts || 0) - Number(b?.ts || 0));
-  const currentStage = normalizeRepairStageKey(issue?.currentStage || "");
+  const currentStage = normalizeRepairStageKey(issueInfo?.currentStage || "");
   const entry =
     getLatestRepairEntry(combined, (item) => normalizeRepairStageKey(item?.stage || "") === currentStage) ||
     combined[combined.length - 1] ||
@@ -3560,6 +3632,20 @@ function collectRepairCurrentStepSnapshot(issue, timelineItems, logItems) {
 
 function collectRepairFailureInsights(issue, timelineItems, logItems) {
   const issueInfo = normalizeRepairIssueRecord(issue);
+  const blockedReason = getAutoRepairBlockedReason(issueInfo);
+  if (blockedReason) {
+    return [
+      {
+        title: `最近状态：${blockedReason}`,
+        meta: [
+          `阶段 ${formatRepairOperationalStageLabel("ISSUE_MERGED") || "ISSUE_MERGED"}`,
+          `状态 ${getRepairStatusLabel(issueInfo?.status || "open")}`,
+          `最近步骤 ${formatTime(issueInfo?.lastStepAt || issueInfo?.updatedAt || 0)}`
+        ].join(" | "),
+        tone: "warning"
+      }
+    ];
+  }
   const list = [];
   const seen = new Set();
   const pushFailure = (title, meta, tone = "danger") => {
@@ -3789,13 +3875,14 @@ function updateRepairLogSummary(totalCount, filteredCount, query) {
 function renderRepairProgress(issue, timelineItems) {
   if (!repairIssueProgressSteps || !repairIssueProgressMetrics || !repairIssueProgressStageBadge) return;
   const info = normalizeRepairIssueRecord(issue);
-  const stage = normalizeRepairStageKey(info.currentStage || "");
+  const blockedReason = getAutoRepairBlockedReason(info);
+  const stage = blockedReason ? "ISSUE_MERGED" : normalizeRepairStageKey(info.currentStage || "");
   const stageIndex = getRepairStageIndex(stage);
   const normalizedStageIndex = stageIndex >= 0 ? stageIndex : 0;
   const lastStepAt = Number(info.lastStepAt || info.updatedAt || 0);
   const lastSeenAt = Number(info.lastSeenAt || info.updatedAt || 0);
 
-  const timelineList = (Array.isArray(timelineItems) ? timelineItems : []).map((item) => normalizeRepairTraceEntry(item));
+  const timelineList = filterRepairEntriesForIssue(info, timelineItems);
   const stageTimeMap = new Map();
   const stageEntryMap = new Map();
   for (const item of timelineList) {
@@ -3808,6 +3895,11 @@ function renderRepairProgress(issue, timelineItems) {
       stageEntryMap.set(key, item);
     }
   }
+  if (blockedReason && !stageEntryMap.has("ISSUE_MERGED")) {
+    const blockedEntry = buildBlockedRepairEntry(info);
+    stageTimeMap.set("ISSUE_MERGED", Number(blockedEntry.ts || lastStepAt || lastSeenAt || Date.now()));
+    stageEntryMap.set("ISSUE_MERGED", blockedEntry);
+  }
 
   const firstTs = timelineList.reduce((min, item) => {
     const ts = Number(item?.ts || 0);
@@ -3817,7 +3909,7 @@ function renderRepairProgress(issue, timelineItems) {
   const lastTs = timelineList.reduce((max, item) => Math.max(max, Number(item?.ts || 0)), 0);
   const durationText = firstTs && lastTs ? formatDuration(lastTs - firstTs) : "-";
 
-  const statusText = `${formatRepairOperationalStageLabel(info.currentStage || "") || info.currentStage || "-"} · ${
+  const statusText = `${formatRepairOperationalStageLabel(stage) || stage || "-"} · ${
     info.status || "open"
   }`;
   repairIssueProgressStageBadge.textContent = statusText;
@@ -3826,6 +3918,8 @@ function renderRepairProgress(issue, timelineItems) {
   const hasActiveError = ((activeStageEntry?.level || "").toString() || "").toLowerCase() === "error";
   if (["ACTIVE"].includes(stage)) {
     repairIssueProgressStageBadge.classList.add("success");
+  } else if (blockedReason) {
+    repairIssueProgressStageBadge.classList.add("warning");
   } else if (["PENDING_REVIEW", "CANARY", "ROLLED_BACK", "DISABLED"].includes(stage)) {
     repairIssueProgressStageBadge.classList.add("warning");
   } else if (hasActiveError) {
@@ -3839,7 +3933,9 @@ function renderRepairProgress(issue, timelineItems) {
     const currentDisplay = buildRepairTraceDisplay(currentEntry);
     const operationalTitle = resolveCurrentOperationalTitle(stage, currentEntry);
     repairIssueProgressStageBadge.textContent = `${operationalTitle} · ${info.status || "open"}`;
-    repairIssueProgressHint.textContent = currentDisplay.title
+    repairIssueProgressHint.textContent = blockedReason
+      ? `进度 ${percent}% · 修复耗时 ${durationText} · 当前动作：${blockedReason}`
+      : currentDisplay.title
       ? `进度 ${percent}% · 修复耗时 ${durationText} · 当前动作：${currentDisplay.title}`
       : `进度 ${percent}% · 修复耗时 ${durationText}`;
   }
@@ -3861,7 +3957,9 @@ function renderRepairProgress(issue, timelineItems) {
     if (idx === normalizedStageIndex) classes.push("active");
     if (idx === normalizedStageIndex && hasActiveError) classes.push("failed");
     const statusText =
-      idx < normalizedStageIndex
+      blockedReason && idx > normalizedStageIndex
+        ? "不适用"
+        : idx < normalizedStageIndex
         ? "已完成"
         : idx === normalizedStageIndex
           ? hasActiveError
@@ -3885,7 +3983,7 @@ function renderRepairProgress(issue, timelineItems) {
 
 function renderRepairTimelineList(list) {
   if (!repairIssueTimelineList) return;
-  const items = (Array.isArray(list) ? list : []).map((item) => normalizeRepairTraceEntry(item));
+  const items = filterRepairEntriesForIssue(repairIssueDetailCache?.issue || null, list);
   if (!items.length) {
     repairIssueTimelineList.innerHTML = `<div class="muted">暂无时间线</div>`;
     return;

@@ -15,7 +15,7 @@ import {
 } from "./adminContracts.js";
 import { query } from "./db.js";
 import { addIssueEvent, setIssueStage } from "./events.js";
-import { chatCompletionsUrl, runReplayOnly, startRepairJob } from "./repair.js";
+import { chatCompletionsUrl, getAutoRepairBlockedReason, runReplayOnly, startRepairJob } from "./repair.js";
 import { getAdminConfigPayload } from "./runtimeConfig.js";
 import { log } from "./log.js";
 import { limitString, id, sha256 } from "./utils.js";
@@ -352,22 +352,42 @@ export async function registerAdminRoutes(app: FastifyInstance, deps: AdminRoute
     return apiOk({ ...result, testedBy: request.adminUser || "admin" });
   });
 
-  app.post("/api/v1/admin/repair/issues/:id/retry", { preHandler: authRequiredFn }, async (request: AdminRequest) => {
+  app.post("/api/v1/admin/repair/issues/:id/retry", { preHandler: authRequiredFn }, async (request: AdminRequest, reply) => {
     const issueId = (request.params as { id: string }).id;
     const result = await startRepairJobFn(issueId, { actor: request.adminUser || "admin", bypassMinQueue: false });
+    if (!result.started && result.reason) {
+      const code = result.reason === "问题不存在" ? 404 : 409;
+      return reply.code(code).send(apiError(code, result.reason));
+    }
     return apiOk(result);
   });
 
-  app.post("/api/v1/admin/repair/issues/:id/force-repair", { preHandler: authRequiredFn }, async (request: AdminRequest) => {
+  app.post("/api/v1/admin/repair/issues/:id/force-repair", { preHandler: authRequiredFn }, async (request: AdminRequest, reply) => {
     const issueId = (request.params as { id: string }).id;
-    await addIssueEventFn({ issueId, stage: "SAMPLE_READY", actor: request.adminUser || "admin", source: "admin_force_repair", message: "管理员立即修复，忽略最小样本数限制" });
     const result = await startRepairJobFn(issueId, { actor: request.adminUser || "admin", bypassMinQueue: true });
+    if (!result.started && result.reason) {
+      const code = result.reason === "问题不存在" ? 404 : 409;
+      return reply.code(code).send(apiError(code, result.reason));
+    }
+    if (result.started) {
+      await addIssueEventFn({
+        issueId,
+        stage: "SAMPLE_READY",
+        actor: request.adminUser || "admin",
+        source: "admin_force_repair",
+        message: "管理员立即修复，忽略最小样本数限制"
+      });
+    }
     return apiOk(result);
   });
 
-  app.post("/api/v1/admin/repair/issues/:id/run", { preHandler: authRequiredFn }, async (request: AdminRequest) => {
+  app.post("/api/v1/admin/repair/issues/:id/run", { preHandler: authRequiredFn }, async (request: AdminRequest, reply) => {
     const issueId = (request.params as { id: string }).id;
     const result = await startRepairJobFn(issueId, { actor: request.adminUser || "admin", bypassMinQueue: true });
+    if (!result.started && result.reason) {
+      const code = result.reason === "问题不存在" ? 404 : 409;
+      return reply.code(code).send(apiError(code, result.reason));
+    }
     return apiOk(result);
   });
 
@@ -863,6 +883,15 @@ async function rollbackRelease(releaseId: string, actor: string): Promise<void> 
 }
 
 function formatIssue(row: Record<string, unknown>): Record<string, unknown> {
+  const blockedReason = getAutoRepairBlockedReason({
+    repair_domain: String(row.repair_domain || ""),
+    target_type: String(row.target_type || "") as any
+  });
+  const rawStage = String(row.current_stage || "");
+  const stageNeedsDowngrade =
+    blockedReason &&
+    !["", "REPORTED", "CLASSIFIED", "ISSUE_MERGED"].includes(rawStage);
+  const effectiveStage = stageNeedsDowngrade ? "ISSUE_MERGED" : rawStage;
   return {
     issueId: row.issue_id,
     schoolId: row.school_id,
@@ -875,11 +904,12 @@ function formatIssue(row: Record<string, unknown>): Record<string, unknown> {
     affectedVersion: row.affected_version,
     failureType: row.failure_type,
     status: row.status,
-    currentStage: row.current_stage,
+    currentStage: effectiveStage,
+    autoRepairBlockedReason: blockedReason || "",
     priority: row.priority,
     sampleCount: row.sample_count,
     userCount: row.user_count,
-    lastErrorMessage: row.last_error,
+    lastErrorMessage: blockedReason || row.last_error,
     lastResult: row.last_result,
     lastSeenAt: row.last_seen_at ? new Date(String(row.last_seen_at)).getTime() : 0,
     lastStepAt: row.last_step_at ? new Date(String(row.last_step_at)).getTime() : 0,

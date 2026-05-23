@@ -95,3 +95,46 @@ test("force-repair 路由会先记录事件，再忽略最小样本限制触发�
 
   await app.close();
 });
+
+test("force-repair 路由在修复被阻止时不应写入 SAMPLE_READY 事件", async () => {
+  const record = { runReplayOnly: [], startRepairJob: [], addIssueEvent: [] };
+  const app = await registerTestAdminApp(record);
+  await app.close();
+
+  const blockedApp = Fastify();
+  await registerAdminRoutes(blockedApp, {
+    ensureBuiltinAdminUser: async () => {},
+    authRequired: async (request) => {
+      request.adminUser = "tester";
+    },
+    startRepairJob: async (issueId, options) => {
+      record.startRepairJob.push({ issueId, options });
+      return {
+        jobId: "",
+        started: false,
+        reason: "该失败类型不适合自动修脚本"
+      };
+    },
+    addIssueEvent: async (event) => {
+      record.addIssueEvent.push(event);
+    }
+  });
+
+  const response = await blockedApp.inject({
+    method: "POST",
+    url: "/api/v1/admin/repair/issues/issue-blocked/force-repair"
+  });
+  assert.equal(response.statusCode, 409);
+  const body = response.json();
+  assert.equal(body.code, 409);
+  assert.match(body.msg, /不适合自动修脚本/);
+  assert.equal(record.addIssueEvent.length, 0);
+  assert.deepEqual(record.startRepairJob, [
+    {
+      issueId: "issue-blocked",
+      options: { actor: "tester", bypassMinQueue: true }
+    }
+  ]);
+
+  await blockedApp.close();
+});

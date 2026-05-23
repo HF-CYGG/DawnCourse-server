@@ -13,6 +13,7 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   IMAGE_NAME: dawncourse-server
   REGISTRY: ghcr.io
+  CHECKOUT_TOKEN: ${{ secrets.CHECKOUT_TOKEN != '' && secrets.CHECKOUT_TOKEN || secrets.GHCR_TOKEN != '' && secrets.GHCR_TOKEN || github.token }}
   GHCR_IMAGE: ghcr.io/hf-cygg/dawncourse-server
   GHCR_USERNAME: ${{ secrets.GHCR_USERNAME != '' && secrets.GHCR_USERNAME || github.actor }}
   GHCR_PASSWORD: ${{ secrets.GHCR_TOKEN != '' && secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
@@ -34,6 +35,11 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
+        with:
+          token: ${{ env.CHECKOUT_TOKEN }}
+          fetch-depth: 1
+          persist-credentials: true
+          submodules: false
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3

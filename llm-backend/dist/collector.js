@@ -183,7 +183,15 @@ export async function ingestParseReport(body, source) {
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
        ON CONFLICT (parse_session_id)
        DO UPDATE SET final_success = EXCLUDED.final_success, final_failure_type = EXCLUDED.final_failure_type,
-         repair_domain = EXCLUDED.repair_domain, updated_at = now()`, [
+        repair_domain = EXCLUDED.repair_domain,
+        school_name = CASE
+          WHEN trim(parse_sessions.school_name) = '' THEN EXCLUDED.school_name
+          WHEN lower(parse_sessions.school_name) = lower(parse_sessions.school_id) THEN EXCLUDED.school_name
+          WHEN lower(parse_sessions.school_name) = lower(parse_sessions.source_url_host) THEN EXCLUDED.school_name
+          WHEN trim(EXCLUDED.school_name) = '' THEN parse_sessions.school_name
+          ELSE parse_sessions.school_name
+        END,
+        updated_at = now()`, [
             parseSessionId,
             Number(session.appVersionCode || 0),
             String(session.appVersionName || ""),
@@ -227,10 +235,18 @@ export async function ingestParseReport(body, source) {
         });
         if (reused) {
             issueId = reused.issueId;
+            const existingIssue = await client.query("SELECT school_name, school_id, source_url_host FROM repair_issues WHERE issue_id = $1 FOR UPDATE", [issueId]);
+            const preferredSchoolName = resolvePreferredSchoolName({
+                currentSchoolName: String(existingIssue.rows[0]?.school_name || ""),
+                incomingSchoolName: schoolName,
+                schoolId: String(existingIssue.rows[0]?.school_id || schoolId),
+                sourceHost: String(existingIssue.rows[0]?.source_url_host || host)
+            });
             await client.query(`UPDATE repair_issues
          SET sample_count = sample_count + 1, user_count = GREATEST(user_count, 1),
+           school_name = $4,
            last_seen_at = now(), updated_at = now(), last_error = $2, failure_type = $3
-         WHERE issue_id = $1`, [issueId, resolution.reason, resolution.failureType]);
+         WHERE issue_id = $1`, [issueId, resolution.reason, resolution.failureType, preferredSchoolName]);
         }
         else {
             issueId = id("issue");
@@ -280,9 +296,24 @@ export async function ingestParseReport(body, source) {
     await addIssueEvent({ issueId, stage: "REPORTED", source, message: "收到失败上报", meta: { parseSessionId, repairDomain: resolution.repairDomain, targetType: resolution.targetType } });
     await addIssueEvent({ issueId, stage: "CLASSIFIED", source: "classifier", message: `失败分类：${resolution.repairDomain}`, meta: resolution });
     await addIssueEvent({ issueId, stage: "ISSUE_MERGED", source, message: "已归并到 Repair Issue", meta: { issueKey: resolution.issueKey, sampleId } });
-    if (sampleId)
+    const postIngestPolicy = resolvePostIngestPolicy({
+        hasSample: sampleId !== null,
+        shouldAutoRepair: resolution.shouldAutoRepair
+    });
+    if (postIngestPolicy.nextStage === "SAMPLE_READY") {
         await setIssueStage(issueId, "SAMPLE_READY", "sample ready");
-    const queued = resolution.shouldAutoRepair && sampleId !== null;
+    }
+    else if (sampleId && !resolution.shouldAutoRepair) {
+        await addIssueEvent({
+            issueId,
+            stage: "CLASSIFIED",
+            source: "collector",
+            level: "info",
+            message: "该问题已保存样本，但当前分类不进入自动修复",
+            meta: { repairDomain: resolution.repairDomain, targetType: resolution.targetType }
+        });
+    }
+    const queued = postIngestPolicy.queued;
     await triggerRepairIfReady({ issueId, queued, hasSample: sampleId !== null });
     return { issueId, repairDomain: resolution.repairDomain, targetType: resolution.targetType, queued };
 }
@@ -324,6 +355,39 @@ export function resolveIssueReuse(input) {
         return { issueId: issueKeyIssueId, reason: "issue_key" };
     }
     return null;
+}
+/**
+ * 失败上报落库后的阶段决策：
+ * - 只有“已保存样本 + 允许自动修复”才进入 SAMPLE_READY；
+ * - 非课表页/登录页等无需自动修复的问题保持 REPORTED，避免后台误显示为待修复。
+ */
+export function resolvePostIngestPolicy(input) {
+    if (input.hasSample && input.shouldAutoRepair) {
+        return { nextStage: "SAMPLE_READY", queued: true };
+    }
+    return { nextStage: "REPORTED", queued: false };
+}
+/**
+ * 学校名称择优规则：
+ * - 真实学校名优先于 host / schoolId 这类回退占位值；
+ * - 一旦已有真实学校名，后续空值或 host 不得覆盖。
+ */
+export function resolvePreferredSchoolName(input) {
+    const currentSchoolName = input.currentSchoolName.trim();
+    const incomingSchoolName = input.incomingSchoolName.trim();
+    const schoolId = input.schoolId.trim().toLowerCase();
+    const sourceHost = input.sourceHost.trim().toLowerCase();
+    if (!incomingSchoolName)
+        return currentSchoolName;
+    const currentLower = currentSchoolName.toLowerCase();
+    const currentIsFallback = !currentSchoolName || currentLower === schoolId || currentLower === sourceHost;
+    const incomingLower = incomingSchoolName.toLowerCase();
+    const incomingIsFallback = incomingLower === schoolId || incomingLower === sourceHost;
+    if (currentIsFallback && !incomingIsFallback)
+        return incomingSchoolName;
+    if (!currentSchoolName)
+        return incomingSchoolName;
+    return currentSchoolName;
 }
 function normalizeAttemptList(value) {
     if (Array.isArray(value))

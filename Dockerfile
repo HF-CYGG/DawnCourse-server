@@ -1,4 +1,13 @@
-FROM node:20-alpine AS backend-build
+#
+# 文件说明：Dawn Course 服务端容器镜像构建文件。
+# 实现逻辑：
+# 1. 第一阶段构建 llm-backend 的 TypeScript 产物与生产依赖；
+# 2. 第二阶段基于 nginx 运行静态管理后台、反向代理与后端服务；
+# 3. 默认通过可配置镜像前缀拉取官方基础镜像，避免阿里云 ACR 源码构建直接访问 Docker Hub 时命中匿名限流。
+#
+ARG DOCKER_HUB_MIRROR=m.daocloud.io/docker.io/library
+
+FROM ${DOCKER_HUB_MIRROR}/node:20-alpine AS backend-build
 ARG NPM_REGISTRY=https://registry.npmjs.org/
 WORKDIR /app/llm-backend
 COPY ./llm-backend/package.json ./llm-backend/package-lock.json ./
@@ -7,7 +16,7 @@ COPY ./llm-backend/tsconfig.json ./
 COPY ./llm-backend/src ./src
 RUN npm run build && npm prune --omit=dev
 
-FROM nginx:alpine
+FROM ${DOCKER_HUB_MIRROR}/nginx:alpine
 ARG NPM_REGISTRY=https://registry.npmjs.org/
 RUN apk add --no-cache nodejs npm redis postgresql postgresql-client
 WORKDIR /app

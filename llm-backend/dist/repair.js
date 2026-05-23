@@ -2,6 +2,7 @@ import { config } from "./config.js";
 import { query } from "./db.js";
 import { addIssueEvent, setIssueStage } from "./events.js";
 import { getActiveScriptContent, createPendingRelease } from "./registry.js";
+import { describeScriptRepairWorkflow, formatScriptRepairWorkflowLabel, resolveScriptRepairWorkflow } from "./repairWorkflow.js";
 import { runScript } from "./runnerClient.js";
 import { getRuntimeModelConfig, getRuntimePlatformConfig } from "./runtimeConfig.js";
 import { id, limitString, scriptId } from "./utils.js";
@@ -179,13 +180,23 @@ async function generateCandidate(issue, oldScript, sample, diagnosis) {
     if (!cfg.apiKey || !cfg.model) {
         return { script: "", summary: "model not configured", error: "script_repair_model_not_configured" };
     }
-    const contract = issue.target_type === "parser"
-        ? "The script must expose scheduleHtmlParser(content) and return a non-empty array of courses with dayOfWeek/startSection/duration/startWeek/endWeek."
-        : "The script must expose a function suitable for navigation or term extraction and return a structured non-empty object/array.";
+    const workflow = resolveScriptRepairWorkflow({
+        repairDomain: issue.repair_domain,
+        targetType: issue.target_type,
+        category: issue.affected_category
+    });
+    const contract = workflow === "manual_capture"
+        ? "This is a manual fixed-page timetable parser. Do not add login, redirect, captcha or page navigation logic. The script must expose scheduleHtmlParser(content) and return a non-empty array of courses with dayOfWeek/startSection/duration/startWeek/endWeek."
+        : "This is an automatic flow helper script. It may need to support auto login, page navigation, term extraction, timetable detection or structured extraction. Return a structured non-empty object/array that matches the target type.";
+    const workflowPrompt = [
+        `Repair workflow: ${formatScriptRepairWorkflowLabel(workflow)}`,
+        `Workflow description: ${describeScriptRepairWorkflow(workflow)}`
+    ].join("\n");
     const prompt = [
         "You repair JavaScript parser/provider scripts for an Android course app.",
         "Return strict JSON with keys: diagnosis, patchSummary, proposedScript.",
         "Do not include markdown.",
+        workflowPrompt,
         contract,
         `Issue: ${diagnosis}`,
         `Target type: ${issue.target_type}`,

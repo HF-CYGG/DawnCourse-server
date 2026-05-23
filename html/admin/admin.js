@@ -344,6 +344,11 @@ function normalizeScriptMeta(meta, fallback = {}) {
   return {
     ...info,
     scriptName: `${pickDefinedValue(info.scriptName, info.script_name, fallback.scriptName, fallback.script_name) || ""}`,
+    targetType: `${pickDefinedValue(info.targetType, info.target_type, fallback.targetType, fallback.target_type) || ""}`,
+    category: `${pickDefinedValue(info.category, fallback.category) || ""}`,
+    scriptRepairWorkflow: `${pickDefinedValue(info.scriptRepairWorkflow, info.script_repair_workflow, fallback.scriptRepairWorkflow, fallback.script_repair_workflow) || ""}`,
+    scriptRepairWorkflowLabel: `${pickDefinedValue(info.scriptRepairWorkflowLabel, info.script_repair_workflow_label, fallback.scriptRepairWorkflowLabel, fallback.script_repair_workflow_label) || ""}`,
+    scriptRepairWorkflowDescription: `${pickDefinedValue(info.scriptRepairWorkflowDescription, info.script_repair_workflow_description, fallback.scriptRepairWorkflowDescription, fallback.script_repair_workflow_description) || ""}`,
     version: Number(pickDefinedValue(info.version, fallback.version, fallback.scriptVersion, fallback.script_version) || 0),
     parentVersion: Number(
       pickDefinedValue(info.parentVersion, info.parent_version, fallback.parentVersion, fallback.parent_version) || 0
@@ -361,10 +366,28 @@ function normalizeScriptMeta(meta, fallback = {}) {
 function normalizeScriptListItem(item) {
   const info = item && typeof item === "object" ? item : {};
   const meta = normalizeScriptMeta(info.meta || info.scriptMeta || info.script_meta || {}, info);
+  const workflow = resolveScriptRepairWorkflow({
+    scriptRepairWorkflow: pickDefinedValue(info.scriptRepairWorkflow, info.script_repair_workflow, meta.scriptRepairWorkflow),
+    targetType: pickDefinedValue(info.targetType, info.target_type, meta.targetType),
+    category: pickDefinedValue(info.category, meta.category)
+  });
   return {
     ...info,
     scriptName: `${pickDefinedValue(info.scriptName, info.script_name, meta.scriptName) || ""}`,
     meta,
+    targetType: `${pickDefinedValue(info.targetType, info.target_type, meta.targetType) || ""}`,
+    category: `${pickDefinedValue(info.category, meta.category) || ""}`,
+    scriptRepairWorkflow: workflow,
+    scriptRepairWorkflowLabel: `${pickDefinedValue(
+      info.scriptRepairWorkflowLabel,
+      info.script_repair_workflow_label,
+      meta.scriptRepairWorkflowLabel
+    ) || formatScriptRepairWorkflowLabel(workflow)}`,
+    scriptRepairWorkflowDescription: `${pickDefinedValue(
+      info.scriptRepairWorkflowDescription,
+      info.script_repair_workflow_description,
+      meta.scriptRepairWorkflowDescription
+    ) || describeScriptRepairWorkflow(workflow)}`,
     pendingAvailable: pickDefinedValue(info.pendingAvailable, info.pending_available, false) === true,
     rollbackAvailable: pickDefinedValue(info.rollbackAvailable, info.rollback_available, false) === true,
     rollbackTargetVersion: Number(
@@ -411,6 +434,12 @@ function normalizeParserAttemptRecord(item) {
 function normalizeRepairIssueRecord(item) {
   const info = item && typeof item === "object" ? item : {};
   const lastAttempt = normalizeParserAttemptRecord(info.lastAttempt || info.last_attempt || {});
+  const workflow = resolveScriptRepairWorkflow({
+    scriptRepairWorkflow: pickDefinedValue(info.scriptRepairWorkflow, info.script_repair_workflow),
+    repairDomain: pickDefinedValue(info.repairDomain, info.repair_domain),
+    targetType: pickDefinedValue(info.targetType, info.target_type),
+    category: pickDefinedValue(info.category, info.affectedCategory, info.affected_category)
+  });
   return {
     ...info,
     issueId: `${pickDefinedValue(info.issueId, info.issue_id) || ""}`,
@@ -427,6 +456,9 @@ function normalizeRepairIssueRecord(item) {
     affectedVersion: Number(pickDefinedValue(info.affectedVersion, info.affected_version, lastAttempt.parserVersion) || 0),
     repairDomain: `${pickDefinedValue(info.repairDomain, info.repair_domain) || ""}`,
     targetType: `${pickDefinedValue(info.targetType, info.target_type) || ""}`,
+    scriptRepairWorkflow: workflow,
+    scriptRepairWorkflowLabel: `${pickDefinedValue(info.scriptRepairWorkflowLabel, info.script_repair_workflow_label) || formatScriptRepairWorkflowLabel(workflow)}`,
+    scriptRepairWorkflowDescription: `${pickDefinedValue(info.scriptRepairWorkflowDescription, info.script_repair_workflow_description) || describeScriptRepairWorkflow(workflow)}`,
     failureType: `${pickDefinedValue(info.failureType, info.failure_type) || "unknown"}`,
     autoRepairBlockedReason: `${pickDefinedValue(info.autoRepairBlockedReason, info.auto_repair_blocked_reason) || ""}`,
     sampleCount: Number(pickDefinedValue(info.sampleCount, info.sample_count) || 0),
@@ -455,6 +487,87 @@ function normalizeRepairIssueRecord(item) {
         ? pickDefinedValue(info.lastSchemaValid, info.last_schema_valid)
         : lastAttempt.schemaValid,
     lastAttempt
+  };
+}
+
+/**
+ * 修复工作流统一归类：
+ * - manual_capture：固定页面课表抓取；
+ * - auto_flow：自动登录/跳转/识别链路；
+ * - not_applicable：不进入脚本修复。
+ */
+function resolveScriptRepairWorkflow(input) {
+  const info = input && typeof input === "object" ? input : {};
+  const explicit = `${pickDefinedValue(info.scriptRepairWorkflow, info.script_repair_workflow) || ""}`.trim();
+  if (explicit) return explicit;
+  const targetType = `${pickDefinedValue(info.targetType, info.target_type) || ""}`.trim().toLowerCase();
+  const category = `${pickDefinedValue(info.category, info.affectedCategory, info.affected_category) || ""}`.trim().toLowerCase();
+  const repairDomain = `${pickDefinedValue(info.repairDomain, info.repair_domain) || ""}`.trim().toUpperCase();
+  if (targetType === "none" || repairDomain === "LOGIN_OR_CAPTCHA" || repairDomain === "NON_TIMETABLE_PAGE") {
+    return "not_applicable";
+  }
+  if (targetType === "parser") return "manual_capture";
+  if (targetType === "navigation" || targetType === "term_extractor" || targetType === "cloud_parse" || category === "js") {
+    return "auto_flow";
+  }
+  return "manual_capture";
+}
+
+function formatScriptRepairWorkflowLabel(workflow) {
+  if (workflow === "manual_capture") return "手动网页抓取脚本";
+  if (workflow === "auto_flow") return "自动测试链路脚本";
+  return "不进入脚本修复";
+}
+
+function describeScriptRepairWorkflow(workflow) {
+  if (workflow === "manual_capture") {
+    return "只处理固定页面中的课表识别与提取，不负责自动登录和跳转。";
+  }
+  if (workflow === "auto_flow") {
+    return "处理自动登录、页面跳转、学期定位、课表识别与提取的完整自动链路。";
+  }
+  return "当前问题不会进入脚本自动修复与发布链路。";
+}
+
+function getScriptRepairWorkflowTone(workflow) {
+  if (workflow === "auto_flow") return "success";
+  if (workflow === "manual_capture") return "warning";
+  return "";
+}
+
+function getScriptRepairWorkflowPresentation(issue) {
+  const info = normalizeRepairIssueRecord(issue);
+  const workflow = info.scriptRepairWorkflow || resolveScriptRepairWorkflow(info);
+  if (workflow === "auto_flow") {
+    return {
+      workflow,
+      label: formatScriptRepairWorkflowLabel(workflow),
+      description: describeScriptRepairWorkflow(workflow),
+      model1Title: "模型 1：自动测试链路总结与修复指令",
+      model2Title: "模型 2：自动测试链路脚本生成",
+      verifyTitle: "候选验证：自动登录/跳转/识别回放",
+      releaseTitle: "发布状态：自动测试脚本发布"
+    };
+  }
+  if (workflow === "manual_capture") {
+    return {
+      workflow,
+      label: formatScriptRepairWorkflowLabel(workflow),
+      description: describeScriptRepairWorkflow(workflow),
+      model1Title: "模型 1：固定页面课表问题总结",
+      model2Title: "模型 2：固定页面课表脚本生成",
+      verifyTitle: "候选验证：固定页面课表回放",
+      releaseTitle: "发布状态：手动抓取脚本发布"
+    };
+  }
+  return {
+    workflow,
+    label: formatScriptRepairWorkflowLabel(workflow),
+    description: describeScriptRepairWorkflow(workflow),
+    model1Title: "模型 1：问题总结",
+    model2Title: "模型 2：脚本生成",
+    verifyTitle: "候选验证",
+    releaseTitle: "发布状态"
   };
 }
 
@@ -1982,20 +2095,24 @@ function renderScriptReleaseGuide(list) {
   if (!scriptReleaseGuide || !scriptReleaseMeta) return;
   const items = (Array.isArray(list) ? list : []).map((item) => normalizeScriptListItem(item));
   const stageCount = { active: 0, canary: 0, pending: 0, rollback: 0, unknown: 0 };
+  const workflowCount = { auto_flow: 0, manual_capture: 0, not_applicable: 0 };
   let pendingExpired = 0;
   let rollbackMissing = 0;
   let failureFocus = null;
   for (const item of items) {
     const stage = (item?.meta?.releaseStage || "unknown").toString();
     stageCount[stage] = (stageCount[stage] || 0) + 1;
+    workflowCount[item?.scriptRepairWorkflow || "manual_capture"] = (workflowCount[item?.scriptRepairWorkflow || "manual_capture"] || 0) + 1;
     if (stage === "pending" && !item?.pendingAvailable) pendingExpired += 1;
     if (Number(item?.meta?.parentVersion || 0) > 0 && !item?.rollbackAvailable) rollbackMissing += 1;
     if (!failureFocus || Number(item?.recentFailureCount || 0) > Number(failureFocus?.recentFailureCount || 0)) {
       failureFocus = item;
     }
   }
-  const title = `发布路径：候选脚本先进入待发布，再选择灰度发布或全量发布；回滚依赖父版本备份`;
+  const title = `发布路径已按“自动测试链路脚本 / 手动网页抓取脚本”拆分展示，避免混用验证口径`;
   const sub = [
+    `自动测试链路 ${formatCount(workflowCount.auto_flow || 0)} 个`,
+    `手动网页抓取 ${formatCount(workflowCount.manual_capture || 0)} 个`,
     `当前生效 ${formatCount(stageCount.active || 0)} 个`,
     `灰度发布 ${formatCount(stageCount.canary || 0)} 个`,
     `待发布 ${formatCount(stageCount.pending || 0)} 个`,
@@ -2009,12 +2126,14 @@ function renderScriptReleaseGuide(list) {
       <div class="overview-banner-sub">${escapeHtml(sub.join(" | "))}</div>
     </div>
     <div class="overview-banner-tags">
+      <span class="badge success">自动测试链路 ${escapeHtml(formatCount(workflowCount.auto_flow || 0))}</span>
+      <span class="badge warning">手动网页抓取 ${escapeHtml(formatCount(workflowCount.manual_capture || 0))}</span>
       <span class="badge warning">待发布过期 ${escapeHtml(formatCount(pendingExpired))}</span>
       <span class="badge danger">缺失回滚备份 ${escapeHtml(formatCount(rollbackMissing))}</span>
       <span class="badge">查看详情可切换历史事件与脚本内容</span>
     </div>
   `;
-  scriptReleaseMeta.textContent = `共 ${formatCount(items.length)} 个脚本。优先处理“待发布已过期”与“缺失回滚备份”的脚本，再决定灰度或全量发布。`;
+  scriptReleaseMeta.textContent = `共 ${formatCount(items.length)} 个脚本。发布时请先区分自动测试链路脚本与手动网页抓取脚本，再分别评估验证结果、上线窗口与回滚路径。`;
 }
 function renderRuntimeLogSummary(payload) {
   if (!runtimeLogSummaryCards || !runtimeLogCallout) return;
@@ -2811,16 +2930,20 @@ function renderScriptCards(list) {
   if (!scriptSummaryCards) return;
   const items = (Array.isArray(list) ? list : []).map((item) => normalizeScriptListItem(item));
   const countByStage = { active: 0, canary: 0, pending: 0, rollback: 0, unknown: 0 };
+  const workflowCount = { auto_flow: 0, manual_capture: 0, not_applicable: 0 };
   let pendingMissing = 0;
   let rollbackMissing = 0;
   for (const item of items) {
     const stage = (item?.meta?.releaseStage || "unknown").toString();
     countByStage[stage] = (countByStage[stage] || 0) + 1;
+    workflowCount[item?.scriptRepairWorkflow || "manual_capture"] = (workflowCount[item?.scriptRepairWorkflow || "manual_capture"] || 0) + 1;
     if (stage === "pending" && !item?.pendingAvailable) pendingMissing += 1;
     if (item?.meta?.parentVersion && !item?.rollbackAvailable) rollbackMissing += 1;
   }
   const cards = [
     { title: "脚本总数", value: formatCount(items.length), sub: "当前脚本输出目录中的脚本数", tone: "primary" },
+    { title: "自动测试链路", value: formatCount(workflowCount.auto_flow), sub: "自动登录 / 跳转 / 识别 / 提取", tone: "primary" },
+    { title: "手动网页抓取", value: formatCount(workflowCount.manual_capture), sub: "固定页面课表解析", tone: "warning" },
     { title: "当前生效", value: formatCount(countByStage.active), sub: "已全量生效", tone: "primary" },
     { title: "灰度发布", value: formatCount(countByStage.canary), sub: "正在逐步放量", tone: "" },
     { title: "待发布", value: formatCount(countByStage.pending), sub: `过期 ${formatCount(pendingMissing)} 个`, tone: "warning" },
@@ -2846,6 +2969,8 @@ function renderScriptsTable(list) {
     .map((item) => {
       const meta = item.meta || {};
       const stage = meta.releaseStage || "unknown";
+      const workflowLabel = item.scriptRepairWorkflowLabel || formatScriptRepairWorkflowLabel(item.scriptRepairWorkflow);
+      const workflowDesc = item.scriptRepairWorkflowDescription || describeScriptRepairWorkflow(item.scriptRepairWorkflow);
       const v = Number(meta.version || 0);
       const pv = Number(meta.parentVersion || 0);
       const failCount = Number(item.recentFailureCount || 0);
@@ -2864,12 +2989,12 @@ function renderScriptsTable(list) {
               <span class="cell-main">${escapeHtml(item.scriptName || "-")}</span>
               ${failBadge}
             </div>
-            <div class="cell-sub">当前阶段：${escapeHtml(formatReleaseStageText(stage))}</div>
+            <div class="cell-sub">当前阶段：${escapeHtml(formatReleaseStageText(stage))} | ${escapeHtml(workflowLabel)}</div>
           </td>
           <td>${stageBadge(stage)}<div class="cell-sub">线上状态标签</div></td>
           <td>${buildInfoLine(`v${v}`, "当前脚本版本")}</td>
           <td>${buildInfoLine(pv > 0 ? `v${pv}` : "-", pv > 0 ? "回滚目标父版本" : "尚未形成父版本")}</td>
-          <td>${pendingBadge}<div class="cell-sub">${escapeHtml(pendingStatus.sub)}</div></td>
+          <td>${pendingBadge}<div class="cell-sub">${escapeHtml(workflowDesc)}</div></td>
           <td>${rollbackBadge}<div class="cell-sub">${escapeHtml(rollbackStatus.sub)}</div></td>
           <td>${buildInfoLine(formatTime(meta.updatedAt), "最近更新时间")}</td>
           <td>${buildInfoLine(meta.appliedBy || "-", "最近操作人")}</td>
@@ -3121,14 +3246,18 @@ function buildRepairIssueListMeta(list) {
     .slice(0, 4)
     .map(([status, count]) => `${getRepairStatusLabel(status)} ${count}`)
     .join(" | ");
-  return `共 ${items.length} 条 | ${summary || "暂无状态分布"} | 最后刷新 ${formatTime(Date.now())}`;
+  const autoFlowCount = items.filter((item) => item.scriptRepairWorkflow === "auto_flow").length;
+  const manualCount = items.filter((item) => item.scriptRepairWorkflow === "manual_capture").length;
+  return `共 ${items.length} 条 | 自动测试链路 ${autoFlowCount} | 手动网页抓取 ${manualCount} | ${summary || "暂无状态分布"} | 最后刷新 ${formatTime(Date.now())}`;
 }
 
 function buildRepairStateBadges(issue) {
   const info = issue || {};
+  const workflow = getScriptRepairWorkflowPresentation(info);
   const badges = [
     `<span class="badge ${getRepairStatusTone(info.status)}">${escapeHtml(getRepairStatusLabel(info.status))}</span>`,
-    `<span class="badge">${escapeHtml(formatRepairOperationalStageLabel(info.currentStage) || info.currentStage || "-")}</span>`
+    `<span class="badge">${escapeHtml(formatRepairOperationalStageLabel(info.currentStage) || info.currentStage || "-")}</span>`,
+    `<span class="badge ${getScriptRepairWorkflowTone(info.scriptRepairWorkflow)}">${escapeHtml(workflow.label)}</span>`
   ];
   if ((info.lastReplayStatus || "").toString()) {
     badges.push(
@@ -3160,6 +3289,7 @@ function renderRepairIssuesTable(list) {
       const selectedClass = issueId && issueId === activeRepairIssueId ? "selected-row" : "";
       const errorText = (item?.lastErrorMessage || "").toString().trim();
       const sourceText = item.lastScriptSource ? `脚本来源 ${formatScriptSourceLabel(item.lastScriptSource)}` : "脚本来源未知";
+      const workflowInfo = getScriptRepairWorkflowPresentation(item);
       const contextText = [item.lastStatusCode ? `HTTP ${item.lastStatusCode}` : "", item.lastErrorCode ? `错误码 ${item.lastErrorCode}` : "", item.lastDurationMs ? `${item.lastDurationMs}ms` : ""]
         .filter(Boolean)
         .join(" | ");
@@ -3173,7 +3303,7 @@ function renderRepairIssuesTable(list) {
           <td>${escapeHtml(formatSystemType(item.schoolSystemType || "unknown"))}</td>
           <td>
             <div class="log-main-text">${escapeHtml(item.affectedScriptId || "-")}</div>
-            <div class="log-sub-text">v${escapeHtml(item.affectedVersion || 0)} | ${escapeHtml(sourceText)}</div>
+            <div class="log-sub-text">v${escapeHtml(item.affectedVersion || 0)} | ${escapeHtml(workflowInfo.label)} | ${escapeHtml(sourceText)}</div>
           </td>
           <td>${escapeHtml(item.affectedVersion || 0)}</td>
           <td>
@@ -3201,10 +3331,12 @@ function renderRepairIssuesTable(list) {
 
 function formatRepairIssueMeta(issue) {
   const info = normalizeRepairIssueRecord(issue);
+  const workflow = getScriptRepairWorkflowPresentation(info);
   return [
     `问题编号：${info.issueId || "-"}`,
     `状态：${getRepairStatusLabel(info.status || "open")}`,
     `当前阶段：${formatRepairOperationalStageLabel(info.currentStage) || info.currentStage || "-"}`,
+    `修复链路：${workflow.label}`,
     `学校：${info.schoolName || info.schoolId || "-"}`,
     `脚本：${info.affectedScriptId || "-"} / v${Number(info.affectedVersion || 0)}`,
     `最近步骤：${formatTime(info.lastStepAt || info.updatedAt || 0)}`,
@@ -3546,6 +3678,7 @@ function buildRepairStatusSnapshot(name, entry, fallbackText) {
 
 function collectRepairModelSnapshots(issue, timelineItems, logItems) {
   const issueInfo = normalizeRepairIssueRecord(issue);
+  const workflowInfo = getScriptRepairWorkflowPresentation(issueInfo);
   const blockedReason = getAutoRepairBlockedReason(issueInfo);
   if (blockedReason) {
     const metaText = [
@@ -3553,10 +3686,10 @@ function collectRepairModelSnapshots(issue, timelineItems, logItems) {
       `更新时间 ${formatTime(issueInfo.lastStepAt || issueInfo.updatedAt || 0)}`
     ].join(" | ");
     return [
-      { name: "模型 1：总结与修复指令", tone: "warning", badgeText: "不适用", detail: blockedReason, meta: metaText },
-      { name: "模型 2：候选脚本生成", tone: "warning", badgeText: "不适用", detail: "该问题不会进入候选脚本生成阶段。", meta: metaText },
-      { name: "候选验证：提交样本回放", tone: "warning", badgeText: "不适用", detail: "该问题不进入自动回放验证阶段。", meta: metaText },
-      { name: "发布状态：Pending / Publish / Rollback", tone: "warning", badgeText: "不适用", detail: "该问题不会进入自动修复发布链路。", meta: metaText }
+      { name: workflowInfo.model1Title, tone: "warning", badgeText: "不适用", detail: blockedReason, meta: metaText },
+      { name: workflowInfo.model2Title, tone: "warning", badgeText: "不适用", detail: "该问题不会进入候选脚本生成阶段。", meta: metaText },
+      { name: workflowInfo.verifyTitle, tone: "warning", badgeText: "不适用", detail: "该问题不进入自动回放验证阶段。", meta: metaText },
+      { name: workflowInfo.releaseTitle, tone: "warning", badgeText: "不适用", detail: "该问题不会进入自动修复发布链路。", meta: metaText }
     ];
   }
   const combined = []
@@ -3599,10 +3732,10 @@ function collectRepairModelSnapshots(issue, timelineItems, logItems) {
     ? "当前问题已结束，等待查看最终发布结果。"
     : "候选脚本尚未进入待发布或正式发布阶段。";
   return [
-    buildRepairStatusSnapshot("模型 1：总结与修复指令", summaryEntry, summaryFallback),
-    buildRepairStatusSnapshot("模型 2：候选脚本生成", scriptEntry, scriptFallback),
-    buildRepairStatusSnapshot("候选验证：提交样本回放", verifyEntry, verifyFallback),
-    buildRepairStatusSnapshot("发布状态：Pending / Publish / Rollback", releaseEntry, releaseFallback)
+    buildRepairStatusSnapshot(workflowInfo.model1Title, summaryEntry, summaryFallback),
+    buildRepairStatusSnapshot(workflowInfo.model2Title, scriptEntry, scriptFallback),
+    buildRepairStatusSnapshot(workflowInfo.verifyTitle, verifyEntry, verifyFallback),
+    buildRepairStatusSnapshot(workflowInfo.releaseTitle, releaseEntry, releaseFallback)
   ];
 }
 
@@ -3699,6 +3832,7 @@ function collectRepairFailureInsights(issue, timelineItems, logItems) {
 function renderRepairOverview(detail, timelineItems, logItems) {
   if (!repairIssueOverviewGrid) return;
   const issue = normalizeRepairIssueRecord(detail?.issue || {});
+  const workflowInfo = getScriptRepairWorkflowPresentation(issue);
   const modelSnapshots = collectRepairModelSnapshots(issue, timelineItems, logItems);
   const currentStepSnapshot = collectRepairCurrentStepSnapshot(issue, timelineItems, logItems);
   const failureItems = collectRepairFailureInsights(issue, timelineItems, logItems);
@@ -3706,6 +3840,8 @@ function renderRepairOverview(detail, timelineItems, logItems) {
   const contextHtml = [
     ["学校", issue.schoolName || issue.schoolId || "-"],
     ["教务系统", formatSystemType(issue.schoolSystemType || "unknown")],
+    ["修复链路", workflowInfo.label],
+    ["功能边界", workflowInfo.description],
     ["脚本", issue.affectedScriptId || "-"],
     ["脚本版本", `v${Number(issue.affectedVersion || 0)}`],
     ["失败类型", formatFailureType(issue.failureType || "unknown")],

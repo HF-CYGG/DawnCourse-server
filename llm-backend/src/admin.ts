@@ -15,6 +15,7 @@ import {
 } from "./adminContracts.js";
 import { query } from "./db.js";
 import { addIssueEvent, setIssueStage } from "./events.js";
+import { describeScriptRepairWorkflow, formatScriptRepairWorkflowLabel, resolveScriptRepairWorkflow } from "./repairWorkflow.js";
 import { chatCompletionsUrl, getAutoRepairBlockedReason, runReplayOnly, startRepairJob } from "./repair.js";
 import { getAdminConfigPayload } from "./runtimeConfig.js";
 import { log } from "./log.js";
@@ -887,6 +888,11 @@ function formatIssue(row: Record<string, unknown>): Record<string, unknown> {
     repair_domain: String(row.repair_domain || ""),
     target_type: String(row.target_type || "") as any
   });
+  const repairWorkflow = resolveScriptRepairWorkflow({
+    repairDomain: String(row.repair_domain || ""),
+    targetType: String(row.target_type || ""),
+    category: String(row.affected_category || "")
+  });
   const rawStage = String(row.current_stage || "");
   const stageNeedsDowngrade =
     blockedReason &&
@@ -900,6 +906,9 @@ function formatIssue(row: Record<string, unknown>): Record<string, unknown> {
     sourceUrlHost: row.source_url_host,
     repairDomain: row.repair_domain,
     targetType: row.target_type,
+    scriptRepairWorkflow: repairWorkflow,
+    scriptRepairWorkflowLabel: formatScriptRepairWorkflowLabel(repairWorkflow),
+    scriptRepairWorkflowDescription: describeScriptRepairWorkflow(repairWorkflow),
     affectedScriptId: row.affected_script_name || row.affected_script_id,
     affectedVersion: row.affected_version,
     failureType: row.failure_type,
@@ -935,11 +944,18 @@ function formatEvent(row: Record<string, unknown>): Record<string, unknown> {
 }
 
 function formatRelease(row: Record<string, unknown>): Record<string, unknown> {
+  const repairWorkflow = resolveScriptRepairWorkflow({
+    targetType: String(row.target_type || ""),
+    category: String(row.category || "")
+  });
   return {
     releaseId: row.release_id,
     scriptId: row.script_id,
     targetType: row.target_type,
     category: row.category,
+    scriptRepairWorkflow: repairWorkflow,
+    scriptRepairWorkflowLabel: formatScriptRepairWorkflowLabel(repairWorkflow),
+    scriptRepairWorkflowDescription: describeScriptRepairWorkflow(repairWorkflow),
     name: row.name,
     version: row.version,
     releaseStage: row.release_stage,

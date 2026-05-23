@@ -25,7 +25,7 @@ test("有样本但无需自动修复时保持 REPORTED，不进入 SAMPLE_READY"
   });
 
   assert.deepEqual(result, {
-    nextStage: "REPORTED",
+    nextStage: "ISSUE_MERGED",
     queued: false
   });
 });
@@ -37,7 +37,7 @@ test("没有样本时不排队且保持 REPORTED", () => {
   });
 
   assert.deepEqual(result, {
-    nextStage: "REPORTED",
+    nextStage: "ISSUE_MERGED",
     queued: false
   });
 });

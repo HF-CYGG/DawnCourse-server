@@ -383,9 +383,8 @@ export async function ingestParseReport(body: ParseReportInput, source: string):
     hasSample: sampleId !== null,
     shouldAutoRepair: resolution.shouldAutoRepair
   });
-  if (postIngestPolicy.nextStage === "SAMPLE_READY") {
-    await setIssueStage(issueId, "SAMPLE_READY", "sample ready");
-  } else if (sampleId && !resolution.shouldAutoRepair) {
+  await setIssueStage(issueId, postIngestPolicy.nextStage, postIngestPolicy.nextStage === "SAMPLE_READY" ? "sample ready" : "issue merged");
+  if (sampleId && !resolution.shouldAutoRepair) {
     await addIssueEvent({
       issueId,
       stage: "CLASSIFIED",
@@ -450,16 +449,16 @@ export function resolveIssueReuse(input: { sessionIssueId: string; issueKeyIssue
 /**
  * 失败上报落库后的阶段决策：
  * - 只有“已保存样本 + 允许自动修复”才进入 SAMPLE_READY；
- * - 非课表页/登录页等无需自动修复的问题保持 REPORTED，避免后台误显示为待修复。
+ * - 其余情况保持在 ISSUE_MERGED，表示分类与归并已完成，但尚未进入自动修复。
  */
 export function resolvePostIngestPolicy(input: {
   hasSample: boolean;
   shouldAutoRepair: boolean;
-}): { nextStage: "REPORTED" | "SAMPLE_READY"; queued: boolean } {
+}): { nextStage: "ISSUE_MERGED" | "SAMPLE_READY"; queued: boolean } {
   if (input.hasSample && input.shouldAutoRepair) {
     return { nextStage: "SAMPLE_READY", queued: true };
   }
-  return { nextStage: "REPORTED", queued: false };
+  return { nextStage: "ISSUE_MERGED", queued: false };
 }
 
 /**

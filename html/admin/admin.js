@@ -278,7 +278,7 @@ const PAGE_METADATA = {
 };
 
 // 修复流水线阶段顺序：用于进度条与时间线可视化展示
-const REPAIR_STAGE_FLOW = [
+const LEGACY_REPAIR_STAGE_FLOW = [
   { stage: "REPORT_RECEIVED", label: "收到失败上报" },
   { stage: "ISSUE_MERGED", label: "归并修复问题" },
   { stage: "QUEUED", label: "排队等待修复" },
@@ -292,7 +292,36 @@ const REPAIR_STAGE_FLOW = [
   { stage: "DISABLED", label: "已禁用" }
 ];
 
-const REPAIR_FINAL_STAGES = new Set(["PUBLISHED", "ROLLED_BACK", "DISABLED"]);
+const LEGACY_REPAIR_FINAL_STAGES = new Set(["PUBLISHED", "ROLLED_BACK", "DISABLED"]);
+
+const REPAIR_STAGE_FLOW = [
+  { stage: "REPORTED", label: "收到失败上报" },
+  { stage: "CLASSIFIED", label: "完成失败分类" },
+  { stage: "ISSUE_MERGED", label: "归并到 Repair Issue" },
+  { stage: "SAMPLE_READY", label: "样本已就绪" },
+  { stage: "REPLAY_BASELINE", label: "基线回放验证" },
+  { stage: "DIAGNOSED", label: "修复诊断完成" },
+  { stage: "PATCH_GENERATED", label: "候选脚本已生成" },
+  { stage: "RUNNER_TESTED", label: "候选脚本测试中" },
+  { stage: "REGRESSION_TESTED", label: "回归验证通过" },
+  { stage: "PENDING_REVIEW", label: "待人工发布" },
+  { stage: "CANARY", label: "灰度发布中" },
+  { stage: "ACTIVE", label: "已正式发布" },
+  { stage: "ROLLED_BACK", label: "已回滚" },
+  { stage: "DISABLED", label: "已禁用" }
+];
+
+const REPAIR_FINAL_STAGES = new Set(["ACTIVE", "PUBLISHED", "ROLLED_BACK", "DISABLED"]);
+const REPAIR_STAGE_ALIASES = {
+  REPORT_RECEIVED: "REPORTED",
+  QUEUED: "SAMPLE_READY",
+  REPLAY_RUNNING: "REPLAY_BASELINE",
+  REPLAY_RESULT: "REPLAY_BASELINE",
+  CANDIDATE_TEST_RUNNING: "RUNNER_TESTED",
+  CANDIDATE_TEST_RESULT: "RUNNER_TESTED",
+  PENDING_RELEASE: "PENDING_REVIEW",
+  PUBLISHED: "ACTIVE"
+};
 
 /**
  * 将一组别名字段归一化为第一个可用值
@@ -3139,7 +3168,7 @@ function formatRepairIssueMeta(issue) {
   ].join(" | ");
 }
 
-function formatRepairStageLabel(stage) {
+function formatRepairStageLabelLegacy(stage) {
   const key = (stage || "").toString().trim();
   const item = REPAIR_STAGE_FLOW.find((it) => it.stage === key);
   return item ? `${item.label}（${item.stage}）` : key || "-";
@@ -3206,7 +3235,7 @@ function formatRepairHighLevelActionLabel(action) {
   return map[key] || "";
 }
 
-function formatRepairOperationalStageLabel(stage) {
+function formatRepairOperationalStageLabelLegacy(stage) {
   const key = (stage || "").toString().trim();
   const map = {
     REPORT_RECEIVED: "收到失败上报",
@@ -3222,6 +3251,43 @@ function formatRepairOperationalStageLabel(stage) {
     DISABLED: "已禁用"
   };
   return map[key] || "";
+}
+
+function normalizeRepairStageKey(stage) {
+  const key = (stage || "").toString().trim();
+  return REPAIR_STAGE_ALIASES[key] || key;
+}
+
+function formatRepairStageLabel(stage) {
+  const key = normalizeRepairStageKey(stage);
+  const item = REPAIR_STAGE_FLOW.find((it) => it.stage === key);
+  return item ? `${item.label} (${item.stage})` : key || "-";
+}
+
+function formatRepairOperationalStageLabel(stage) {
+  const key = normalizeRepairStageKey(stage);
+  const map = {
+    REPORTED: "收到失败上报",
+    CLASSIFIED: "完成失败分类",
+    ISSUE_MERGED: "归并到 Repair Issue",
+    SAMPLE_READY: "样本已就绪",
+    REPLAY_BASELINE: "基线回放验证",
+    DIAGNOSED: "修复诊断完成",
+    PATCH_GENERATED: "候选脚本已生成",
+    RUNNER_TESTED: "候选脚本测试中",
+    REGRESSION_TESTED: "回归验证通过",
+    PENDING_REVIEW: "待人工发布",
+    CANARY: "灰度发布中",
+    ACTIVE: "已正式发布",
+    ROLLED_BACK: "已回滚",
+    DISABLED: "已禁用"
+  };
+  return map[key] || "";
+}
+
+function getRepairStageIndex(stage) {
+  const key = normalizeRepairStageKey(stage);
+  return REPAIR_STAGE_FLOW.findIndex((it) => it.stage === key);
 }
 
 function buildRepairContextItem(label, value) {
@@ -3393,6 +3459,7 @@ function buildRepairStatusSnapshot(name, entry, fallbackText) {
   }
   const meta = entry?.meta || {};
   const display = buildRepairTraceDisplay(entry);
+  const normalizedStage = normalizeRepairStageKey(entry?.stage || "");
   let tone = "";
   let badgeText = "已完成";
   if (entry?.level === "error") {
@@ -3401,19 +3468,19 @@ function buildRepairStatusSnapshot(name, entry, fallbackText) {
   } else if (entry?.level === "warning") {
     tone = "warning";
     badgeText = "警告";
-  } else if ((entry?.stage || "").toString() === "PENDING_RELEASE") {
+  } else if (normalizedStage === "PENDING_REVIEW" || normalizedStage === "CANARY") {
     tone = "warning";
     badgeText = "待发布";
-  } else if ((entry?.stage || "").toString() === "PUBLISHED") {
+  } else if (normalizedStage === "ACTIVE") {
     tone = "success";
     badgeText = "已发布";
-  } else if ((entry?.stage || "").toString() === "ROLLED_BACK") {
+  } else if (normalizedStage === "ROLLED_BACK") {
     tone = "warning";
     badgeText = "已回滚";
-  } else if ((entry?.stage || "").toString() === "DISABLED") {
+  } else if (normalizedStage === "DISABLED") {
     tone = "danger";
     badgeText = "已禁用";
-  } else if (["CANDIDATE_TEST_RUNNING", "REPLAY_RUNNING"].includes((entry?.stage || "").toString())) {
+  } else if (["RUNNER_TESTED", "REPLAY_BASELINE", "PATCH_GENERATED", "DIAGNOSED"].includes(normalizedStage)) {
     badgeText = "进行中";
   } else if (meta?.ok === true) {
     tone = "success";
@@ -3433,14 +3500,14 @@ function collectRepairModelSnapshots(issue, timelineItems, logItems) {
     .concat((Array.isArray(timelineItems) ? timelineItems : []).map((item) => normalizeRepairTraceEntry(item)))
     .concat((Array.isArray(logItems) ? logItems : []).map((item) => normalizeRepairTraceEntry(item)))
     .sort((a, b) => Number(a?.ts || 0) - Number(b?.ts || 0));
-  const currentStage = (issue?.currentStage || "").toString();
+  const currentStage = normalizeRepairStageKey(issue?.currentStage || "");
   const summaryEntry = getLatestRepairEntry(combined, (item) => item?.meta?.modelRole === "summary");
   const scriptEntry = getLatestRepairEntry(combined, (item) => item?.meta?.modelRole === "script_repair");
   const rawVerifyEntry = getLatestRepairEntry(
     combined,
     (item) =>
       ["replay_candidate_script", "replay_candidate_script_single"].includes((item?.meta?.action || "").toString()) ||
-      ((item?.stage || "").toString() === "CANDIDATE_TEST_RESULT" && /回放/.test((item?.message || "").toString()))
+      (normalizeRepairStageKey(item?.stage || "") === "RUNNER_TESTED" && /回放/.test((item?.message || "").toString()))
   );
   const verifyEntry =
     rawVerifyEntry && scriptEntry && Number(rawVerifyEntry?.ts || 0) < Number(scriptEntry?.ts || 0)
@@ -3448,21 +3515,24 @@ function collectRepairModelSnapshots(issue, timelineItems, logItems) {
       : rawVerifyEntry;
   const releaseEntry = getLatestRepairEntry(
     combined,
-    (item) => ["PENDING_RELEASE", "PUBLISHED", "ROLLED_BACK", "DISABLED"].includes((item?.stage || "").toString())
+    (item) =>
+      ["PENDING_REVIEW", "CANARY", "ACTIVE", "ROLLED_BACK", "DISABLED"].includes(
+        normalizeRepairStageKey(item?.stage || "")
+      )
   );
   const summaryFallback =
-    getRepairStageIndex(currentStage) >= getRepairStageIndex("CANDIDATE_TEST_RUNNING")
+    getRepairStageIndex(currentStage) >= getRepairStageIndex("DIAGNOSED")
       ? "已进入自动修复阶段，等待模型 1 记录。"
       : "问题尚未进入模型 1 汇总阶段。";
   const scriptFallback =
-    getRepairStageIndex(currentStage) >= getRepairStageIndex("CANDIDATE_TEST_RUNNING")
+    getRepairStageIndex(currentStage) >= getRepairStageIndex("PATCH_GENERATED")
       ? "等待模型 2 生成候选脚本。"
       : "模型 2 尚未启动。";
   const verifyFallback =
-    getRepairStageIndex(currentStage) >= getRepairStageIndex("CANDIDATE_TEST_RESULT")
+    getRepairStageIndex(currentStage) >= getRepairStageIndex("RUNNER_TESTED")
       ? "等待回放验证记录。"
       : "候选脚本验证尚未开始。";
-  const releaseFallback = REPAIR_FINAL_STAGES.has(currentStage)
+  const releaseFallback = REPAIR_FINAL_STAGES.has(currentStage) || ["PENDING_REVIEW", "CANARY"].includes(currentStage)
     ? "当前问题已结束，等待查看最终发布结果。"
     : "候选脚本尚未进入待发布或正式发布阶段。";
   return [
@@ -3478,9 +3548,9 @@ function collectRepairCurrentStepSnapshot(issue, timelineItems, logItems) {
     .concat((Array.isArray(timelineItems) ? timelineItems : []).map((item) => normalizeRepairTraceEntry(item)))
     .concat((Array.isArray(logItems) ? logItems : []).map((item) => normalizeRepairTraceEntry(item)))
     .sort((a, b) => Number(a?.ts || 0) - Number(b?.ts || 0));
-  const currentStage = (issue?.currentStage || "").toString();
+  const currentStage = normalizeRepairStageKey(issue?.currentStage || "");
   const entry =
-    getLatestRepairEntry(combined, (item) => (item?.stage || "").toString() === currentStage) ||
+    getLatestRepairEntry(combined, (item) => normalizeRepairStageKey(item?.stage || "") === currentStage) ||
     combined[combined.length - 1] ||
     null;
   const stageLabel = entry?.stage ? formatRepairStageLabel(entry.stage) : formatRepairStageLabel(currentStage);
@@ -3627,7 +3697,7 @@ function resolveCurrentOperationalTitle(stage, currentEntry) {
   return formatRepairOperationalStageLabel(stage || "") || stage || "-";
 }
 
-function getRepairStageIndex(stage) {
+function getRepairStageIndexLegacy(stage) {
   const key = (stage || "").toString().trim();
   return REPAIR_STAGE_FLOW.findIndex((it) => it.stage === key);
 }
@@ -3719,7 +3789,7 @@ function updateRepairLogSummary(totalCount, filteredCount, query) {
 function renderRepairProgress(issue, timelineItems) {
   if (!repairIssueProgressSteps || !repairIssueProgressMetrics || !repairIssueProgressStageBadge) return;
   const info = normalizeRepairIssueRecord(issue);
-  const stage = (info.currentStage || "").toString();
+  const stage = normalizeRepairStageKey(info.currentStage || "");
   const stageIndex = getRepairStageIndex(stage);
   const normalizedStageIndex = stageIndex >= 0 ? stageIndex : 0;
   const lastStepAt = Number(info.lastStepAt || info.updatedAt || 0);
@@ -3729,7 +3799,7 @@ function renderRepairProgress(issue, timelineItems) {
   const stageTimeMap = new Map();
   const stageEntryMap = new Map();
   for (const item of timelineList) {
-    const key = (item?.stage || "").toString();
+    const key = normalizeRepairStageKey(item?.stage || "");
     const ts = Number(item?.ts || 0);
     if (!key || !ts) continue;
     const existing = stageTimeMap.get(key) || 0;
@@ -3752,11 +3822,13 @@ function renderRepairProgress(issue, timelineItems) {
   }`;
   repairIssueProgressStageBadge.textContent = statusText;
   repairIssueProgressStageBadge.classList.remove("success", "warning", "danger");
-  if (["PUBLISHED"].includes(info.currentStage)) {
+  const activeStageEntry = stageEntryMap.get(stage) || null;
+  const hasActiveError = ((activeStageEntry?.level || "").toString() || "").toLowerCase() === "error";
+  if (["ACTIVE"].includes(stage)) {
     repairIssueProgressStageBadge.classList.add("success");
-  } else if (["ROLLED_BACK", "DISABLED"].includes(info.currentStage)) {
+  } else if (["PENDING_REVIEW", "CANARY", "ROLLED_BACK", "DISABLED"].includes(stage)) {
     repairIssueProgressStageBadge.classList.add("warning");
-  } else if (info.lastErrorMessage) {
+  } else if (hasActiveError) {
     repairIssueProgressStageBadge.classList.add("danger");
   }
 
@@ -3787,14 +3859,14 @@ function renderRepairProgress(issue, timelineItems) {
     const classes = ["progress-step"];
     if (idx < normalizedStageIndex) classes.push("completed");
     if (idx === normalizedStageIndex) classes.push("active");
-    if (idx === normalizedStageIndex && info.lastErrorMessage) classes.push("failed");
+    if (idx === normalizedStageIndex && hasActiveError) classes.push("failed");
     const statusText =
       idx < normalizedStageIndex
         ? "已完成"
         : idx === normalizedStageIndex
-          ? info.lastErrorMessage
+          ? hasActiveError
             ? "失败"
-            : ["CANDIDATE_TEST_RUNNING", "REPLAY_RUNNING"].includes((step.stage || "").toString())
+            : ["REPLAY_BASELINE", "DIAGNOSED", "PATCH_GENERATED", "RUNNER_TESTED"].includes((step.stage || "").toString())
               ? "进行中"
               : "当前"
           : "待执行";
@@ -4135,7 +4207,7 @@ async function runRepairIssueReplay(issueId) {
     list: [
       {
         ts: Date.now(),
-        stage: "REPLAY_RESULT",
+        stage: "REPLAY_BASELINE",
         level: result?.data?.ok ? "info" : "error",
         source: "admin_run_test",
         actor: result?.data?.testedBy || "-",

@@ -3,12 +3,19 @@ export function classifyFailure(input) {
     const session = input.session || {};
     const fingerprint = input.pageFingerprint || {};
     const systemType = normalizeSystemType(String(session.schoolSystemType || ""));
-    const sourceHost = fingerprint.host || hostFromUrl(input.sourceUrl || String(session.sourceUrl || ""));
+    const sourceUrl = String(input.sourceUrl || session.sourceUrl || "");
+    const sourceHost = fingerprint.host || hostFromUrl(sourceUrl);
+    const sourceUrlText = `${sourceUrl} ${fingerprint.pathPattern || ""}`.toLowerCase();
     const content = (input.sanitizedContent || "").toLowerCase();
-    const failureText = `${input.finalFailureType || ""} ${input.failureStage || ""} ${content.slice(0, 500)}`.toLowerCase();
+    const attemptSignals = input.attempts
+        .map((attempt) => `${attempt.parserName || ""} ${attempt.failureType || ""} ${attempt.safeErrorCode || ""}`)
+        .join(" ")
+        .toLowerCase();
+    const failureText = `${input.finalFailureType || ""} ${input.failureStage || ""} ${sourceUrlText} ${attemptSignals} ${content.slice(0, 500)}`.toLowerCase();
     const lastAttempt = input.attempts.find((attempt) => attempt.parserName) || input.attempts[0] || {};
     const attemptName = lastAttempt.parserName || parserForSystem(systemType);
     const attemptVersion = Number(lastAttempt.parserVersion || 0);
+    const zhengfangPortalContext = looksLikeZhengfangPortal(systemType, sourceHost, sourceUrlText, content);
     let repairDomain = input.repairDomain || "PARSER_FAILURE";
     let targetType = input.targetType || "parser";
     let category = "parsers";
@@ -60,6 +67,13 @@ export function classifyFailure(input) {
         scriptName = attemptName;
         reason = "cloud fallback failed";
     }
+    else if (!fingerprint.hasCourseKeyword && !looksLikeTimetable(content) && zhengfangPortalContext) {
+        repairDomain = "NAVIGATION_FAILURE";
+        targetType = "navigation";
+        category = "js";
+        scriptName = "zf_nav.js";
+        reason = "zhengfang portal detected but timetable page not reached";
+    }
     else if (!fingerprint.hasCourseKeyword && !looksLikeTimetable(content)) {
         repairDomain = "NON_TIMETABLE_PAGE";
         targetType = "none";
@@ -97,6 +111,12 @@ function looksLikeTimetable(content) {
     if (!content)
         return false;
     return /课表|课程|星期|节次|上课|教师|教室|timetable|schedule|kbtable|xskb|kbcx|kblist/.test(content);
+}
+function looksLikeZhengfangPortal(systemType, sourceHost, sourceUrlText, content) {
+    if (normalizeSystemType(systemType) !== "ZF")
+        return false;
+    const combined = `${sourceHost} ${sourceUrlText} ${content.slice(0, 200)}`.toLowerCase();
+    return /(jwglxt|jwxt|xtgl|mmgl_|index_initmenu|xskb|xskbcx|kbcx|jsxsd)/.test(combined);
 }
 function normalizeFailureType(value, domain) {
     const raw = String(value || "").toLowerCase();

@@ -1,14 +1,28 @@
-name: Create and publish a Docker image
+name: Build and publish Docker images
 
 on:
   push:
-    branches: ['main']
-    tags: ['v*.*.*']
+    branches:
+      - main
+    tags:
+      - v*.*
+      - v*.*.*
+  workflow_dispatch:
 
 env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  IMAGE_NAME: dawncourse-server
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
-  DOCKER_HUB_IMAGE: yemiao351/dawncourse
+  GHCR_IMAGE: ghcr.io/hf-cygg/dawncourse-server
+  GHCR_USERNAME: ${{ secrets.GHCR_USERNAME != '' && secrets.GHCR_USERNAME || github.actor }}
+  GHCR_PASSWORD: ${{ secrets.GHCR_TOKEN != '' && secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+  DOCKER_HUB_IMAGE: ${{ secrets.DOCKERHUB_NAMESPACE != '' && format('{0}/{1}', secrets.DOCKERHUB_NAMESPACE, 'dawncourse-server') || 'yemiao351/dawncourse' }}
+  DOCKER_HUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_USERNAME || secrets.DOCKER_USERNAME }}
+  DOCKER_HUB_PASSWORD: ${{ secrets.DOCKERHUB_TOKEN != '' && secrets.DOCKERHUB_TOKEN || secrets.DOCKER_PASSWORD }}
+  ALIYUN_REGISTRY: crpi-9gmsq2s17re73ia9.cn-qingdao.personal.cr.aliyuncs.com
+  ALIYUN_NAMESPACE: yyh163
+  ALIYUN_USERNAME: ${{ secrets.ALIYUN_USERNAME }}
+  ALIYUN_PASSWORD: ${{ secrets.ALIYUN_PASSWORD }}
 
 jobs:
   build-and-push-image:
@@ -19,38 +33,126 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      - name: Log in to the Container registry
-        uses: docker/login-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Validate required Aliyun ACR secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${ALIYUN_USERNAME}" || -z "${ALIYUN_PASSWORD}" ]]; then
+            echo "Aliyun ACR is mandatory, but ALIYUN_USERNAME or ALIYUN_PASSWORD is missing." >&2
+            exit 1
+          fi
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ env.GHCR_USERNAME }}
+          password: ${{ env.GHCR_PASSWORD }}
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@v3
+        if: ${{ env.DOCKER_HUB_USERNAME != '' && env.DOCKER_HUB_PASSWORD != '' }}
+        uses: docker/login-action@v4
         with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
+          registry: docker.io
+          username: ${{ env.DOCKER_HUB_USERNAME }}
+          password: ${{ env.DOCKER_HUB_PASSWORD }}
 
-      - name: Extract metadata (tags, labels) for Docker
-        uses: docker/metadata-action@v5
-        id: meta
+      - name: Log in to Aliyun ACR
+        uses: docker/login-action@v4
         with:
-          images: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-            ${{ env.DOCKER_HUB_IMAGE }}
-          tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=ref,event=branch
-            type=ref,event=tag
-            type=sha,format=short
+          registry: ${{ env.ALIYUN_REGISTRY }}
+          username: ${{ env.ALIYUN_USERNAME }}
+          password: ${{ env.ALIYUN_PASSWORD }}
 
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+      - name: Prepare image tags
+        id: tags
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          declare -a suffixes=()
+          short_sha="${GITHUB_SHA::7}"
+
+          if [[ "${GITHUB_REF_TYPE}" == "branch" ]]; then
+            suffixes+=("${GITHUB_REF_NAME}")
+            suffixes+=("sha-${short_sha}")
+            if [[ "${GITHUB_REF_NAME}" == "main" ]]; then
+              suffixes+=("latest")
+            fi
+          elif [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            suffixes+=("${GITHUB_REF_NAME}")
+            suffixes+=("sha-${short_sha}")
+          else
+            suffixes+=("sha-${short_sha}")
+          fi
+
+          mapfile -t unique_suffixes < <(printf "%s\n" "${suffixes[@]}" | awk 'NF && !seen[$0]++')
+
+          build_tag_block() {
+            local image="$1"
+            shift
+            local block=""
+            for suffix in "$@"; do
+              block+="${image}:${suffix}"$'\n'
+            done
+            printf "%s" "${block}"
+          }
+
+          {
+            echo "ghcr<<EOF"
+            build_tag_block "${GHCR_IMAGE}" "${unique_suffixes[@]}"
+            echo
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+          if [[ -n "${DOCKER_HUB_USERNAME}" && -n "${DOCKER_HUB_PASSWORD}" && -n "${DOCKER_HUB_IMAGE}" ]]; then
+            {
+              echo "dockerhub<<EOF"
+              build_tag_block "${DOCKER_HUB_IMAGE}" "${unique_suffixes[@]}"
+              echo
+              echo "EOF"
+            } >> "${GITHUB_OUTPUT}"
+          fi
+
+          {
+            echo "aliyun<<EOF"
+            build_tag_block "${ALIYUN_REGISTRY}/${ALIYUN_NAMESPACE}/${IMAGE_NAME}" "${unique_suffixes[@]}"
+            echo
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Build and push image to GHCR
+        uses: docker/build-push-action@v6
         with:
           context: .
+          file: ./Dockerfile
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ steps.tags.outputs.ghcr }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push image to Docker Hub
+        if: ${{ steps.tags.outputs.dockerhub != '' }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.tags.outputs.dockerhub }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push image to Aliyun ACR
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.tags.outputs.aliyun }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

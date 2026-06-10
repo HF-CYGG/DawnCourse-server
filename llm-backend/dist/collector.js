@@ -327,7 +327,20 @@ export async function ingestParseReport(body, source) {
           sanitized_content, page_fingerprint_json, school_id, school_name, school_system_type, source_url_host, repair_domain)
          SELECT $1,$2,$3,true,$4,$5,$6,$7::jsonb,$8,$9,$10,$11,$12
          WHERE NOT EXISTS (
-           SELECT 1 FROM failure_samples WHERE issue_id = $3 AND content_sha256 = $5
+           SELECT 1
+           FROM failure_samples
+           WHERE issue_id = $3
+             AND content_sha256 = $5
+             AND has_user_consent = true
+             AND COALESCE(sanitized_content, '') <> ''
+         )
+         AND NOT EXISTS (
+           SELECT 1
+           FROM failure_samples
+           WHERE parse_session_id = $2
+             AND content_sha256 = $5
+             AND has_user_consent = true
+             AND COALESCE(sanitized_content, '') <> ''
          )
          RETURNING sample_id`, [
                 candidateSampleId,

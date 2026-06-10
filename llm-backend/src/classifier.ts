@@ -13,98 +13,83 @@ interface ClassifyInput {
   sanitizedContent?: string;
 }
 
+interface MutableResolution {
+  repairDomain: RepairDomain;
+  targetType: TargetType;
+  category: string;
+  scriptName: string;
+  shouldAutoRepair: boolean;
+  reason: string;
+  confidence: number;
+  evidence: string[];
+}
+
+const STAGE_ALIASES: Record<string, string> = {
+  NAV: "NAVIGATION",
+  NAVIGATION_FAILURE: "NAVIGATION",
+  TERM: "TERM_EXTRACT",
+  TERM_EXTRACT_FAILURE: "TERM_EXTRACT",
+  TERM_EXTRACTOR: "TERM_EXTRACT",
+  PARSER_FAILURE: "PARSER",
+  PARSER_EMPTY: "PARSER",
+  PARSER_CRASH: "PARSER",
+  CLOUD: "CLOUD_PARSE",
+  CLOUD_PARSE_FAILURE: "CLOUD_PARSE",
+  LOGIN: "LOGIN_OR_CAPTCHA",
+  CAPTCHA: "LOGIN_OR_CAPTCHA",
+  UNSUPPORTED_PAGE: "NON_TIMETABLE_PAGE"
+};
+
 export function classifyFailure(input: ClassifyInput): IssueResolution {
   const session = input.session || {};
   const fingerprint = input.pageFingerprint || {};
   const systemType = normalizeSystemType(String(session.schoolSystemType || ""));
   const sourceUrl = String(input.sourceUrl || session.sourceUrl || "");
-  const sourceHost = fingerprint.host || hostFromUrl(sourceUrl);
+  const sourceHost = (fingerprint.host || hostFromUrl(sourceUrl)).toLowerCase();
   const sourceUrlText = `${sourceUrl} ${fingerprint.pathPattern || ""}`.toLowerCase();
   const content = (input.sanitizedContent || "").toLowerCase();
-  const attemptSignals = input.attempts
+  const attempts = input.attempts || [];
+  const attemptSignals = attempts
     .map((attempt) => `${attempt.parserName || ""} ${attempt.failureType || ""} ${attempt.safeErrorCode || ""}`)
     .join(" ")
     .toLowerCase();
-  const failureText = `${input.finalFailureType || ""} ${input.failureStage || ""} ${sourceUrlText} ${attemptSignals} ${content.slice(0, 500)}`.toLowerCase();
-  const lastAttempt = input.attempts.find((attempt) => attempt.parserName) || input.attempts[0] || {};
+  const failureText = `${input.finalFailureType || ""} ${input.failureStage || ""} ${sourceUrlText} ${attemptSignals} ${content.slice(0, 800)}`.toLowerCase();
+  const lastAttempt = attempts.find((attempt) => attempt.parserName) || attempts[0] || {};
   const attemptName = lastAttempt.parserName || parserForSystem(systemType);
   const attemptVersion = Number(lastAttempt.parserVersion || 0);
-  const zhengfangPortalContext = looksLikeZhengfangPortal(systemType, sourceHost, sourceUrlText, content);
+  const explicitStage = normalizeFailureStage(input.failureStage);
 
-  let repairDomain: RepairDomain = input.repairDomain || "PARSER_FAILURE";
-  let targetType: TargetType = input.targetType || "parser";
-  let category = "parsers";
-  let scriptName = attemptName;
-  let shouldAutoRepair = true;
-  let reason = "parser failure";
-
-  if (fingerprint.hasCaptcha || failureText.includes("captcha") || failureText.includes("验证码")) {
-    repairDomain = "LOGIN_OR_CAPTCHA";
-    targetType = "none";
-    category = "none";
-    scriptName = "none";
-    shouldAutoRepair = false;
-    reason = "login or captcha page";
-  } else if (fingerprint.hasLoginKeyword || failureText.includes("login") || failureText.includes("未登录") || failureText.includes("登录")) {
-    repairDomain = "LOGIN_OR_CAPTCHA";
-    targetType = "none";
-    category = "none";
-    scriptName = "none";
-    shouldAutoRepair = false;
-    reason = "user needs login";
-  } else if (
-    failureText.includes("term") ||
-    failureText.includes("semester") ||
-    failureText.includes("学期") ||
-    failureText.includes("学年") ||
-    failureText.includes("extractor_empty")
-  ) {
-    repairDomain = "TERM_EXTRACT_FAILURE";
-    targetType = "term_extractor";
-    category = "js";
-    scriptName = "auto_sync_extractor.js";
-    reason = "term option extraction failed";
-  } else if (
-    failureText.includes("nav") ||
-    failureText.includes("navigation") ||
-    failureText.includes("入口") ||
-    failureText.includes("菜单") ||
-    failureText.includes("跳转")
-  ) {
-    repairDomain = "NAVIGATION_FAILURE";
-    targetType = "navigation";
-    category = "js";
-    scriptName = "zf_nav.js";
-    reason = "navigation failed";
-  } else if (failureText.includes("cloud") || failureText.includes("云端")) {
-    repairDomain = "CLOUD_PARSE_FAILURE";
-    targetType = "cloud_parse";
-    category = "parsers";
-    scriptName = attemptName;
-    reason = "cloud fallback failed";
-  } else if (!fingerprint.hasCourseKeyword && !looksLikeTimetable(content) && zhengfangPortalContext) {
-    repairDomain = "NAVIGATION_FAILURE";
-    targetType = "navigation";
-    category = "js";
-    scriptName = "zf_nav.js";
-    reason = "zhengfang portal detected but timetable page not reached";
-  } else if (!fingerprint.hasCourseKeyword && !looksLikeTimetable(content)) {
-    repairDomain = "NON_TIMETABLE_PAGE";
-    targetType = "none";
-    category = "none";
-    scriptName = "none";
-    shouldAutoRepair = false;
-    reason = "non timetable page";
+  const resolution = buildDefaultResolution(input, attemptName);
+  if (explicitStage) {
+    resolution.evidence.push(`failureStage=${explicitStage}`);
+    applyExplicitStage(resolution, explicitStage, attemptName);
+  } else {
+    applyHeuristics(resolution, {
+      systemType,
+      sourceHost,
+      sourceUrlText,
+      content,
+      failureText,
+      fingerprint,
+      attemptName
+    });
   }
 
-  const failureType = normalizeFailureType(input.finalFailureType, repairDomain);
-  const scriptIdentity = scriptName === "none" ? "none.none" : scriptId(category, scriptName);
+  if (input.repairDomain && input.repairDomain !== "CLOUD_PARSE_FAILURE") {
+    resolution.evidence.push(`client repairDomain=${input.repairDomain}`);
+  }
+  if (input.targetType && input.targetType !== "cloud_parse") {
+    resolution.evidence.push(`client targetType=${input.targetType}`);
+  }
+
+  const failureType = normalizeFailureType(input.finalFailureType, resolution.repairDomain);
+  const scriptIdentity = resolution.scriptName === "none" ? "none.none" : scriptId(resolution.category, resolution.scriptName);
   const issueKey = sha256(
     [
       normalizeSystemType(systemType),
       sourceHost,
       fingerprint.htmlStructureHash || fingerprint.bodyTextHash || fingerprint.pathPattern || "",
-      repairDomain,
+      resolution.repairDomain,
       scriptIdentity,
       attemptVersion,
       failureType
@@ -112,18 +97,189 @@ export function classifyFailure(input: ClassifyInput): IssueResolution {
   );
 
   return {
-    repairDomain,
-    targetType,
+    repairDomain: resolution.repairDomain,
+    targetType: resolution.targetType,
     scriptId: scriptIdentity,
-    scriptName,
-    category,
+    scriptName: resolution.scriptName,
+    category: resolution.category,
     version: attemptVersion,
     issueKey,
     failureType,
     sourceHost,
-    shouldAutoRepair,
-    reason
+    shouldAutoRepair: resolution.shouldAutoRepair,
+    reason: resolution.reason,
+    confidence: clampConfidence(resolution.confidence),
+    evidence: resolution.evidence.length ? resolution.evidence : ["fallback classifier rule"]
   };
+}
+
+function buildDefaultResolution(input: ClassifyInput, attemptName: string): MutableResolution {
+  const repairDomain = input.repairDomain || "PARSER_FAILURE";
+  const targetType = input.targetType || "parser";
+  return {
+    repairDomain,
+    targetType,
+    category: targetType === "parser" ? "parsers" : targetType === "none" ? "none" : "js",
+    scriptName: attemptName,
+    shouldAutoRepair: targetType !== "none" && repairDomain !== "CLOUD_PARSE_FAILURE",
+    reason: "parser failure",
+    confidence: 0.55,
+    evidence: []
+  };
+}
+
+function applyExplicitStage(resolution: MutableResolution, stage: string, attemptName: string): void {
+  if (stage === "LOGIN_OR_CAPTCHA") {
+    Object.assign(resolution, noRepair("LOGIN_OR_CAPTCHA", "login or captcha page", 0.95));
+    return;
+  }
+  if (stage === "NON_TIMETABLE_PAGE") {
+    Object.assign(resolution, noRepair("NON_TIMETABLE_PAGE", "non timetable page", 0.92));
+    return;
+  }
+  if (stage === "TERM_EXTRACT") {
+    Object.assign(resolution, {
+      repairDomain: "TERM_EXTRACT_FAILURE",
+      targetType: "term_extractor",
+      category: "js",
+      scriptName: "auto_sync_extractor.js",
+      shouldAutoRepair: true,
+      reason: "term option extraction failed",
+      confidence: 0.9
+    });
+    return;
+  }
+  if (stage === "NAVIGATION") {
+    Object.assign(resolution, {
+      repairDomain: "NAVIGATION_FAILURE",
+      targetType: "navigation",
+      category: "js",
+      scriptName: "zf_nav.js",
+      shouldAutoRepair: true,
+      reason: "navigation failed",
+      confidence: 0.9
+    });
+    return;
+  }
+  if (stage === "CLOUD_PARSE") {
+    Object.assign(resolution, {
+      repairDomain: "CLOUD_PARSE_FAILURE",
+      targetType: "cloud_parse",
+      category: "parsers",
+      scriptName: attemptName,
+      shouldAutoRepair: false,
+      reason: "cloud fallback failed; awaiting concrete repair target",
+      confidence: 0.82
+    });
+    return;
+  }
+  Object.assign(resolution, {
+    repairDomain: "PARSER_FAILURE",
+    targetType: "parser",
+    category: "parsers",
+    scriptName: attemptName,
+    shouldAutoRepair: true,
+    reason: "parser failure",
+    confidence: 0.85
+  });
+}
+
+function applyHeuristics(
+  resolution: MutableResolution,
+  input: {
+    systemType: string;
+    sourceHost: string;
+    sourceUrlText: string;
+    content: string;
+    failureText: string;
+    fingerprint: PageFingerprintInput;
+    attemptName: string;
+  }
+): void {
+  const { systemType, sourceHost, sourceUrlText, content, failureText, fingerprint, attemptName } = input;
+  if (fingerprint.hasCaptcha || includesAny(failureText, ["captcha", "验证码", "verify code"])) {
+    resolution.evidence.push("captcha marker detected");
+    Object.assign(resolution, noRepair("LOGIN_OR_CAPTCHA", "login or captcha page", 0.9));
+    return;
+  }
+  if (fingerprint.hasLoginKeyword || includesAny(failureText, ["login", "未登录", "登录", "账号", "password"])) {
+    resolution.evidence.push("login marker detected");
+    Object.assign(resolution, noRepair("LOGIN_OR_CAPTCHA", "user needs login", 0.88));
+    return;
+  }
+  if (includesAny(failureText, ["term", "semester", "学期", "学年", "extractor_empty", "term_options_empty"])) {
+    resolution.evidence.push("term extraction marker detected");
+    Object.assign(resolution, {
+      repairDomain: "TERM_EXTRACT_FAILURE",
+      targetType: "term_extractor",
+      category: "js",
+      scriptName: "auto_sync_extractor.js",
+      shouldAutoRepair: true,
+      reason: "term option extraction failed",
+      confidence: 0.78
+    });
+    return;
+  }
+  if (includesAny(failureText, ["nav", "navigation", "入口", "菜单", "跳转"])) {
+    resolution.evidence.push("navigation marker detected");
+    Object.assign(resolution, {
+      repairDomain: "NAVIGATION_FAILURE",
+      targetType: "navigation",
+      category: "js",
+      scriptName: "zf_nav.js",
+      shouldAutoRepair: true,
+      reason: "navigation failed",
+      confidence: 0.78
+    });
+    return;
+  }
+  if (includesAny(failureText, ["cloud", "云端"])) {
+    resolution.evidence.push("cloud fallback marker detected");
+    Object.assign(resolution, {
+      repairDomain: "CLOUD_PARSE_FAILURE",
+      targetType: "cloud_parse",
+      category: "parsers",
+      scriptName: attemptName,
+      shouldAutoRepair: false,
+      reason: "cloud fallback failed; awaiting concrete repair target",
+      confidence: 0.72
+    });
+    return;
+  }
+  if (!fingerprint.hasCourseKeyword && !looksLikeTimetable(content) && looksLikeZhengfangPortal(systemType, sourceHost, sourceUrlText, content)) {
+    resolution.evidence.push("zhengfang portal detected without timetable markers");
+    Object.assign(resolution, {
+      repairDomain: "NAVIGATION_FAILURE",
+      targetType: "navigation",
+      category: "js",
+      scriptName: "zf_nav.js",
+      shouldAutoRepair: true,
+      reason: "zhengfang portal detected but timetable page not reached",
+      confidence: 0.74
+    });
+    return;
+  }
+  if (!fingerprint.hasCourseKeyword && !looksLikeTimetable(content)) {
+    resolution.evidence.push("no timetable markers detected");
+    Object.assign(resolution, noRepair("NON_TIMETABLE_PAGE", "non timetable page", 0.7));
+  }
+}
+
+function noRepair(domain: RepairDomain, reason: string, confidence: number): Partial<MutableResolution> {
+  return {
+    repairDomain: domain,
+    targetType: "none",
+    category: "none",
+    scriptName: "none",
+    shouldAutoRepair: false,
+    reason,
+    confidence
+  };
+}
+
+function normalizeFailureStage(value: string | undefined): string {
+  const raw = String(value || "").trim().toUpperCase();
+  return STAGE_ALIASES[raw] || raw;
 }
 
 function looksLikeTimetable(content: string): boolean {
@@ -133,7 +289,7 @@ function looksLikeTimetable(content: string): boolean {
 
 function looksLikeZhengfangPortal(systemType: string, sourceHost: string, sourceUrlText: string, content: string): boolean {
   if (normalizeSystemType(systemType) !== "ZF") return false;
-  const combined = `${sourceHost} ${sourceUrlText} ${content.slice(0, 200)}`.toLowerCase();
+  const combined = `${sourceHost} ${sourceUrlText} ${content.slice(0, 300)}`.toLowerCase();
   return /(jwglxt|jwxt|xtgl|mmgl_|index_initmenu|xskb|xskbcx|kbcx|jsxsd)/.test(combined);
 }
 
@@ -143,9 +299,17 @@ function normalizeFailureType(value: string | undefined, domain: RepairDomain): 
   if (domain === "NAVIGATION_FAILURE") return "navigation_failure";
   if (domain === "LOGIN_OR_CAPTCHA") return "login_or_captcha";
   if (domain === "NON_TIMETABLE_PAGE") return "non_timetable_page";
+  if (domain === "CLOUD_PARSE_FAILURE") return "cloud_parse_failure";
   if (raw.includes("empty")) return "parser_empty";
   if (raw.includes("schema")) return "schema_invalid";
   if (raw.includes("crash") || raw.includes("exception")) return "parser_crash";
-  if (raw.includes("cloud")) return "cloud_parse_failure";
   return "parser_failure";
+}
+
+function includesAny(value: string, needles: string[]): boolean {
+  return needles.some((needle) => value.includes(needle.toLowerCase()));
+}
+
+function clampConfidence(value: number): number {
+  return Math.max(0, Math.min(1, Number.isFinite(value) ? value : 0.5));
 }

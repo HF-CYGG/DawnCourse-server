@@ -65,6 +65,8 @@ export interface ParseReportInput {
   repairDomain?: RepairDomain;
   targetType?: TargetType;
   sourceUrl?: string;
+  classificationHint?: Record<string, unknown>;
+  consentAt?: number | string;
   sanitizedSample?: {
     hasUserConsent?: boolean;
     sanitizerVersion?: number;
@@ -85,6 +87,8 @@ export interface IssueResolution {
   sourceHost: string;
   shouldAutoRepair: boolean;
   reason: string;
+  confidence: number;
+  evidence: string[];
 }
 
 export interface RunnerRequest {

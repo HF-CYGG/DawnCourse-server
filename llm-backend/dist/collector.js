@@ -54,7 +54,12 @@ export async function registerCollectorRoutes(app, deps = {}) {
         const body = (request.body || {});
         const content = String(body.sanitizedContent || body.content || body.html || "");
         const parseSessionId = String(body.parseSessionId || id("sess"));
-        const hasConsent = body.userConsent === true || body.hasUserConsent === true || Boolean(body.sanitizedContent);
+        const explicitConsent = body.userConsent === true || body.hasUserConsent === true;
+        const sanitizerVersion = Number(body.sanitizerVersion || 1);
+        const computedHash = content ? sha256(content) : "";
+        const providedHash = String(body.contentSha256 || "").trim();
+        const contentHashValid = !providedHash || providedHash.toLowerCase() === computedHash.toLowerCase();
+        const hasConsent = explicitConsent && sanitizerVersion > 0 && contentHashValid && Boolean(content.trim());
         const report = {
             session: {
                 parseSessionId,
@@ -73,14 +78,25 @@ export async function registerCollectorRoutes(app, deps = {}) {
             })),
             finalSuccess: false,
             finalFailureType: String(body.failureType || "parser_failure"),
+            failureStage: String(body.failureStage || ""),
+            repairDomain: body.repairDomain,
+            targetType: body.targetType,
+            consentAt: body.consentAt,
             sanitizedSample: {
                 hasUserConsent: hasConsent,
-                sanitizerVersion: Number(body.sanitizerVersion || 1),
-                contentSha256: content ? sha256(content) : "",
+                sanitizerVersion,
+                contentSha256: computedHash,
                 content: hasConsent ? content : ""
             }
         };
         const issue = await ingestParseReportFn(report, "parse_task");
+        if (explicitConsent && !contentHashValid) {
+            return {
+                code: 400,
+                msg: "contentSha256 mismatch",
+                data: { issueId: issue.issueId }
+            };
+        }
         if (!hasConsent) {
             return {
                 code: 400,
@@ -175,15 +191,22 @@ export async function ingestParseReport(body, source) {
     const schoolSystemType = normalizeSystemType(String(session.schoolSystemType || ""));
     const schoolId = String(session.schoolId || host || "");
     const schoolName = String(session.schoolName || schoolId || "");
+    const consentAt = normalizeConsentAt(body.consentAt);
     let issueId = "";
     let sampleId = null;
     await withTx(async (client) => {
         await client.query(`INSERT INTO parse_sessions(parse_session_id, app_version_code, app_version_name, install_bucket_id_hash, school_id, school_name,
-        school_system_type, import_source, source_url_host, page_fingerprint_hash, repair_domain, final_success, final_failure_type)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+        school_system_type, import_source, source_url_host, page_fingerprint_hash, repair_domain, final_success, final_failure_type,
+        failure_stage, target_type, source_url, classification_hint_json, consent_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17::jsonb,$18)
        ON CONFLICT (parse_session_id)
        DO UPDATE SET final_success = EXCLUDED.final_success, final_failure_type = EXCLUDED.final_failure_type,
         repair_domain = EXCLUDED.repair_domain,
+        failure_stage = EXCLUDED.failure_stage,
+        target_type = EXCLUDED.target_type,
+        source_url = EXCLUDED.source_url,
+        classification_hint_json = EXCLUDED.classification_hint_json,
+        consent_at = COALESCE(EXCLUDED.consent_at, parse_sessions.consent_at),
         school_name = CASE
           WHEN trim(parse_sessions.school_name) = '' THEN EXCLUDED.school_name
           WHEN lower(parse_sessions.school_name) = lower(parse_sessions.school_id) THEN EXCLUDED.school_name
@@ -204,7 +227,12 @@ export async function ingestParseReport(body, source) {
             fingerprintHash,
             resolution.repairDomain,
             body.finalSuccess === true,
-            body.finalFailureType || resolution.failureType
+            body.finalFailureType || resolution.failureType,
+            body.failureStage || "",
+            resolution.targetType,
+            sourceUrl,
+            JSON.stringify(body.classificationHint || {}),
+            consentAt
         ]);
         for (const attempt of attempts) {
             await client.query(`INSERT INTO parser_attempts(parse_session_id, parser_name, category, parser_version, release_id, script_source, script_sha256,
@@ -243,17 +271,35 @@ export async function ingestParseReport(body, source) {
                 sourceHost: String(existingIssue.rows[0]?.source_url_host || host)
             });
             await client.query(`UPDATE repair_issues
-         SET sample_count = sample_count + 1, user_count = GREATEST(user_count, 1),
+         SET user_count = GREATEST(user_count, 1),
            school_name = $4,
-           last_seen_at = now(), updated_at = now(), last_error = $2, failure_type = $3
-         WHERE issue_id = $1`, [issueId, resolution.reason, resolution.failureType, preferredSchoolName]);
+           last_seen_at = now(), updated_at = now(), last_error = $2, failure_type = $3,
+           repair_domain = $5, target_type = $6, affected_script_id = $7, affected_script_name = $8,
+           affected_category = $9, affected_version = $10,
+           classification_confidence = $11,
+           classification_evidence_json = $12::jsonb
+         WHERE issue_id = $1`, [
+                issueId,
+                resolution.reason,
+                resolution.failureType,
+                preferredSchoolName,
+                resolution.repairDomain,
+                resolution.targetType,
+                resolution.scriptId,
+                resolution.scriptName,
+                resolution.category,
+                resolution.version,
+                resolution.confidence,
+                JSON.stringify(resolution.evidence)
+            ]);
         }
         else {
             issueId = id("issue");
             await client.query(`INSERT INTO repair_issues(issue_id, issue_key, school_id, school_name, school_system_type, source_url_host,
           page_fingerprint_hash, repair_domain, target_type, affected_script_id, affected_script_name, affected_category,
-          affected_version, failure_type, sample_count, user_count, last_error, last_result)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,1,1,$15,$16)`, [
+          affected_version, failure_type, sample_count, user_count, last_error, last_result, classification_confidence,
+          classification_evidence_json)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,0,1,$15,$16,$17,$18::jsonb)`, [
                 issueId,
                 resolution.issueKey,
                 schoolId,
@@ -269,16 +315,22 @@ export async function ingestParseReport(body, source) {
                 resolution.version,
                 resolution.failureType,
                 resolution.reason,
-                "reported"
+                "reported",
+                resolution.confidence,
+                JSON.stringify(resolution.evidence)
             ]);
         }
         await client.query("UPDATE parse_sessions SET issue_id = $2, updated_at = now() WHERE parse_session_id = $1", [parseSessionId, issueId]);
         if (body.sanitizedSample?.hasUserConsent && content) {
-            sampleId = id("sample");
-            await client.query(`INSERT INTO failure_samples(sample_id, parse_session_id, issue_id, has_user_consent, sanitizer_version, content_sha256,
+            const candidateSampleId = id("sample");
+            const insertSample = await client.query(`INSERT INTO failure_samples(sample_id, parse_session_id, issue_id, has_user_consent, sanitizer_version, content_sha256,
           sanitized_content, page_fingerprint_json, school_id, school_name, school_system_type, source_url_host, repair_domain)
-         VALUES ($1,$2,$3,true,$4,$5,$6,$7::jsonb,$8,$9,$10,$11,$12)`, [
-                sampleId,
+         SELECT $1,$2,$3,true,$4,$5,$6,$7::jsonb,$8,$9,$10,$11,$12
+         WHERE NOT EXISTS (
+           SELECT 1 FROM failure_samples WHERE issue_id = $3 AND content_sha256 = $5
+         )
+         RETURNING sample_id`, [
+                candidateSampleId,
                 parseSessionId,
                 issueId,
                 Number(body.sanitizedSample.sanitizerVersion || 1),
@@ -291,7 +343,24 @@ export async function ingestParseReport(body, source) {
                 host,
                 resolution.repairDomain
             ]);
+            sampleId = insertSample.rows[0]?.sample_id || null;
         }
+        await client.query(`UPDATE repair_issues
+       SET sample_count = (
+           SELECT COUNT(*)::int FROM failure_samples
+           WHERE issue_id = $1 AND has_user_consent = true AND COALESCE(sanitized_content, '') <> ''
+         ),
+         user_count = GREATEST(
+           1,
+           (
+             SELECT COUNT(DISTINCT COALESCE(NULLIF(ps.install_bucket_id_hash, ''), fs.parse_session_id))::int
+             FROM failure_samples fs
+             LEFT JOIN parse_sessions ps ON ps.parse_session_id = fs.parse_session_id
+             WHERE fs.issue_id = $1
+           )
+         ),
+         updated_at = now()
+       WHERE issue_id = $1`, [issueId]);
     });
     await addIssueEvent({ issueId, stage: "REPORTED", source, message: "收到失败上报", meta: { parseSessionId, repairDomain: resolution.repairDomain, targetType: resolution.targetType } });
     await addIssueEvent({ issueId, stage: "CLASSIFIED", source: "classifier", message: `失败分类：${resolution.repairDomain}`, meta: resolution });
@@ -610,6 +679,18 @@ function tryNormalizeJsonArray(rawText) {
  */
 function isCloudParseProviderReady(summaryConfig) {
     return summaryConfig.apiKey.trim().length > 0 && summaryConfig.model.trim().length > 0;
+}
+function normalizeConsentAt(value) {
+    if (typeof value === "number" && Number.isFinite(value)) {
+        const date = new Date(value);
+        return Number.isNaN(date.getTime()) ? null : date.toISOString();
+    }
+    if (typeof value === "string" && value.trim()) {
+        const numeric = Number(value);
+        const date = Number.isFinite(numeric) ? new Date(numeric) : new Date(value);
+        return Number.isNaN(date.getTime()) ? null : date.toISOString();
+    }
+    return null;
 }
 function apiOk(data) {
     return { code: 200, msg: "ok", data };

@@ -1,7 +1,7 @@
 import { config } from "./config.js";
 import { query } from "./db.js";
 import { addIssueEvent, setIssueStage } from "./events.js";
-import { getActiveScriptContent, createPendingRelease } from "./registry.js";
+import { createPendingRelease, getActiveScriptContent } from "./registry.js";
 import { describeScriptRepairWorkflow, formatScriptRepairWorkflowLabel, resolveScriptRepairWorkflow } from "./repairWorkflow.js";
 import { runScript } from "./runnerClient.js";
 import { getRuntimeModelConfig, getRuntimePlatformConfig, ModelRuntimeConfig } from "./runtimeConfig.js";
@@ -10,6 +10,8 @@ import { id, limitString, scriptId } from "./utils.js";
 
 interface IssueRow {
   issue_id: string;
+  school_id: string | null;
+  school_system_type: string | null;
   repair_domain: string;
   target_type: TargetType;
   affected_script_id: string;
@@ -25,49 +27,54 @@ interface SampleRow {
   sanitized_content: string;
 }
 
-/**
- * 自动修复适用性判断：
- * - 登录/验证码页面、非课表页面、以及没有明确脚本目标的问题，不应进入脚本自动修复流水线；
- * - 返回空字符串表示允许自动修复，返回非空字符串表示应直接阻止并给出用户可读原因。
- */
-export function getAutoRepairBlockedReason(
-  issue: Pick<IssueRow, "repair_domain" | "target_type"> | null | undefined
-): string {
-  if (!issue) return "问题不存在";
-  if (issue.target_type === "none") return "该失败类型不适合自动修脚本";
+type MinimalRunnerReport = Pick<RunnerResponse, "ok" | "schemaValid" | "resultCount" | "errorCode" | "errorMessage">;
+
+export function getAutoRepairBlockedReason(issue: Pick<IssueRow, "repair_domain" | "target_type"> | null | undefined): string {
+  if (!issue) return "issue not found";
+  if (issue.target_type === "none") return "failure type is not script-repairable";
   if (issue.repair_domain === "LOGIN_OR_CAPTCHA" || issue.repair_domain === "NON_TIMETABLE_PAGE") {
-    return "该失败类型不适合自动修脚本";
+    return "failure type is not script-repairable";
   }
   return "";
+}
+
+export function summarizeBaselineReportsForTest(reports: MinimalRunnerReport[]): { reproduced: boolean } {
+  return { reproduced: reports.length > 0 && reports.every((report) => !isRunnerPass(report)) };
+}
+
+export function summarizeCandidateReportsForTest(reports: MinimalRunnerReport[]): { passed: boolean } {
+  return { passed: reports.length > 0 && reports.every(isRunnerPass) };
+}
+
+export function summarizeRegressionReportsForTest(reports: MinimalRunnerReport[]): { status: "limited_regression" | "passed" | "failed"; passed: boolean } {
+  if (!reports.length) return { status: "limited_regression", passed: true };
+  return reports.every(isRunnerPass) ? { status: "passed", passed: true } : { status: "failed", passed: false };
 }
 
 export async function startRepairJob(
   issueId: string,
   options: { actor?: string; bypassMinQueue?: boolean } = {}
 ): Promise<{ jobId: string; started: boolean; reason?: string }> {
+  const actor = options.actor || "system";
   const issue = await loadIssue(issueId);
   const blockedReason = getAutoRepairBlockedReason(issue);
   if (blockedReason) {
-    await addIssueEvent({
-      issueId,
-      stage: "ISSUE_MERGED",
-      level: "warning",
-      actor: options.actor || "system",
-      message: blockedReason
-    });
+    await addIssueEvent({ issueId, stage: "ISSUE_MERGED", level: "warning", actor, message: blockedReason });
     await setIssueStage(issueId, "ISSUE_MERGED", "repair blocked", blockedReason);
     return { jobId: "", started: false, reason: blockedReason };
   }
+
   const lock = await query("SELECT pg_try_advisory_lock(hashtext($1)) AS locked", [`repair:${issueId}`]);
   if (!lock.rows[0]?.locked) {
-    await addIssueEvent({ issueId, stage: "SAMPLE_READY", level: "warning", message: "已有修复任务正在运行", actor: options.actor || "system" });
-    return { jobId: "", started: false };
+    await addIssueEvent({ issueId, stage: "SAMPLE_READY", level: "warning", actor, message: "repair job already running" });
+    return { jobId: "", started: false, reason: "repair_job_already_running" };
   }
+
   const jobId = id("job");
   await query(
     `INSERT INTO repair_jobs(job_id, issue_id, status, bypass_min_queue, actor, started_at)
      VALUES ($1,$2,'running',$3,$4,now())`,
-    [jobId, issueId, options.bypassMinQueue === true, options.actor || "system"]
+    [jobId, issueId, options.bypassMinQueue === true, actor]
   );
   void runRepairJob(issueId, jobId, options).finally(async () => {
     await query("SELECT pg_advisory_unlock(hashtext($1))", [`repair:${issueId}`]).catch(() => undefined);
@@ -77,25 +84,34 @@ export async function startRepairJob(
 
 export async function runReplayOnly(issueId: string, actor = "admin"): Promise<{ ok: boolean; reason?: string; reportId?: string }> {
   const issue = await loadIssue(issueId);
-  const sample = await loadSample(issueId);
+  const samples = await loadSamples(issueId, 1);
+  const sample = samples[0];
   if (!issue || !sample) return { ok: false, reason: "missing_issue_or_sample" };
   const active = await getActiveScriptContent(issue.affected_category, issue.affected_script_name);
   if (!active) return { ok: false, reason: "missing_active_script" };
-  await addIssueEvent({ issueId, stage: "REPLAY_BASELINE", actor, message: "开始基线回放", meta: { script: issue.affected_script_name } });
+
+  await addIssueEvent({ issueId, stage: "REPLAY_BASELINE", actor, message: "baseline replay started", meta: { script: issue.affected_script_name } });
   const report = await runScript({
     scriptContent: active.content,
     sampleContent: sample.sanitized_content,
     targetType: issue.target_type,
     timeoutMs: config.runnerTimeoutMs
   });
-  const reportId = await saveRunnerReport({ issueId, scriptId: issue.affected_script_id, releaseId: active.releaseId, sampleId: sample.sample_id, targetType: issue.target_type, report });
-  const ok = !report.ok || !report.schemaValid || report.resultCount === 0;
+  const reportId = await saveRunnerReport({
+    issueId,
+    scriptId: issue.affected_script_id,
+    releaseId: active.releaseId,
+    sampleId: sample.sample_id,
+    targetType: issue.target_type,
+    report
+  });
+  const ok = !isRunnerPass(report);
   await addIssueEvent({
     issueId,
     stage: "REPLAY_BASELINE",
     level: ok ? "info" : "warning",
     actor,
-    message: ok ? "基线失败已复现" : "基线未复现失败，暂不自动修复",
+    message: ok ? "baseline failure reproduced" : "baseline did not reproduce failure",
     meta: { reportId, report }
   });
   return { ok, reason: ok ? undefined : "baseline_not_reproduced", reportId };
@@ -111,74 +127,132 @@ async function runRepairJob(issueId: string, jobId: string, options: { actor?: s
       await failJob(jobId, issueId, blockedReason);
       return;
     }
+
     const runtime = await getRuntimePlatformConfig();
     if (!options.bypassMinQueue && Number(issue.sample_count || 0) < runtime.minQueueSize) {
-      await addIssueEvent({ issueId, jobId, stage: "SAMPLE_READY", level: "info", actor, message: `样本数不足，等待 ${runtime.minQueueSize} 条样本` });
+      await addIssueEvent({
+        issueId,
+        jobId,
+        stage: "SAMPLE_READY",
+        level: "info",
+        actor,
+        message: `waiting for ${runtime.minQueueSize} authorized samples`
+      });
       await query("UPDATE repair_jobs SET status = 'waiting', finished_at = now() WHERE job_id = $1", [jobId]);
       return;
     }
-    const sample = await loadSample(issueId);
-    if (!sample?.sanitized_content) {
-      await failJob(jobId, issueId, "缺少用户授权脱敏样本");
+
+    const sampleLimit = options.bypassMinQueue ? 1 : Math.max(3, runtime.minQueueSize);
+    const samples = await loadSamples(issueId, sampleLimit);
+    if (!samples.length) {
+      await failJob(jobId, issueId, "missing_authorized_sample");
       return;
     }
-    await setIssueStage(issueId, "REPLAY_BASELINE", "baseline replay running");
-    await addIssueEvent({ issueId, jobId, stage: "REPLAY_BASELINE", actor, message: "开始复现旧脚本失败", meta: { targetType: issue.target_type } });
 
     const active = await getActiveScriptContent(issue.affected_category, issue.affected_script_name);
     if (!active) {
-      await failJob(jobId, issueId, "找不到 active 基线脚本");
+      await failJob(jobId, issueId, "missing_active_script");
       return;
     }
-    const baseline = await runScript({ scriptContent: active.content, sampleContent: sample.sanitized_content, targetType: issue.target_type, timeoutMs: config.runnerTimeoutMs });
-    const baselineReportId = await saveRunnerReport({ issueId, jobId, scriptId: issue.affected_script_id, releaseId: active.releaseId, sampleId: sample.sample_id, targetType: issue.target_type, report: baseline });
-    const reproduced = !baseline.ok || !baseline.schemaValid || baseline.resultCount === 0;
+
+    await setIssueStage(issueId, "REPLAY_BASELINE", "baseline replay running");
     await addIssueEvent({
       issueId,
       jobId,
       stage: "REPLAY_BASELINE",
-      level: reproduced ? "info" : "warning",
       actor,
-      message: reproduced ? "旧脚本失败已复现" : "旧脚本没有复现失败，停止自动修复",
-      meta: { baselineReportId, baseline }
+      message: "baseline replay started",
+      meta: { targetType: issue.target_type, sampleCount: samples.length }
     });
-    if (!reproduced) {
+    const baselineRuns = await runScriptForSamples({
+      issue,
+      issueId,
+      jobId,
+      scriptContent: active.content,
+      releaseId: active.releaseId,
+      samples,
+      timeoutMs: config.runnerTimeoutMs
+    });
+    const baselineSummary = summarizeBaselineReportsForTest(baselineRuns.map((item) => item.report));
+    await addIssueEvent({
+      issueId,
+      jobId,
+      stage: "REPLAY_BASELINE",
+      level: baselineSummary.reproduced ? "info" : "warning",
+      actor,
+      message: baselineSummary.reproduced ? "baseline failure reproduced on selected samples" : "baseline did not reproduce failure on every selected sample",
+      meta: { reportIds: baselineRuns.map((item) => item.reportId), reports: baselineRuns.map((item) => item.report) }
+    });
+    if (!baselineSummary.reproduced) {
       await failJob(jobId, issueId, "baseline_not_reproduced");
       return;
     }
 
     await setIssueStage(issueId, "DIAGNOSED", "diagnosing");
-    const diagnosis = await diagnose(issue, sample.sanitized_content, baseline.errorMessage || baseline.errorCode || "empty result");
-    await addIssueEvent({ issueId, jobId, stage: "DIAGNOSED", actor, message: "已生成修复诊断", meta: { diagnosis: diagnosis.summary } });
+    const firstBaseline = baselineRuns[0]?.report;
+    const diagnosis = await diagnose(issue, samples[0].sanitized_content, firstBaseline?.errorMessage || firstBaseline?.errorCode || "empty result");
+    await addIssueEvent({ issueId, jobId, stage: "DIAGNOSED", actor, message: "repair diagnosis generated", meta: { diagnosis: diagnosis.summary } });
 
     await setIssueStage(issueId, "PATCH_GENERATED", "generating candidate");
-    const candidate = await generateCandidate(issue, active.content, sample.sanitized_content, diagnosis.summary);
+    const candidate = await generateCandidate(issue, active.content, samples[0].sanitized_content, diagnosis.summary);
     if (!candidate.script.trim()) {
       await failJob(jobId, issueId, candidate.error || "candidate_empty");
       return;
     }
-    await addIssueEvent({ issueId, jobId, stage: "PATCH_GENERATED", actor, message: "候选脚本已生成", meta: { summary: candidate.summary } });
+    await addIssueEvent({ issueId, jobId, stage: "PATCH_GENERATED", actor, message: "candidate script generated", meta: { summary: candidate.summary } });
 
     await setIssueStage(issueId, "RUNNER_TESTED", "candidate test running");
-    const candidateReport = await runScript({ scriptContent: candidate.script, sampleContent: sample.sanitized_content, targetType: issue.target_type, timeoutMs: Math.max(config.runnerTimeoutMs, 10000) });
-    const candidateReportId = await saveRunnerReport({ issueId, jobId, scriptId: issue.affected_script_id, sampleId: sample.sample_id, targetType: issue.target_type, report: candidateReport });
-    if (!candidateReport.ok || !candidateReport.schemaValid || candidateReport.resultCount <= 0) {
+    const candidateRuns = await runScriptForSamples({
+      issue,
+      issueId,
+      jobId,
+      scriptContent: candidate.script,
+      samples,
+      timeoutMs: Math.max(config.runnerTimeoutMs, 10000)
+    });
+    const candidateSummary = summarizeCandidateReportsForTest(candidateRuns.map((item) => item.report));
+    if (!candidateSummary.passed) {
+      const failed = candidateRuns.find((item) => !isRunnerPass(item.report))?.report;
       await addIssueEvent({
         issueId,
         jobId,
         stage: "RUNNER_TESTED",
         level: "error",
         actor,
-        message: "候选脚本未通过 Runner 测试",
-        meta: { candidateReportId, candidateReport }
+        message: "candidate failed runner test on issue samples",
+        meta: { reportIds: candidateRuns.map((item) => item.reportId), reports: candidateRuns.map((item) => item.report) }
       });
-      await failJob(jobId, issueId, candidateReport.errorMessage || candidateReport.errorCode || "candidate_invalid");
+      await failJob(jobId, issueId, failed?.errorMessage || failed?.errorCode || "candidate_invalid");
       return;
     }
-    await addIssueEvent({ issueId, jobId, stage: "RUNNER_TESTED", actor, message: "候选脚本通过提交样本测试", meta: { candidateReportId } });
+    await addIssueEvent({ issueId, jobId, stage: "RUNNER_TESTED", actor, message: "candidate passed issue sample tests", meta: { reportIds: candidateRuns.map((item) => item.reportId) } });
 
     await setIssueStage(issueId, "REGRESSION_TESTED", "regression tested");
-    await addIssueEvent({ issueId, jobId, stage: "REGRESSION_TESTED", actor, message: "MVP 回归检查通过", meta: { strategy: "same issue sample replay" } });
+    const regressionSamples = await loadRegressionSamples(issue, issueId, 10);
+    const regressionRuns = regressionSamples.length
+      ? await runScriptForSamples({
+          issue,
+          issueId,
+          jobId,
+          scriptContent: candidate.script,
+          samples: regressionSamples,
+          timeoutMs: Math.max(config.runnerTimeoutMs, 10000)
+        })
+      : [];
+    const regressionSummary = summarizeRegressionReportsForTest(regressionRuns.map((item) => item.report));
+    await addIssueEvent({
+      issueId,
+      jobId,
+      stage: "REGRESSION_TESTED",
+      level: regressionSummary.passed ? "info" : "error",
+      actor,
+      message: regressionSummary.status,
+      meta: { reportIds: regressionRuns.map((item) => item.reportId), sampleCount: regressionSamples.length }
+    });
+    if (!regressionSummary.passed) {
+      await failJob(jobId, issueId, "regression_failed");
+      return;
+    }
 
     const releaseId = await createPendingRelease({
       issueId,
@@ -189,12 +263,18 @@ async function runRepairJob(issueId: string, jobId: string, options: { actor?: s
       content: candidate.script,
       parentReleaseId: active.releaseId,
       changelog: `Auto repair from ${issueId}: ${candidate.summary || diagnosis.summary}`,
-      testReportId: candidateReportId,
+      testReportId: candidateRuns[candidateRuns.length - 1]?.reportId,
       actor
     });
     await query("UPDATE repair_jobs SET status = 'completed', finished_at = now(), meta_json = $2::jsonb WHERE job_id = $1", [
       jobId,
-      JSON.stringify({ releaseId, candidateReportId, baselineReportId })
+      JSON.stringify({
+        releaseId,
+        baselineReportIds: baselineRuns.map((item) => item.reportId),
+        candidateReportIds: candidateRuns.map((item) => item.reportId),
+        regressionReportIds: regressionRuns.map((item) => item.reportId),
+        regressionStatus: regressionSummary.status
+      })
     ]);
   } catch (error) {
     await failJob(jobId, issueId, error instanceof Error ? error.message : String(error));
@@ -248,10 +328,7 @@ async function generateCandidate(
   return parsed.script ? parsed : { script: "", summary: "empty proposed script", error: "candidate_empty" };
 }
 
-async function callOpenAiCompatible(
-  cfg: ModelRuntimeConfig,
-  prompt: string
-): Promise<{ ok: boolean; text: string; error?: string }> {
+async function callOpenAiCompatible(cfg: ModelRuntimeConfig, prompt: string): Promise<{ ok: boolean; text: string; error?: string }> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), cfg.timeoutMs);
   try {
@@ -322,12 +399,61 @@ async function loadIssue(issueId: string): Promise<IssueRow | null> {
   return result.rows[0] || null;
 }
 
-async function loadSample(issueId: string): Promise<SampleRow | null> {
+async function loadSamples(issueId: string, limit: number): Promise<SampleRow[]> {
   const result = await query<SampleRow>(
-    "SELECT sample_id, sanitized_content FROM failure_samples WHERE issue_id = $1 AND has_user_consent = true AND sanitized_content <> '' ORDER BY created_at DESC LIMIT 1",
-    [issueId]
+    "SELECT sample_id, sanitized_content FROM failure_samples WHERE issue_id = $1 AND has_user_consent = true AND sanitized_content <> '' ORDER BY created_at DESC LIMIT $2",
+    [issueId, Math.max(1, limit)]
   );
-  return result.rows[0] || null;
+  return result.rows;
+}
+
+async function loadRegressionSamples(issue: IssueRow, issueId: string, limit: number): Promise<SampleRow[]> {
+  const result = await query<SampleRow>(
+    `SELECT fs.sample_id, fs.sanitized_content
+     FROM failure_samples fs
+     JOIN repair_issues ri ON ri.issue_id = fs.issue_id
+     WHERE fs.issue_id <> $1
+       AND fs.has_user_consent = true
+       AND fs.sanitized_content <> ''
+       AND ri.affected_script_id = $2
+       AND ($3 = '' OR ri.school_system_type = $3)
+       AND ($4 = '' OR ri.school_id = $4)
+     ORDER BY fs.created_at DESC
+     LIMIT $5`,
+    [issueId, issue.affected_script_id, issue.school_system_type || "", issue.school_id || "", Math.max(1, limit)]
+  );
+  return result.rows;
+}
+
+async function runScriptForSamples(input: {
+  issue: IssueRow;
+  issueId: string;
+  jobId: string;
+  scriptContent: string;
+  releaseId?: string;
+  samples: SampleRow[];
+  timeoutMs: number;
+}): Promise<Array<{ sample: SampleRow; report: RunnerResponse; reportId: string }>> {
+  const runs: Array<{ sample: SampleRow; report: RunnerResponse; reportId: string }> = [];
+  for (const sample of input.samples) {
+    const report = await runScript({
+      scriptContent: input.scriptContent,
+      sampleContent: sample.sanitized_content,
+      targetType: input.issue.target_type,
+      timeoutMs: input.timeoutMs
+    });
+    const reportId = await saveRunnerReport({
+      issueId: input.issueId,
+      jobId: input.jobId,
+      scriptId: input.issue.affected_script_id,
+      releaseId: input.releaseId,
+      sampleId: sample.sample_id,
+      targetType: input.issue.target_type,
+      report
+    });
+    runs.push({ sample, report, reportId });
+  }
+  return runs;
 }
 
 async function saveRunnerReport(input: {
@@ -364,8 +490,12 @@ async function saveRunnerReport(input: {
   return reportId;
 }
 
+function isRunnerPass(report: MinimalRunnerReport): boolean {
+  return report.ok === true && report.schemaValid === true && Number(report.resultCount || 0) > 0;
+}
+
 async function failJob(jobId: string, issueId: string, reason: string): Promise<void> {
-  await addIssueEvent({ issueId, jobId, stage: "RUNNER_TESTED", level: "error", message: `自动修复失败：${reason}` });
+  await addIssueEvent({ issueId, jobId, stage: "RUNNER_TESTED", level: "error", message: `auto repair failed: ${reason}` });
   await setIssueStage(issueId, "RUNNER_TESTED", "repair failed", reason);
   await query("UPDATE repair_jobs SET status = 'failed', finished_at = now(), error_summary = $2 WHERE job_id = $1", [jobId, reason]);
 }

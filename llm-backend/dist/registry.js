@@ -81,7 +81,7 @@ export async function createPendingRelease(input) {
         input.parentReleaseId || null,
         input.issueId
     ]);
-    await addIssueEvent({ issueId: input.issueId, stage: "PENDING_REVIEW", message: `候选脚本已进入 pending：${input.name} v${nextVersion}`, meta: { releaseId } });
+    await addIssueEvent({ issueId: input.issueId, stage: "PENDING_REVIEW", message: `candidate pending: ${input.name} v${nextVersion}`, meta: { releaseId } });
     await setIssueStage(input.issueId, "PENDING_REVIEW", "pending release created");
     return releaseId;
 }
@@ -115,7 +115,7 @@ export async function registerRegistryRoutes(app) {
         const queryParams = request.query;
         const systemType = String(queryParams.schoolSystemType || "");
         const appVersionCode = Number(queryParams.appVersionCode || 0);
-        const rows = await selectManifestReleases(systemType, queryParams.schoolId || "", appVersionCode, queryParams.installBucketIdHash || "");
+        const rows = await selectManifestReleases(systemType, queryParams.schoolId || "", appVersionCode, queryParams.installBucketIdHash || "", queryParams.selectionPolicy || "");
         const base = await getManifestPublicBaseUrl(request.headers.host);
         const scripts = rows.map((row) => ({
             scriptId: row.script_id,
@@ -140,8 +140,8 @@ export async function registerRegistryRoutes(app) {
             maxAppVersionCode: row.max_app_version_code ? Number(row.max_app_version_code) : null,
             parserApiVersion: 1,
             runnerContractVersion: 1,
-            schoolBindingId: null,
-            selectionPolicy: "auto",
+            schoolBindingId: row.school_binding_id || null,
+            selectionPolicy: row.selection_policy || "auto",
             dependencies: row.category === "parsers" && row.name !== "common_parser_utils.js" ? [{ category: "parsers", name: "common_parser_utils.js", version: 1 }] : [],
             changelog: row.changelog || ""
         }));
@@ -181,26 +181,134 @@ async function getReleaseForServing(category, name) {
      LIMIT 1`, [category, name]);
     return result.rows[0] || null;
 }
-async function selectManifestReleases(systemType, schoolId, appVersionCode, bucket) {
+async function selectManifestReleases(systemType, schoolId, appVersionCode, bucket, requestedPolicy = "") {
     const rows = await query(`SELECT r.*, a.content_sha256, a.signature, a.alg
      FROM script_releases r
      JOIN script_artifacts a ON a.script_id = r.script_id AND a.version = r.version
      WHERE r.release_stage IN ('active','canary') AND r.status = 'enabled' AND r.kill_switch = false
        AND r.min_app_version_code <= $1
        AND (r.max_app_version_code IS NULL OR r.max_app_version_code >= $1)
-     ORDER BY r.category, r.name, CASE WHEN r.release_stage = 'active' THEN 2 ELSE 1 END DESC, r.version DESC`, [appVersionCode]);
-    const seen = new Set();
-    return rows.rows.filter((row) => {
-        const key = `${row.category}/${row.name}`;
-        if (seen.has(key))
-            return false;
-        if (!releaseTargetsMatch(row, systemType, schoolId))
-            return false;
-        if (!rolloutHit(row, bucket || "anonymous"))
-            return false;
-        seen.add(key);
-        return true;
+     ORDER BY r.category, r.name, CASE WHEN r.release_stage = 'canary' THEN 2 ELSE 1 END DESC, r.version DESC`, [appVersionCode]);
+    const selection = await loadAppSelection(bucket, schoolId, systemType, requestedPolicy);
+    const bindings = await loadSchoolBindings(schoolId, systemType);
+    return selectManifestRowsForTest(rows.rows, {
+        systemType,
+        schoolId,
+        appVersionCode,
+        bucket,
+        selection,
+        bindings
     });
+}
+export function selectManifestRowsForTest(rows, context) {
+    const policy = context.selection?.selection_policy || "auto";
+    if (policy === "assets_only")
+        return [];
+    const grouped = new Map();
+    for (const row of rows) {
+        if (!isReleaseEligible(row, context.appVersionCode))
+            continue;
+        if (!releaseTargetsMatch(row, context.systemType, context.schoolId))
+            continue;
+        const key = `${row.category}/${row.name}`;
+        grouped.set(key, [...(grouped.get(key) || []), row]);
+    }
+    const selected = [];
+    for (const group of grouped.values()) {
+        const picked = selectUserFixedRelease(group, context.selection) ||
+            selectUserSchoolSpecificRelease(group, context.selection) ||
+            selectSchoolBindingRelease(group, context.bindings) ||
+            selectCanaryRelease(group, context.bucket || "anonymous") ||
+            selectActiveRelease(group);
+        if (picked)
+            selected.push(picked);
+    }
+    return selected.sort((a, b) => priorityFor(b, context.systemType) - priorityFor(a, context.systemType));
+}
+async function loadAppSelection(bucket, schoolId, systemType, requestedPolicy) {
+    const result = await query(`SELECT selection_policy, preferred_release_id, preferred_script_id
+     FROM app_script_selections
+     WHERE install_bucket_id_hash = $1
+       AND (school_id = $2 OR school_id = '')
+       AND (school_system_type = $3 OR school_system_type = '')
+     ORDER BY CASE WHEN school_id = $2 THEN 1 ELSE 0 END DESC,
+       CASE WHEN school_system_type = $3 THEN 1 ELSE 0 END DESC,
+       updated_at DESC
+     LIMIT 1`, [bucket || "anonymous", schoolId || "", systemType || ""]);
+    const stored = result.rows[0] || null;
+    if (requestedPolicy && requestedPolicy !== "auto") {
+        return {
+            selection_policy: requestedPolicy,
+            preferred_release_id: stored?.preferred_release_id || null,
+            preferred_script_id: stored?.preferred_script_id || null
+        };
+    }
+    return stored;
+}
+async function loadSchoolBindings(schoolId, systemType) {
+    const result = await query(`SELECT binding_id, release_id, script_id, selection_policy, priority
+     FROM school_script_bindings
+     WHERE enabled = true
+       AND (school_id = $1 OR school_id = '')
+       AND (school_system_type = $2 OR school_system_type = '')
+     ORDER BY priority DESC, updated_at DESC`, [schoolId || "", systemType || ""]);
+    return result.rows;
+}
+function isReleaseEligible(row, appVersionCode) {
+    if (!["active", "canary"].includes(row.release_stage))
+        return false;
+    if (row.status !== "enabled" || row.kill_switch)
+        return false;
+    const minVersion = Number(row.min_app_version_code || 0);
+    const maxVersion = row.max_app_version_code ? Number(row.max_app_version_code) : null;
+    if (appVersionCode < minVersion)
+        return false;
+    if (maxVersion !== null && appVersionCode > maxVersion)
+        return false;
+    return true;
+}
+function selectUserFixedRelease(group, selection) {
+    if (selection?.selection_policy !== "fixed_release" || !selection.preferred_release_id)
+        return null;
+    const row = group.find((item) => item.release_id === selection.preferred_release_id);
+    return row ? markSelection(row, "fixed_release") : null;
+}
+function selectUserSchoolSpecificRelease(group, selection) {
+    if (selection?.selection_policy !== "school_specific")
+        return null;
+    const row = group.find((item) => {
+        if (selection.preferred_release_id && item.release_id === selection.preferred_release_id)
+            return true;
+        if (selection.preferred_script_id && item.script_id === selection.preferred_script_id)
+            return true;
+        return false;
+    });
+    return row ? markSelection(row, "school_specific") : null;
+}
+function selectSchoolBindingRelease(group, bindings) {
+    for (const binding of bindings.sort((a, b) => Number(b.priority || 0) - Number(a.priority || 0))) {
+        const row = group.find((item) => {
+            if (binding.release_id)
+                return item.release_id === binding.release_id;
+            return item.script_id === binding.script_id;
+        });
+        if (row)
+            return markSelection(row, "school_binding", binding.binding_id);
+    }
+    return null;
+}
+function selectCanaryRelease(group, bucket) {
+    const row = group
+        .filter((item) => item.release_stage === "canary" && rolloutHit(item, bucket))
+        .sort((a, b) => Number(b.version || 0) - Number(a.version || 0))[0];
+    return row ? markSelection(row, "auto") : null;
+}
+function selectActiveRelease(group) {
+    const row = group.filter((item) => item.release_stage === "active").sort((a, b) => Number(b.version || 0) - Number(a.version || 0))[0];
+    return row ? markSelection(row, "auto") : null;
+}
+function markSelection(row, selectionPolicy, schoolBindingId = null) {
+    return { ...row, selection_policy: selectionPolicy, school_binding_id: schoolBindingId };
 }
 function releaseTargetsMatch(row, systemType, schoolId) {
     const systems = Array.isArray(row.school_system_types_json) ? row.school_system_types_json.map(String) : [];

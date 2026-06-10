@@ -13,10 +13,9 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   IMAGE_NAME: dawncourse-server
   REGISTRY: ghcr.io
-  CHECKOUT_TOKEN: ${{ secrets.CHECKOUT_TOKEN != '' && secrets.CHECKOUT_TOKEN || secrets.GHCR_TOKEN != '' && secrets.GHCR_TOKEN || github.token }}
   GHCR_IMAGE: ghcr.io/hf-cygg/dawncourse-server
-  GHCR_USERNAME: ${{ secrets.GHCR_USERNAME != '' && secrets.GHCR_USERNAME || github.actor }}
-  GHCR_PASSWORD: ${{ secrets.GHCR_TOKEN != '' && secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+  GHCR_USERNAME: ${{ secrets.GHCR_USERNAME || github.actor }}
+  GHCR_PASSWORD: ${{ secrets.GHCR_TOKEN || github.token }}
   DOCKER_HUB_IMAGE: ${{ secrets.DOCKERHUB_NAMESPACE != '' && format('{0}/{1}', secrets.DOCKERHUB_NAMESPACE, 'dawncourse-server') || 'yemiao351/dawncourse' }}
   DOCKER_HUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_USERNAME || secrets.DOCKER_USERNAME }}
   DOCKER_HUB_PASSWORD: ${{ secrets.DOCKERHUB_TOKEN != '' && secrets.DOCKERHUB_TOKEN || secrets.DOCKER_PASSWORD }}
@@ -34,15 +33,26 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
-          token: ${{ env.CHECKOUT_TOKEN }}
           fetch-depth: 1
           persist-credentials: true
           submodules: false
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
+
+      - name: Check GHCR authentication mode
+        shell: bash
+        env:
+          HAS_GHCR_TOKEN: ${{ secrets.GHCR_TOKEN != '' && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          if [[ "${HAS_GHCR_TOKEN}" == "true" ]]; then
+            echo "Using GHCR_TOKEN for ghcr.io push."
+          else
+            echo "::warning::GHCR_TOKEN is not configured. Falling back to the workflow GITHUB_TOKEN. If ghcr.io push still fails with unauthorized, create a repository secret named GHCR_TOKEN with write:packages permission."
+          fi
 
       - name: Validate required Aliyun ACR secrets
         shell: bash

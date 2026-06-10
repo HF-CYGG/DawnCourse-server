@@ -5,7 +5,7 @@
 import fs from "node:fs";
 import { config } from "./config.js";
 import { buildRuntimeLogPayload, buildScriptHistoryEntries, formatAdminBufferLine } from "./adminContracts.js";
-import { query } from "./db.js";
+import { query, withTx } from "./db.js";
 import { addIssueEvent, setIssueStage } from "./events.js";
 import { describeScriptRepairWorkflow, formatScriptRepairWorkflowLabel, resolveScriptRepairWorkflow } from "./repairWorkflow.js";
 import { chatCompletionsUrl, getAutoRepairBlockedReason, runReplayOnly, startRepairJob } from "./repair.js";
@@ -742,23 +742,35 @@ async function loadModelConfig() {
     return getAdminConfigPayload();
 }
 async function publishRelease(releaseId, stage, actor) {
+    const normalizedStage = stage === "active" ? "active" : "canary";
     const release = await query("SELECT script_id, issue_id FROM script_releases WHERE release_id = $1", [releaseId]);
     const row = release.rows[0];
     if (!row)
         throw new Error("release_not_found");
-    if (stage === "active") {
-        await query("UPDATE script_releases SET release_stage = 'rolled_back' WHERE script_id = $1 AND release_stage = 'active'", [row.script_id]);
-    }
-    await query("UPDATE script_releases SET release_stage = $2, channel = $2, rollout_percent = CASE WHEN $2 = 'active' THEN 100 ELSE rollout_percent END, approved_by = $3, approved_at = now(), published_at = now() WHERE release_id = $1", [releaseId, stage, actor]);
-    await query("INSERT INTO audit_logs(actor, action, target_type, target_id, detail_json) VALUES ($1,'publish_release','script_release',$2,$3::jsonb)", [
-        actor,
-        releaseId,
-        JSON.stringify({ stage })
-    ]);
-    pushAdminLog("info", "发布脚本版本", { source: "script-release", actor, releaseId, stage });
+    await withTx(async (client) => {
+        if (normalizedStage === "active") {
+            await client.query(`UPDATE script_releases
+         SET release_stage = 'rolled_back', channel = 'rolled_back', rollout_percent = 0
+         WHERE script_id = $1 AND release_stage = 'active' AND release_id <> $2`, [row.script_id, releaseId]);
+        }
+        await client.query(`UPDATE script_releases
+       SET release_stage = $2,
+           channel = CASE WHEN $2 = 'active' THEN 'stable' ELSE 'canary' END,
+           rollout_percent = CASE WHEN $2 = 'active' THEN 100 ELSE GREATEST(rollout_percent, 1) END,
+           approved_by = $3,
+           approved_at = now(),
+           published_at = now()
+       WHERE release_id = $1`, [releaseId, normalizedStage, actor]);
+        await client.query("INSERT INTO audit_logs(actor, action, target_type, target_id, detail_json) VALUES ($1,'publish_release','script_release',$2,$3::jsonb)", [
+            actor,
+            releaseId,
+            JSON.stringify({ stage: normalizedStage })
+        ]);
+    });
+    pushAdminLog("info", "script release published", { source: "script-release", actor, releaseId, stage: normalizedStage });
     if (row.issue_id) {
-        await setIssueStage(row.issue_id, stage === "active" ? "ACTIVE" : "CANARY", `published ${stage}`);
-        await addIssueEvent({ issueId: row.issue_id, stage: stage === "active" ? "ACTIVE" : "CANARY", actor, message: `发布 ${releaseId} 到 ${stage}` });
+        await setIssueStage(row.issue_id, normalizedStage === "active" ? "ACTIVE" : "CANARY", `published ${normalizedStage}`);
+        await addIssueEvent({ issueId: row.issue_id, stage: normalizedStage === "active" ? "ACTIVE" : "CANARY", actor, message: `published ${releaseId} to ${normalizedStage}` });
     }
 }
 async function rollbackRelease(releaseId, actor) {
@@ -766,18 +778,23 @@ async function rollbackRelease(releaseId, actor) {
     const row = release.rows[0];
     if (!row)
         throw new Error("release_not_found");
-    await query("UPDATE script_releases SET release_stage = 'rolled_back' WHERE release_id = $1", [releaseId]);
-    if (row.parent_release_id) {
-        await query("UPDATE script_releases SET release_stage = 'active', channel = 'stable', rollout_percent = 100, status = 'enabled' WHERE release_id = $1", [
-            row.parent_release_id
+    await withTx(async (client) => {
+        await client.query("UPDATE script_releases SET release_stage = 'rolled_back', channel = 'rolled_back', rollout_percent = 0 WHERE release_id = $1", [releaseId]);
+        if (row.parent_release_id) {
+            await client.query(`UPDATE script_releases
+         SET release_stage = 'rolled_back', channel = 'rolled_back', rollout_percent = 0
+         WHERE script_id = $1 AND release_stage = 'active' AND release_id <> $2`, [row.script_id, row.parent_release_id]);
+            await client.query("UPDATE script_releases SET release_stage = 'active', channel = 'stable', rollout_percent = 100, status = 'enabled' WHERE release_id = $1", [
+                row.parent_release_id
+            ]);
+        }
+        await client.query("INSERT INTO audit_logs(actor, action, target_type, target_id, detail_json) VALUES ($1,'rollback_release','script_release',$2,$3::jsonb)", [
+            actor,
+            releaseId,
+            JSON.stringify({ parentReleaseId: row.parent_release_id })
         ]);
-    }
-    await query("INSERT INTO audit_logs(actor, action, target_type, target_id, detail_json) VALUES ($1,'rollback_release','script_release',$2,$3::jsonb)", [
-        actor,
-        releaseId,
-        JSON.stringify({ parentReleaseId: row.parent_release_id })
-    ]);
-    pushAdminLog("warning", "回滚脚本版本", {
+    });
+    pushAdminLog("warning", "script release rolled back", {
         source: "script-release",
         actor,
         releaseId,
@@ -785,7 +802,7 @@ async function rollbackRelease(releaseId, actor) {
     });
     if (row.issue_id) {
         await setIssueStage(row.issue_id, "ROLLED_BACK", "rolled back");
-        await addIssueEvent({ issueId: row.issue_id, stage: "ROLLED_BACK", actor, message: `已回滚 ${releaseId}` });
+        await addIssueEvent({ issueId: row.issue_id, stage: "ROLLED_BACK", actor, message: `rolled back ${releaseId}` });
     }
 }
 function formatIssue(row) {

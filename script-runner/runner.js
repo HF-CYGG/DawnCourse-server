@@ -1,33 +1,42 @@
 import http from "node:http";
 import { spawn } from "node:child_process";
+import { pathToFileURL } from "node:url";
 
 const PORT = Number(process.env.PORT || 8090);
 const MAX_BODY = Number(process.env.MAX_RUNNER_BODY || 1024 * 1024);
 
-const server = http.createServer(async (req, res) => {
-  try {
-    if (req.method === "GET" && req.url === "/health") return send(res, 200, { ok: true });
-    if (req.method !== "POST" || req.url !== "/run") return send(res, 404, { ok: false, errorMessage: "not_found" });
-    const body = await readBody(req);
-    const payload = JSON.parse(body || "{}");
-    const result = await execute(payload);
-    return send(res, 200, result);
-  } catch (error) {
-    return send(res, 500, {
-      ok: false,
-      status: "failed",
-      durationMs: 0,
-      schemaValid: false,
-      resultCount: 0,
-      errorCode: "runner_server_error",
-      errorMessage: error instanceof Error ? error.message : String(error)
-    });
-  }
-});
+export function normalizeResultForTest(targetType, result) {
+  return normalizeResult(targetType, result);
+}
 
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`[runner] listening on ${PORT}`);
-});
+export function createRunnerServer() {
+  return http.createServer(async (req, res) => {
+    try {
+      if (req.method === "GET" && req.url === "/health") return send(res, 200, { ok: true });
+      if (req.method !== "POST" || req.url !== "/run") return send(res, 404, failure("not_found", "not_found"));
+      const body = await readBody(req);
+      const payload = JSON.parse(body || "{}");
+      const result = await execute(payload);
+      return send(res, 200, result);
+    } catch (error) {
+      return send(res, 500, {
+        ok: false,
+        status: "failed",
+        durationMs: 0,
+        schemaValid: false,
+        resultCount: 0,
+        errorCode: "runner_server_error",
+        errorMessage: error instanceof Error ? error.message : String(error)
+      });
+    }
+  });
+}
+
+if (isMainModule()) {
+  createRunnerServer().listen(PORT, "0.0.0.0", () => {
+    console.log(`[runner] listening on ${PORT}`);
+  });
+}
 
 function execute(payload) {
   const timeoutMs = Math.max(500, Math.min(Number(payload.timeoutMs || 5000), 60000));
@@ -117,7 +126,9 @@ function executeSource(source, console, window, document, fetch, XMLHttpRequest)
 function resolveEntry(payload, window, globalObject, exported) {
   const names = payload.targetType === "parser"
     ? ["scheduleHtmlParser", "parse", "scheduleHtmlProvider"]
-    : ["extractTermOptions", "detectPageState", "navigateToSchedule", "run", "parse"];
+    : payload.targetType === "term_extractor"
+      ? ["extractTermOptions", "run", "parse"]
+      : ["navigateToSchedule", "detectPageState", "run", "parse"];
   if (payload.entry) names.unshift(payload.entry);
   for (const name of names) {
     if (typeof exported[name] === "function") return exported[name];
@@ -126,18 +137,119 @@ function resolveEntry(payload, window, globalObject, exported) {
   }
   return null;
 }
-function normalizeResult(targetType, result) {
-  if (targetType === "parser") {
-    const arr = Array.isArray(result) ? result : Array.isArray(result && result.courses) ? result.courses : [];
-    if (!arr.length) return { ok: false, schemaValid: true, resultCount: 0, errorCode: "empty_result", errorMessage: "parser returned empty courses" };
-    const valid = arr.some(c => c && Number(c.dayOfWeek || c.day || c.weekday) >= 1 && Number(c.startSection || c.startNode || c.sectionStart) > 0 && Number(c.duration || c.step || 1) > 0);
-    return { ok: valid, schemaValid: valid, resultCount: arr.length, errorCode: valid ? "" : "schema_invalid", errorMessage: valid ? "" : "course schema invalid" };
-  }
-  if (result == null) return { ok: false, schemaValid: false, resultCount: 0, errorCode: "empty_result", errorMessage: "script returned empty result" };
-  const count = Array.isArray(result) ? result.length : Object.keys(Object(result)).length;
-  return { ok: count > 0, schemaValid: count > 0, resultCount: count, errorCode: count > 0 ? "" : "empty_result", errorMessage: count > 0 ? "" : "empty structured result" };
-}
+${normalizeResult.toString()}
+${normalizeParserResult.toString()}
+${normalizeTermExtractorResult.toString()}
+${normalizeNavigationResult.toString()}
+${toArray.toString()}
+${isNonEmptyString.toString()}
+${isPositiveNumber.toString()}
+${isValidDay.toString()}
+${hasValidWeeks.toString()}
+${duplicateRatio.toString()}
+${failure.toString()}
 `;
+}
+
+function normalizeResult(targetType, result) {
+  if (targetType === "parser") return normalizeParserResult(result);
+  if (targetType === "term_extractor") return normalizeTermExtractorResult(result);
+  if (targetType === "navigation") return normalizeNavigationResult(result);
+  if (result == null) return failure("empty_result", "script returned empty result");
+  const count = Array.isArray(result) ? result.length : Object.keys(Object(result)).length;
+  return count > 0
+    ? { ok: true, schemaValid: true, resultCount: count, errorCode: "", errorMessage: "" }
+    : failure("empty_result", "empty structured result");
+}
+
+function normalizeParserResult(result) {
+  const courses = Array.isArray(result) ? result : Array.isArray(result?.courses) ? result.courses : [];
+  if (!courses.length) return failure("empty_result", "parser returned empty courses", true);
+  const invalid = courses.find((course) => {
+    const day = Number(course?.dayOfWeek ?? course?.day ?? course?.weekday);
+    const start = Number(course?.startSection ?? course?.startNode ?? course?.sectionStart);
+    const duration = Number(course?.duration ?? course?.step);
+    return !isNonEmptyString(course?.courseName ?? course?.name ?? course?.title)
+      || !isValidDay(day)
+      || !isPositiveNumber(start)
+      || !isPositiveNumber(duration)
+      || !hasValidWeeks(course);
+  });
+  if (invalid) return failure("schema_invalid", "course schema invalid");
+  if (duplicateRatio(courses) > 0.2) return failure("duplicate_ratio_high", "duplicate course ratio is too high");
+  return { ok: true, schemaValid: true, resultCount: courses.length, errorCode: "", errorMessage: "" };
+}
+
+function normalizeTermExtractorResult(result) {
+  const options = toArray(result?.terms ?? result?.options ?? result);
+  if (!options.length) return failure("empty_result", "term extractor returned empty options");
+  const validCount = options.filter((option) => {
+    const label = String(option?.label ?? option?.name ?? "");
+    const value = String(option?.value ?? option?.id ?? option?.termId ?? "");
+    return isNonEmptyString(label) && isNonEmptyString(value) && /\\d{4}|semester|term/i.test(`${label} ${value}`);
+  }).length;
+  return validCount > 0
+    ? { ok: true, schemaValid: true, resultCount: options.length, errorCode: "", errorMessage: "" }
+    : failure("schema_invalid", "term option schema invalid");
+}
+
+function normalizeNavigationResult(result) {
+  if (!result || typeof result !== "object") return failure("empty_result", "navigation returned empty result");
+  const action = String(result.action ?? result.type ?? result.kind ?? "");
+  const target = String(result.url ?? result.targetUrl ?? result.path ?? result.menuPath ?? result.selector ?? "");
+  const lowerTarget = target.toLowerCase();
+  const validAction = /navigate|click|open|redirect|state|menu|detect/i.test(action);
+  const validTarget = isNonEmptyString(target)
+    && (lowerTarget.startsWith("http://")
+      || lowerTarget.startsWith("https://")
+      || target.startsWith("/")
+      || lowerTarget.includes("xskb")
+      || lowerTarget.includes("schedule")
+      || lowerTarget.includes("timetable"));
+  return validAction && validTarget
+    ? { ok: true, schemaValid: true, resultCount: 1, errorCode: "", errorMessage: "" }
+    : failure("schema_invalid", "navigation action or target invalid");
+}
+
+function toArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function isNonEmptyString(value) {
+  return String(value ?? "").trim().length > 0;
+}
+
+function isPositiveNumber(value) {
+  return Number.isFinite(value) && value > 0;
+}
+
+function isValidDay(value) {
+  return Number.isInteger(value) && value >= 1 && value <= 7;
+}
+
+function hasValidWeeks(course) {
+  const start = Number(course?.startWeek ?? course?.weekStart ?? course?.start ?? 1);
+  const end = Number(course?.endWeek ?? course?.weekEnd ?? course?.end ?? start);
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return false;
+  return start > 0 && end >= start && end <= 60;
+}
+
+function duplicateRatio(courses) {
+  if (courses.length <= 1) return 0;
+  const keys = courses.map((course) =>
+    [
+      course?.courseName ?? course?.name ?? "",
+      course?.dayOfWeek ?? course?.day ?? "",
+      course?.startSection ?? course?.startNode ?? "",
+      course?.startWeek ?? "",
+      course?.endWeek ?? ""
+    ].join("|")
+  );
+  return 1 - new Set(keys).size / keys.length;
+}
+
+function failure(errorCode, errorMessage, schemaValid = false) {
+  return { ok: false, schemaValid, resultCount: 0, errorCode, errorMessage };
 }
 
 function readBody(req) {
@@ -158,4 +270,8 @@ function readBody(req) {
 function send(res, status, body) {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
   res.end(JSON.stringify(body));
+}
+
+function isMainModule() {
+  return process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 }

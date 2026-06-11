@@ -1,1 +1,15 @@
+.env
+.env.*
+!.env.example
+
+secrets/
+*.pem
+script_sign_private_env.txt
+script_verify_public_env.txt
+
 /llm-backend/node_modules/
+/script-runner/node_modules/
+/llm-backend/dist/
+/data/
+/shared/
+*.log

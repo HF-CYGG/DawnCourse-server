@@ -13,6 +13,8 @@ ADD COLUMN IF NOT EXISTS classification_evidence_json JSONB NOT NULL DEFAULT '[]
 
 -- 旧版本可能已经写入了相同 issue/session 下的重复授权样本。
 -- 先保留每组最早的一条可回放样本，其余重复记录降级为诊断记录，再创建唯一索引。
+-- Keep the earliest replayable authorized sample in each duplicate group.
+-- This prevents historical duplicate rows from blocking unique index creation.
 WITH duplicate_samples AS (
   SELECT id
   FROM (
@@ -95,6 +97,7 @@ GROUP BY COALESCE(issue_id, 'unknown');
 CREATE UNIQUE INDEX IF NOT EXISTS uq_failure_samples_issue_content
 ON failure_samples(issue_id, content_sha256)
 WHERE has_user_consent = true
+  AND COALESCE(issue_id, '') <> ''
   AND COALESCE(content_sha256, '') <> ''
   AND COALESCE(sanitized_content, '') <> '';
 

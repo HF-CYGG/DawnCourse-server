@@ -197,17 +197,17 @@ function applyHeuristics(
   }
 ): void {
   const { systemType, sourceHost, sourceUrlText, content, failureText, fingerprint, attemptName } = input;
-  if (fingerprint.hasCaptcha || includesAny(failureText, ["captcha", "验证码", "verify code"])) {
+  if (fingerprint.hasCaptcha || includesAny(failureText, ["captcha", "验证码", "校验码", "图形码", "verify code"])) {
     resolution.evidence.push("captcha marker detected");
     Object.assign(resolution, noRepair("LOGIN_OR_CAPTCHA", "login or captcha page", 0.9));
     return;
   }
-  if (fingerprint.hasLoginKeyword || includesAny(failureText, ["login", "未登录", "登录", "账号", "password"])) {
+  if (fingerprint.hasLoginKeyword || includesAny(failureText, ["login", "未登录", "登录", "账号", "密码", "统一身份认证", "password"])) {
     resolution.evidence.push("login marker detected");
     Object.assign(resolution, noRepair("LOGIN_OR_CAPTCHA", "user needs login", 0.88));
     return;
   }
-  if (includesAny(failureText, ["term", "semester", "学期", "学年", "extractor_empty", "term_options_empty"])) {
+  if (includesAny(failureText, ["term", "semester", "学期", "学年", "学年学期", "选项为空", "extractor_empty", "term_options_empty"])) {
     resolution.evidence.push("term extraction marker detected");
     Object.assign(resolution, {
       repairDomain: "TERM_EXTRACT_FAILURE",
@@ -220,7 +220,7 @@ function applyHeuristics(
     });
     return;
   }
-  if (includesAny(failureText, ["nav", "navigation", "入口", "菜单", "跳转"])) {
+  if (includesAny(failureText, ["nav", "navigation", "入口", "菜单", "跳转", "未识别到登录入口", "未进入课表页"])) {
     resolution.evidence.push("navigation marker detected");
     Object.assign(resolution, {
       repairDomain: "NAVIGATION_FAILURE",
@@ -233,7 +233,7 @@ function applyHeuristics(
     });
     return;
   }
-  if (includesAny(failureText, ["cloud", "云端"])) {
+  if (includesAny(failureText, ["cloud", "云端", "云端解析", "cloud_empty_result"])) {
     resolution.evidence.push("cloud fallback marker detected");
     Object.assign(resolution, {
       repairDomain: "CLOUD_PARSE_FAILURE",
@@ -284,7 +284,7 @@ function normalizeFailureStage(value: string | undefined): string {
 
 function looksLikeTimetable(content: string): boolean {
   if (!content) return false;
-  return /课表|课程|星期|节次|上课|教师|教室|timetable|schedule|kbtable|xskb|kbcx|kblist/.test(content);
+  return /课表|课程|星期|周次|节次|上课|教师|教室|教学班|timetable|schedule|kbtable|xskb|kbcx|kblist/.test(content);
 }
 
 function looksLikeZhengfangPortal(systemType: string, sourceHost: string, sourceUrlText: string, content: string): boolean {

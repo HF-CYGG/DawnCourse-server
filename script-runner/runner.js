@@ -93,6 +93,7 @@ function execute(payload) {
 function childProgram() {
   return `
 let input = "";
+const __stdout = process.stdout;
 process.stdin.on("data", c => input += c);
 process.stdin.on("end", () => {
   const started = Date.now();
@@ -104,26 +105,45 @@ process.stdin.on("end", () => {
   const fetch = undefined;
   const XMLHttpRequest = undefined;
   try {
+    lockDownHostGlobals();
     const exported = {};
     for (const dep of payload.dependencies || []) {
       Object.assign(exported, executeSource(String(dep.content || ""), console, window, document, fetch, XMLHttpRequest));
     }
     Object.assign(exported, executeSource(String(payload.scriptContent || ""), console, window, document, fetch, XMLHttpRequest));
-    const fn = resolveEntry(payload, window, globalThis, exported);
+    const fn = resolveEntry(payload, window, exported);
     if (typeof fn !== "function") throw new Error("entry_not_found");
     const result = fn(String(payload.sampleContent || ""));
     const normalized = normalizeResult(payload.targetType, result);
-    process.stdout.write(JSON.stringify({ ok: normalized.ok, status: normalized.ok ? "passed" : "invalid", schemaValid: normalized.schemaValid, resultCount: normalized.resultCount, result, console: logs, durationMs: Date.now() - started, errorCode: normalized.errorCode, errorMessage: normalized.errorMessage }));
+    __stdout.write(JSON.stringify({ ok: normalized.ok, status: normalized.ok ? "passed" : "invalid", schemaValid: normalized.schemaValid, resultCount: normalized.resultCount, result, console: logs, durationMs: Date.now() - started, errorCode: normalized.errorCode, errorMessage: normalized.errorMessage }));
   } catch (error) {
-    process.stdout.write(JSON.stringify({ ok: false, status: "failed", schemaValid: false, resultCount: 0, console: logs, durationMs: Date.now() - started, errorCode: "script_exception", errorMessage: error && error.message ? error.message : String(error) }));
+    __stdout.write(JSON.stringify({ ok: false, status: "failed", schemaValid: false, resultCount: 0, console: logs, durationMs: Date.now() - started, errorCode: "script_exception", errorMessage: error && error.message ? error.message : String(error) }));
   }
 });
 function executeSource(source, console, window, document, fetch, XMLHttpRequest) {
   const names = ["scheduleHtmlParser", "scheduleHtmlProvider", "scheduleTimer", "parse", "extractTermOptions", "detectPageState", "navigateToSchedule", "run"];
-  const capture = "return {" + names.map(name => name + ": (typeof " + name + " !== 'undefined' ? " + name + " : window." + name + ")").join(",") + "};";
-  return Function("console","window","document","fetch","XMLHttpRequest", source + "\\n" + capture)(console, window, document, fetch, XMLHttpRequest) || {};
+  const scriptGlobal = Object.create(null);
+  const capture = "return {" + names.map(name => name + ": (typeof " + name + " !== 'undefined' ? " + name + " : (window." + name + " || globalThis." + name + "))").join(",") + "};";
+  return Function(
+    "console",
+    "window",
+    "document",
+    "fetch",
+    "XMLHttpRequest",
+    "globalThis",
+    "self",
+    "process",
+    "require",
+    "module",
+    "exports",
+    "Buffer",
+    "setTimeout",
+    "setInterval",
+    "WebAssembly",
+    "\\\"use strict\\\";\\n" + source + "\\n" + capture
+  )(console, window, document, fetch, XMLHttpRequest, scriptGlobal, scriptGlobal, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined) || {};
 }
-function resolveEntry(payload, window, globalObject, exported) {
+function resolveEntry(payload, window, exported) {
   const names = payload.targetType === "parser"
     ? ["scheduleHtmlParser", "parse", "scheduleHtmlProvider"]
     : payload.targetType === "term_extractor"
@@ -132,10 +152,18 @@ function resolveEntry(payload, window, globalObject, exported) {
   if (payload.entry) names.unshift(payload.entry);
   for (const name of names) {
     if (typeof exported[name] === "function") return exported[name];
-    if (typeof globalObject[name] === "function") return globalObject[name];
     if (typeof window[name] === "function") return window[name];
   }
   return null;
+}
+function lockDownHostGlobals() {
+  for (const name of ["process", "require", "module", "exports", "Buffer", "SharedArrayBuffer", "WebAssembly"]) {
+    try {
+      Object.defineProperty(globalThis, name, { value: undefined, writable: false, configurable: false });
+    } catch {
+      try { globalThis[name] = undefined; } catch {}
+    }
+  }
 }
 ${normalizeResult.toString()}
 ${normalizeParserResult.toString()}

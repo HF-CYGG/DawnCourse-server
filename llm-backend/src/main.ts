@@ -17,7 +17,7 @@ async function bootstrap(): Promise<void> {
     logger: false,
     bodyLimit: config.maxContentLength + 1024 * 64
   });
-  await app.register(cors, { origin: true });
+  await app.register(cors, { origin: false });
 
   app.get("/health", async () => ({ ok: true, service: "llm-backend", version: "2.0.0" }));
 
@@ -27,7 +27,7 @@ async function bootstrap(): Promise<void> {
 
   app.setErrorHandler(async (error, request, reply) => {
     log.error("request failed", { url: request.url, error: error.message });
-    return reply.code(500).send({ code: 500, msg: error.message || "server_error", data: null });
+    return reply.code(500).send({ code: 500, msg: "server_error", data: null });
   });
 
   await app.listen({ host: "0.0.0.0", port: config.port });

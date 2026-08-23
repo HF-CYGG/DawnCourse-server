@@ -7,7 +7,7 @@ import { addIssueEvent, setIssueStage } from "./events.js";
 import { log } from "./log.js";
 import { getManifestPublicBaseUrl } from "./runtimeConfig.js";
 import { ReleaseStage } from "./types.js";
-import { hostFromUrl, id, parserForSystem, safeSegment, scriptId, sha256, signContent, stableJson } from "./utils.js";
+import { hostFromUrl, id, normalizeSystemType, parserForSystem, safeSegment, scriptId, sha256, signContent, stableJson } from "./utils.js";
 
 interface ReleaseRow {
   release_id: string;
@@ -50,10 +50,10 @@ interface SchoolScriptBinding {
 export async function seedBundledScripts(): Promise<void> {
   const candidates: Array<{ category: string; file: string; targetType: string }> = [];
   for (const dir of config.legacyScriptDirs) {
-    const category = dir.endsWith("/js") || dir.endsWith("\\js") ? "js" : "parsers";
+    const category = categoryFromDir(dir);
     if (!fs.existsSync(dir)) continue;
     for (const name of fs.readdirSync(dir).filter((item) => item.endsWith(".js"))) {
-      candidates.push({ category, file: path.join(dir, name), targetType: category === "parsers" ? "parser" : inferJsTarget(name) });
+      candidates.push({ category, file: path.join(dir, name), targetType: targetTypeFor(category, name) });
     }
   }
   for (const candidate of candidates) {
@@ -105,6 +105,8 @@ export async function createPendingRelease(input: {
   changelog: string;
   testReportId?: string;
   actor?: string;
+  schoolId?: string;
+  schoolSystemType?: string;
 }): Promise<string> {
   const latest = await query<{ version: number }>("SELECT COALESCE(MAX(version),0) AS version FROM script_artifacts WHERE script_id = $1", [
     input.scriptId
@@ -113,6 +115,11 @@ export async function createPendingRelease(input: {
   const releaseId = id("rel");
   const hash = sha256(input.content);
   const signature = signContent(input.content);
+  const scope = buildScriptReleaseScope({
+    name: input.name,
+    schoolId: input.schoolId || "",
+    schoolSystemType: input.schoolSystemType || ""
+  });
   await query(
     `INSERT INTO script_artifacts(script_id,target_type,category,name,version,release_id,content,content_sha256,signature,parent_release_id,test_report_id,provenance,created_by)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13)`,
@@ -134,7 +141,7 @@ export async function createPendingRelease(input: {
   );
   await query(
     `INSERT INTO script_releases(release_id,script_id,target_type,category,name,version,release_stage,channel,status,rollout_percent,school_system_types_json,school_ids_json,changelog,parent_release_id,issue_id)
-     VALUES ($1,$2,$3,$4,$5,$6,'pending','pending','enabled',0,$7::jsonb,'[]'::jsonb,$8,$9,$10)`,
+     VALUES ($1,$2,$3,$4,$5,$6,'pending','pending','enabled',0,$7::jsonb,$8::jsonb,$9,$10,$11)`,
     [
       releaseId,
       input.scriptId,
@@ -142,7 +149,8 @@ export async function createPendingRelease(input: {
       input.category,
       input.name,
       nextVersion,
-      JSON.stringify(systemTypesForScript(input.name)),
+      JSON.stringify(scope.schoolSystemTypes),
+      JSON.stringify(scope.schoolIds),
       input.changelog,
       input.parentReleaseId || null,
       input.issueId
@@ -151,6 +159,30 @@ export async function createPendingRelease(input: {
   await addIssueEvent({ issueId: input.issueId, stage: "PENDING_REVIEW", message: `candidate pending: ${input.name} v${nextVersion}`, meta: { releaseId } });
   await setIssueStage(input.issueId, "PENDING_REVIEW", "pending release created");
   return releaseId;
+}
+
+export function buildScriptReleaseScopeForTest(input: {
+  name: string;
+  schoolId: string;
+  schoolSystemType: string;
+}): { schoolSystemTypes: string[]; schoolIds: string[] } {
+  return buildScriptReleaseScope(input);
+}
+
+function buildScriptReleaseScope(input: {
+  name: string;
+  schoolId: string;
+  schoolSystemType: string;
+}): { schoolSystemTypes: string[]; schoolIds: string[] } {
+  const normalizedSystemType = normalizeSystemType(input.schoolSystemType);
+  const schoolSystemTypes = normalizedSystemType !== "UNKNOWN"
+    ? [normalizedSystemType]
+    : systemTypesForScript(input.name);
+  const schoolId = input.schoolId.trim();
+  return {
+    schoolSystemTypes,
+    schoolIds: schoolId ? [schoolId] : []
+  };
 }
 
 export async function registerRegistryRoutes(app: FastifyInstance): Promise<void> {
@@ -442,6 +474,25 @@ function priorityFor(row: ReleaseRow, systemType: string): number {
   if (row.name === parser) return 100;
   if (row.category === "parsers") return 50;
   return 10;
+}
+
+/**
+ * 由目录名推断脚本分类。
+ *
+ * 此前实现是「以 /js 结尾则 js，否则一律 parsers」，新增 runtime 目录后会把
+ * 共享执行契约误判为解析器，导致它被当成课表解析脚本参与 manifest 优先级排序。
+ */
+export function categoryFromDir(dir: string): string {
+  const base = path.basename(dir.replace(/[\\/]+$/, "")).toLowerCase();
+  if (base === "js" || base === "parsers" || base === "runtime") return base;
+  return "parsers";
+}
+
+/** 由分类与文件名推断 targetType */
+export function targetTypeFor(category: string, name: string): string {
+  if (category === "parsers") return "parser";
+  if (category === "runtime") return "runtime";
+  return inferJsTarget(name);
 }
 
 function inferJsTarget(name: string): string {

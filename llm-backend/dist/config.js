@@ -9,7 +9,7 @@ export const config = {
     redisUrl: process.env.REDIS_URL || "redis://redis:6379",
     runnerUrl: process.env.RUNNER_URL || "http://script-runner:8090",
     scriptOutputDir: process.env.SCRIPT_OUTPUT_DIR || "/shared/parsers",
-    legacyScriptDirs: (process.env.LEGACY_SCRIPT_OUTPUT_DIRS || "/shared/scripts/parsers,/shared/scripts/js")
+    legacyScriptDirs: (process.env.LEGACY_SCRIPT_OUTPUT_DIRS || "/shared/scripts/parsers,/shared/scripts/js,/shared/scripts/runtime")
         .split(",")
         .map((item) => item.trim())
         .filter(Boolean),

@@ -99,6 +99,13 @@ export interface RunnerRequest {
   entry?: string;
   timeoutMs?: number;
   memoryLimitMb?: number;
+  /**
+   * 共享执行契约（script_host.js）源码。
+   *
+   * 由后端读取「当前对外服务的那一版 harness」并随请求下发，使沙箱校验环境
+   * 与设备端实际执行环境保持同版本，避免契约漂移导致的误判。
+   */
+  harnessSource?: string;
 }
 
 export interface RunnerResponse {

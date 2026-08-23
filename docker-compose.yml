@@ -57,8 +57,8 @@ services:
       RUNNER_URL: http://script-runner:8090
       # 脚本输出目录
       SCRIPT_OUTPUT_DIR: /shared/parsers
-      # 挂载原始脚本以便自动迁移并生成 meta.json
-      LEGACY_SCRIPT_OUTPUT_DIRS: /shared/scripts/parsers,/shared/scripts/js
+      # 挂载原始脚本以便自动迁移并生成 meta.json（runtime 目录存放共享执行契约 script_host.js）
+      LEGACY_SCRIPT_OUTPUT_DIRS: /shared/scripts/parsers,/shared/scripts/js,/shared/scripts/runtime
       # 单次请求超时
       LLM_TIMEOUT_MS: 20000
       # 最大请求体长度
@@ -107,9 +107,14 @@ services:
   script-runner:
     build: ./script-runner
     restart: ${RESTART_POLICY:-no}
+    volumes:
+      # 共享执行契约的兜底来源。正常情况下由 llm-backend 随请求下发 harnessSource，
+      # 这里仅用于后端未携带时（如独立调试）的降级读取。
+      - ./html/scripts:/shared/scripts:ro
     environment:
       PORT: 8090
       MAX_RUNNER_BODY: 1048576
+      SCRIPT_HOST_PATH: /shared/scripts/runtime/script_host.js
     healthcheck:
       test:
         [

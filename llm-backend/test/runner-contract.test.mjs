@@ -42,7 +42,9 @@ test("runner blocks Node host globals from generated scripts", async () => {
           if (typeof Buffer !== "undefined") throw new Error("buffer exposed");
           const host = Function("return this")();
           if (host && (host.process || host.Buffer)) throw new Error("host global exposed");
-          return [{ courseName: "安全测试", dayOfWeek: 1, startSection: 1, duration: 2, startWeek: 1, endWeek: 16 }];
+          // 字段名必须是 name：设备端 parseParsedCourseArray 只读 name，
+          // 沙箱若接受 courseName 等别名，会放行「服务端通过但设备端 0 门课」的脚本。
+          return [{ name: "安全测试", dayOfWeek: 1, startSection: 1, duration: 2, startWeek: 1, endWeek: 16 }];
         }
       `
     });

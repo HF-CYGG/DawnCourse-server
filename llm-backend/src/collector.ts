@@ -24,11 +24,44 @@ const taskStore = new Map<
     result?: string;
     error?: string;
     issueId?: string;
+    schoolId?: string;
+    schoolName?: string;
+    schoolSystemType?: string;
     createdAt: number;
     startedAt?: number;
     completedAt?: number;
   }
 >();
+
+type CloudParseTaskRecord = {
+  taskId: string;
+  status: string;
+  result?: string;
+  error?: string;
+  issueId?: string;
+  schoolId?: string;
+  schoolName?: string;
+  schoolSystemType?: string;
+  createdAt: number;
+  startedAt?: number;
+  completedAt?: number;
+};
+
+export interface CloudParseTaskStore {
+  create(task: CloudParseTaskRecord): Promise<void>;
+  update(taskId: string, patch: Partial<CloudParseTaskRecord>): Promise<void>;
+  get(taskId: string): Promise<CloudParseTaskRecord | null>;
+}
+
+export interface SchoolProfileUpsert {
+  schoolId: string;
+  schoolName: string;
+  normalizedName: string;
+  schoolSystemType: string;
+  sourceHosts: string[];
+  status: "reported";
+  createdFromIssueId: string;
+}
 
 /**
  * 路由级依赖注入：
@@ -44,8 +77,10 @@ export interface CollectorRouteDeps {
     summaryConfig: ModelRuntimeConfig;
     issueId: string;
     taskStore: typeof taskStore;
+    cloudTaskStore: CloudParseTaskStore;
   }) => Promise<void>;
   taskStore?: typeof taskStore;
+  cloudTaskStore?: CloudParseTaskStore;
 }
 
 /**
@@ -66,6 +101,8 @@ export async function registerCollectorRoutes(app: FastifyInstance, deps: Collec
   const getRuntimeModelConfigFn = deps.getRuntimeModelConfig || getRuntimeModelConfig;
   const scheduleCloudParseTaskFn = deps.scheduleCloudParseTask || scheduleCloudParseTask;
   const routeTaskStore = deps.taskStore || taskStore;
+  const cloudTaskStore =
+    deps.cloudTaskStore || (deps.taskStore ? createMapCloudTaskStore(routeTaskStore) : pgCloudParseTaskStore);
   app.post("/api/v1/parse/report", async (request) => {
     const body = (request.body || {}) as ParseReportInput;
     const result = await ingestParseReportFn(body, "parse_report");
@@ -173,28 +210,41 @@ export async function registerCollectorRoutes(app: FastifyInstance, deps: Collec
     }
 
     const taskId = id("task");
-    routeTaskStore.set(taskId, {
+    const now = Date.now();
+    const taskRecord = {
+      taskId,
       status: "processing",
       issueId: issue.issueId,
-      createdAt: Date.now(),
-      startedAt: Date.now()
-    });
+      schoolId: String(body.schoolId || ""),
+      schoolName: String(body.schoolName || ""),
+      schoolSystemType: String(body.schoolSystemType || ""),
+      createdAt: now,
+      startedAt: now
+    };
+    await cloudTaskStore.create(taskRecord);
+    routeTaskStore.set(taskId, taskRecord);
     void scheduleCloudParseTaskFn({
       taskId,
       content,
       summaryConfig,
       issueId: issue.issueId,
-      taskStore: routeTaskStore
+      taskStore: routeTaskStore,
+      cloudTaskStore
     }).catch((error) => {
       const existing = routeTaskStore.get(taskId);
-      routeTaskStore.set(taskId, {
+      const failedTask = {
         status: "failed",
         issueId: existing?.issueId || issue.issueId,
+        schoolId: existing?.schoolId || "",
+        schoolName: existing?.schoolName || "",
+        schoolSystemType: existing?.schoolSystemType || "",
         createdAt: existing?.createdAt || Date.now(),
         startedAt: existing?.startedAt,
         completedAt: Date.now(),
         error: error instanceof Error ? error.message : String(error)
-      });
+      };
+      routeTaskStore.set(taskId, failedTask);
+      void cloudTaskStore.update(taskId, failedTask);
       log.error("cloud parse task failed", { taskId, issueId: issue.issueId, error: String(error) });
     });
     return apiOk({ taskId, status: "processing", issueId: issue.issueId });
@@ -202,7 +252,7 @@ export async function registerCollectorRoutes(app: FastifyInstance, deps: Collec
 
   app.get("/api/v1/task_status", async (request) => {
     const taskId = String((request.query as Record<string, unknown>).taskId || (request.query as Record<string, unknown>).id || "");
-    const task = routeTaskStore.get(taskId);
+    const task = (await cloudTaskStore.get(taskId)) || routeTaskStore.get(taskId);
     if (!task) {
       return {
         code: 404,
@@ -215,6 +265,9 @@ export async function registerCollectorRoutes(app: FastifyInstance, deps: Collec
       result: task.result || null,
       error: task.error || "",
       issueId: task.issueId || "",
+      schoolId: task.schoolId || "",
+      schoolName: task.schoolName || "",
+      schoolSystemType: task.schoolSystemType || "",
       startedAt: task.startedAt || 0,
       completedAt: task.completedAt || 0
     });
@@ -464,6 +517,18 @@ export async function ingestParseReport(body: ParseReportInput, source: string):
   await addIssueEvent({ issueId, stage: "CLASSIFIED", source: "classifier", message: `失败分类：${resolution.repairDomain}`, meta: resolution as unknown as Record<string, unknown> });
   await addIssueEvent({ issueId, stage: "ISSUE_MERGED", source, message: "已归并到 Repair Issue", meta: { issueKey: resolution.issueKey, sampleId } });
 
+  await upsertSchoolProfile(
+    buildSchoolProfileUpsert({
+      schoolId: String(session.schoolId || ""),
+      schoolName,
+      schoolSystemType,
+      sourceUrl,
+      issueId
+    })
+  ).catch((error) => {
+    log.error("school profile upsert failed", { issueId, error: String(error) });
+  });
+
   const postIngestPolicy = resolvePostIngestPolicy({
     hasSample: sampleId !== null,
     shouldAutoRepair: resolution.shouldAutoRepair
@@ -592,6 +657,162 @@ export function getTaskStore(): typeof taskStore {
   return taskStore;
 }
 
+export function buildSchoolProfileUpsertForTest(input: {
+  schoolId: string;
+  schoolName: string;
+  schoolSystemType: string;
+  sourceUrl: string;
+  issueId: string;
+}): SchoolProfileUpsert {
+  return buildSchoolProfileUpsert(input);
+}
+
+function buildSchoolProfileUpsert(input: {
+  schoolId: string;
+  schoolName: string;
+  schoolSystemType: string;
+  sourceUrl: string;
+  issueId: string;
+}): SchoolProfileUpsert {
+  const schoolSystemType = normalizeSystemType(input.schoolSystemType || "UNKNOWN");
+  const sourceHost = hostFromUrl(input.sourceUrl);
+  const normalizedName = normalizeSchoolProfileName(input.schoolName || sourceHost || "unknown");
+  const providedId = input.schoolId.trim();
+  const schoolId = providedId || `school:${schoolSystemType.toLowerCase()}:${normalizedName}`;
+  return {
+    schoolId,
+    schoolName: input.schoolName.trim() || sourceHost || schoolId,
+    normalizedName,
+    schoolSystemType,
+    sourceHosts: sourceHost ? [sourceHost] : [],
+    status: "reported",
+    createdFromIssueId: input.issueId
+  };
+}
+
+function normalizeSchoolProfileName(value: string): string {
+  return value.trim().replace(/\s+/g, "").toLowerCase();
+}
+
+async function upsertSchoolProfile(profile: SchoolProfileUpsert): Promise<void> {
+  await query(
+    `INSERT INTO school_profiles(school_id, school_name, normalized_name, school_system_type, source_hosts_json, status, created_from_issue_id)
+     VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7)
+     ON CONFLICT (school_id)
+     DO UPDATE SET
+       school_name = CASE
+         WHEN trim(school_profiles.school_name) = '' THEN EXCLUDED.school_name
+         ELSE school_profiles.school_name
+       END,
+       normalized_name = EXCLUDED.normalized_name,
+       school_system_type = CASE
+         WHEN school_profiles.school_system_type = 'UNKNOWN' THEN EXCLUDED.school_system_type
+         ELSE school_profiles.school_system_type
+       END,
+       source_hosts_json = (
+         SELECT jsonb_agg(DISTINCT value)
+         FROM jsonb_array_elements_text(school_profiles.source_hosts_json || EXCLUDED.source_hosts_json) AS value
+       ),
+       updated_at = now()`,
+    [
+      profile.schoolId,
+      profile.schoolName,
+      profile.normalizedName,
+      profile.schoolSystemType,
+      JSON.stringify(profile.sourceHosts),
+      profile.status,
+      profile.createdFromIssueId
+    ]
+  );
+}
+
+function createMapCloudTaskStore(store: typeof taskStore): CloudParseTaskStore {
+  return {
+    async create(task) {
+      store.set(task.taskId, task);
+    },
+    async update(taskId, patch) {
+      const existing = store.get(taskId);
+      if (!existing) return;
+      store.set(taskId, { ...existing, ...patch });
+    },
+    async get(taskId) {
+      const task = store.get(taskId);
+      return task ? { taskId, ...task } : null;
+    }
+  };
+}
+
+const pgCloudParseTaskStore: CloudParseTaskStore = {
+  async create(task) {
+    await query(
+      `INSERT INTO cloud_parse_tasks(task_id, status, issue_id, school_id, school_name, school_system_type, created_at, started_at, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,to_timestamp($7 / 1000.0),to_timestamp($8 / 1000.0),now())
+       ON CONFLICT (task_id)
+       DO UPDATE SET status = EXCLUDED.status, issue_id = EXCLUDED.issue_id, updated_at = now()`,
+      [
+        task.taskId,
+        task.status,
+        task.issueId || "",
+        task.schoolId || "",
+        task.schoolName || "",
+        task.schoolSystemType || "",
+        task.createdAt,
+        task.startedAt || task.createdAt
+      ]
+    );
+  },
+  async update(taskId, patch) {
+    await query(
+      `UPDATE cloud_parse_tasks
+       SET status = COALESCE($2, status),
+         result_text = COALESCE($3, result_text),
+         error_text = COALESCE($4, error_text),
+         completed_at = CASE WHEN $5::bigint IS NULL THEN completed_at ELSE to_timestamp($5 / 1000.0) END,
+         updated_at = now()
+       WHERE task_id = $1`,
+      [taskId, patch.status || null, patch.result || null, patch.error || null, patch.completedAt || null]
+    );
+  },
+  async get(taskId) {
+    const result = await query<{
+      task_id: string;
+      status: string;
+      result_text: string | null;
+      error_text: string | null;
+      issue_id: string | null;
+      school_id: string | null;
+      school_name: string | null;
+      school_system_type: string | null;
+      created_at_ms: string;
+      started_at_ms: string | null;
+      completed_at_ms: string | null;
+    }>(
+      `SELECT task_id, status, result_text, error_text, issue_id, school_id, school_name, school_system_type,
+         floor(extract(epoch from created_at) * 1000)::bigint::text AS created_at_ms,
+         floor(extract(epoch from started_at) * 1000)::bigint::text AS started_at_ms,
+         floor(extract(epoch from completed_at) * 1000)::bigint::text AS completed_at_ms
+       FROM cloud_parse_tasks WHERE task_id = $1`,
+      [taskId]
+    );
+    const row = result.rows[0];
+    if (!row) return null;
+    return {
+      taskId: row.task_id,
+      status: row.status,
+      result: row.result_text || undefined,
+      error: row.error_text || undefined,
+      issueId: row.issue_id || undefined,
+      schoolId: row.school_id || undefined,
+      schoolName: row.school_name || undefined,
+      schoolSystemType: row.school_system_type || undefined,
+      createdAt: Number(row.created_at_ms || 0),
+      startedAt: row.started_at_ms ? Number(row.started_at_ms) : undefined,
+      completedAt: row.completed_at_ms ? Number(row.completed_at_ms) : undefined
+    };
+  }
+};
+
 /**
  * 统一调度云端兜底解析任务：
  * - 默认实现直接调用当前文件内的解析逻辑；
@@ -603,25 +824,34 @@ async function scheduleCloudParseTask(input: {
   summaryConfig: ModelRuntimeConfig;
   issueId: string;
   taskStore: typeof taskStore;
+  cloudTaskStore: CloudParseTaskStore;
 }): Promise<void> {
-  await runCloudParseTask(input.taskId, input.content, input.summaryConfig, input.taskStore);
+  await runCloudParseTask(input.taskId, input.content, input.summaryConfig, input.taskStore, input.cloudTaskStore);
 }
 
 /**
  * 后台执行单次云端兜底解析，并把结果回写到任务状态仓库。
  * 这里直接产出 ParsedCourse JSON 数组文本，和客户端轮询接口形成闭环。
  */
-async function runCloudParseTask(taskId: string, content: string, summaryConfig: ModelRuntimeConfig, targetTaskStore: typeof taskStore = taskStore): Promise<void> {
+async function runCloudParseTask(
+  taskId: string,
+  content: string,
+  summaryConfig: ModelRuntimeConfig,
+  targetTaskStore: typeof taskStore = taskStore,
+  targetCloudTaskStore: CloudParseTaskStore = createMapCloudTaskStore(targetTaskStore)
+): Promise<void> {
   const existing = targetTaskStore.get(taskId);
   if (!existing) return;
   const parseResult = await callCloudParseProvider(content, summaryConfig);
-  targetTaskStore.set(taskId, {
+  const nextTask = {
     ...existing,
     status: parseResult.resultText != null ? "success" : "failed",
     result: parseResult.resultText || undefined,
     error: parseResult.resultText != null ? "" : parseResult.reason,
     completedAt: Date.now()
-  });
+  };
+  targetTaskStore.set(taskId, nextTask);
+  await targetCloudTaskStore.update(taskId, nextTask);
 }
 
 /**

@@ -13,13 +13,20 @@ import {
   type AdminBufferEntry,
   type RuntimeLogSourceKey
 } from "./adminContracts.js";
-import { query, withTx } from "./db.js";
+import { query } from "./db.js";
 import { addIssueEvent, setIssueStage } from "./events.js";
 import { describeScriptRepairWorkflow, formatScriptRepairWorkflowLabel, resolveScriptRepairWorkflow } from "./repairWorkflow.js";
 import { chatCompletionsUrl, getAutoRepairBlockedReason, runReplayOnly, startRepairJob } from "./repair.js";
 import { getAdminConfigPayload } from "./runtimeConfig.js";
 import { log } from "./log.js";
 import { limitString, id, sha256 } from "./utils.js";
+import {
+  disableScriptRelease,
+  publishScriptRelease,
+  rollbackScriptRelease,
+  type ScriptReleaseAdminResult
+} from "./scriptReleaseAdminService.js";
+import { createUploadedScriptRelease, revalidateScriptRelease, type ScriptUploadInput } from "./scriptUpload.js";
 
 type AdminRequest = FastifyRequest & { adminUser?: string };
 const eventStreamTokens = new Map<string, { username: string; expiresAt: number }>();
@@ -36,6 +43,11 @@ export interface AdminRouteDeps {
   runReplayOnly?: typeof runReplayOnly;
   startRepairJob?: typeof startRepairJob;
   addIssueEvent?: typeof addIssueEvent;
+  publishScriptRelease?: typeof publishScriptRelease;
+  rollbackScriptRelease?: typeof rollbackScriptRelease;
+  disableScriptRelease?: typeof disableScriptRelease;
+  createUploadedScriptRelease?: typeof createUploadedScriptRelease;
+  revalidateScriptRelease?: typeof revalidateScriptRelease;
 }
 
 export async function registerAdminRoutes(app: FastifyInstance, deps: AdminRouteDeps = {}): Promise<void> {
@@ -44,6 +56,11 @@ export async function registerAdminRoutes(app: FastifyInstance, deps: AdminRoute
   const runReplayOnlyFn = deps.runReplayOnly || runReplayOnly;
   const startRepairJobFn = deps.startRepairJob || startRepairJob;
   const addIssueEventFn = deps.addIssueEvent || addIssueEvent;
+  const publishScriptReleaseFn = deps.publishScriptRelease || publishScriptRelease;
+  const rollbackScriptReleaseFn = deps.rollbackScriptRelease || rollbackScriptRelease;
+  const disableScriptReleaseFn = deps.disableScriptRelease || disableScriptRelease;
+  const createUploadedScriptReleaseFn = deps.createUploadedScriptRelease || createUploadedScriptRelease;
+  const revalidateScriptReleaseFn = deps.revalidateScriptRelease || revalidateScriptRelease;
   await ensureBuiltinAdminUserFn();
 
   app.post("/api/v1/admin/login", async (request, reply) => {
@@ -404,11 +421,154 @@ export async function registerAdminRoutes(app: FastifyInstance, deps: AdminRoute
 
   app.get("/api/v1/admin/scripts", { preHandler: authRequiredFn }, async () => {
     const rows = await query(
-      `SELECT r.*, a.content_sha256, a.signature
-       FROM script_releases r JOIN script_artifacts a ON a.script_id = r.script_id AND a.version = r.version
+      `SELECT r.*, a.content_sha256, a.signature, parent.version AS parent_version,
+         COALESCE(metrics.verified_count,0) AS verified_count,
+         COALESCE(metrics.trial_passed_count,0) AS trial_passed_count,
+         COALESCE(metrics.activated_count,0) AS activated_count,
+         COALESCE(metrics.failed_count,0) AS failed_count,
+         COALESCE(metrics.quarantined_count,0) AS quarantined_count,
+         COALESCE(metrics.rolled_back_count,0) AS rolled_back_count
+       FROM script_releases r
+       JOIN script_artifacts a ON a.release_id = r.release_id
+       LEFT JOIN script_releases parent ON parent.release_id = r.parent_release_id
+       LEFT JOIN (
+         SELECT release_id,
+           SUM(event_count) FILTER (WHERE event_type = 'verified') AS verified_count,
+           SUM(event_count) FILTER (WHERE event_type = 'trial_passed') AS trial_passed_count,
+           SUM(event_count) FILTER (WHERE event_type = 'activated') AS activated_count,
+           SUM(event_count) FILTER (WHERE event_type = 'failed') AS failed_count,
+           SUM(event_count) FILTER (WHERE event_type = 'quarantined') AS quarantined_count,
+           SUM(event_count) FILTER (WHERE event_type = 'rolled_back') AS rolled_back_count
+         FROM script_activation_metrics GROUP BY release_id
+       ) metrics ON metrics.release_id = r.release_id
        ORDER BY r.created_at DESC LIMIT 300`
     );
     return apiOk({ list: rows.rows.map(formatRelease) });
+  });
+
+  app.post("/api/v1/admin/scripts/uploads", { preHandler: authRequiredFn }, async (request: AdminRequest, reply) => {
+    try {
+      const result = await createUploadedScriptReleaseFn(
+        (request.body || {}) as ScriptUploadInput,
+        request.adminUser || "admin"
+      );
+      pushAdminLog("info", "script candidate uploaded", {
+        source: "script-release",
+        actor: request.adminUser || "admin",
+        releaseId: result.releaseId,
+        scriptKey: result.scriptKey
+      });
+      return apiOk(result);
+    } catch (error) {
+      return sendScriptReleaseError(reply, error);
+    }
+  });
+
+  app.post("/api/v1/admin/scripts/releases/:id/revalidate", { preHandler: authRequiredFn }, async (request: AdminRequest, reply) => {
+    const releaseId = (request.params as { id: string }).id;
+    try {
+      const result = await revalidateScriptReleaseFn(
+        releaseId,
+        (request.body || {}) as Partial<ScriptUploadInput>,
+        request.adminUser || "admin"
+      );
+      return apiOk(result);
+    } catch (error) {
+      return sendScriptReleaseError(reply, error);
+    }
+  });
+
+  app.get("/api/v1/admin/scripts/releases/:id", { preHandler: authRequiredFn }, async (request, reply) => {
+    const releaseId = (request.params as { id: string }).id;
+    const releaseResult = await query(
+      `SELECT r.*, a.content, a.content_sha256, a.signature, a.alg,
+         parent.version AS parent_version, parent_artifact.content AS parent_content
+       FROM script_releases r
+       JOIN script_artifacts a ON a.release_id = r.release_id
+       LEFT JOIN script_releases parent ON parent.release_id = r.parent_release_id
+       LEFT JOIN script_artifacts parent_artifact ON parent_artifact.release_id = parent.release_id
+       WHERE r.release_id = $1 LIMIT 1`,
+      [releaseId]
+    );
+    const release = releaseResult.rows[0];
+    if (!release) return reply.code(404).send(apiError(404, "脚本版本不存在"));
+    const [dependencies, validations, audits, metrics] = await Promise.all([
+      query(
+        `SELECT d.load_order,dr.release_id,dr.name,dr.version,da.content_sha256
+         FROM script_release_dependencies d
+         JOIN script_releases dr ON dr.release_id = d.dependency_release_id
+         JOIN script_artifacts da ON da.release_id = dr.release_id
+         WHERE d.release_id = $1 ORDER BY d.load_order`,
+        [releaseId]
+      ),
+      query("SELECT * FROM script_manual_validations WHERE release_id = $1 ORDER BY created_at DESC", [releaseId]),
+      query("SELECT actor,action,detail_json,created_at FROM audit_logs WHERE target_type = 'script_release' AND target_id = $1 ORDER BY created_at DESC", [releaseId]),
+      query(
+        `SELECT metric_date,school_id,school_system_type,event_type,error_code,SUM(event_count)::bigint AS event_count,MAX(last_event_at) AS last_event_at
+         FROM script_activation_metrics WHERE release_id = $1
+         GROUP BY metric_date,school_id,school_system_type,event_type,error_code
+         ORDER BY metric_date DESC,last_event_at DESC`,
+        [releaseId]
+      )
+    ]);
+    return apiOk({
+      release: formatRelease(release),
+      content: release.content || "",
+      parentContent: release.parent_content || "",
+      validationReport: release.validation_report_json || {},
+      dependencies: dependencies.rows,
+      manualValidations: validations.rows,
+      timeline: audits.rows,
+      activationMetrics: metrics.rows
+    });
+  });
+
+  app.get("/api/v1/admin/scripts/activation-metrics", { preHandler: authRequiredFn }, async (request) => {
+    const q = request.query as Record<string, string | undefined>;
+    const releaseId = String(q.releaseId || "").trim();
+    const rows = await query(
+      `SELECT m.metric_date,m.release_id,r.script_key,r.name,m.school_id,m.school_system_type,
+         m.event_type,m.error_code,SUM(m.event_count)::bigint AS event_count,MAX(m.last_event_at) AS last_event_at
+       FROM script_activation_metrics m
+       JOIN script_releases r ON r.release_id = m.release_id
+       WHERE ($1 = '' OR m.release_id = $1)
+       GROUP BY m.metric_date,m.release_id,r.script_key,r.name,m.school_id,m.school_system_type,m.event_type,m.error_code
+       ORDER BY m.metric_date DESC,last_event_at DESC LIMIT 1000`,
+      [releaseId]
+    );
+    return apiOk({ list: rows.rows });
+  });
+
+  app.get("/api/v1/admin/unmatched-schools", { preHandler: authRequiredFn }, async () => {
+    const rows = await query(
+      `SELECT sp.school_id,sp.school_name,sp.school_system_type,sp.status,sp.updated_at,
+         COALESCE(samples.sample_count,0) AS sample_count,
+         generic_release.release_id AS generic_release_id,
+         generic_release.name AS generic_script_name,
+         school_release.release_id AS school_release_id,
+         school_release.name AS school_script_name,
+         school_release.release_stage AS school_release_stage,
+         school_release.validation_status AS school_validation_status,
+         sp.created_from_issue_id
+       FROM school_profiles sp
+       LEFT JOIN LATERAL (
+         SELECT COUNT(*)::int AS sample_count FROM failure_samples fs
+         WHERE fs.school_id = sp.school_id AND fs.has_user_consent = true AND fs.sanitized_content <> ''
+       ) samples ON true
+       LEFT JOIN LATERAL (
+         SELECT release_id,name FROM script_releases
+         WHERE category = 'parsers' AND scope_kind = 'system' AND scope_id = sp.school_system_type
+           AND release_stage IN ('active','canary') AND status = 'enabled' AND kill_switch = false
+         ORDER BY CASE WHEN release_stage = 'active' THEN 2 ELSE 1 END DESC,version DESC LIMIT 1
+       ) generic_release ON true
+       LEFT JOIN LATERAL (
+         SELECT release_id,name,release_stage,validation_status FROM script_releases
+         WHERE category = 'parsers' AND scope_kind = 'school' AND scope_id = sp.school_id
+         ORDER BY created_at DESC LIMIT 1
+       ) school_release ON true
+       ORDER BY sample_count DESC,sp.updated_at DESC LIMIT 500`
+    );
+    return apiOk({ list: rows.rows });
   });
 
   app.get("/api/v1/admin/script_content", { preHandler: authRequiredFn }, async (request) => {
@@ -417,33 +577,75 @@ export async function registerAdminRoutes(app: FastifyInstance, deps: AdminRoute
     return apiOk({ content: row.rows[0]?.content || "" });
   });
 
-  app.post("/api/v1/admin/scripts/releases", { preHandler: authRequiredFn }, async (request: AdminRequest) => {
+  app.post("/api/v1/admin/scripts/releases", { preHandler: authRequiredFn }, async (request: AdminRequest, reply) => {
     const body = (request.body || {}) as Record<string, unknown>;
     const releaseId = String(body.releaseId || "");
     const targetStage = String(body.releaseStage || body.stage || "canary");
-    if (!releaseId) return { code: 400, msg: "missing releaseId", data: null };
-    await publishRelease(releaseId, targetStage, request.adminUser || "admin");
-    return apiOk({ releaseId, releaseStage: targetStage });
+    const rolloutPercent = targetStage === "active" ? 100 : Number(body.rolloutPercent ?? 10);
+    if (!releaseId) return reply.code(400).send(apiError(400, "缺少 releaseId"));
+    try {
+      const result = await publishScriptReleaseFn(releaseId, targetStage, rolloutPercent, request.adminUser || "admin");
+      await recordPublishedIssue(result, request.adminUser || "admin");
+      pushAdminLog("info", "script release published", { source: "script-release", actor: request.adminUser || "admin", releaseId, stage: targetStage, rolloutPercent });
+      return apiOk(result);
+    } catch (error) {
+      return sendScriptReleaseError(reply, error);
+    }
   });
 
-  app.post("/api/v1/admin/promote_script", { preHandler: authRequiredFn }, async (request: AdminRequest) => {
+  app.post("/api/v1/admin/promote_script", { preHandler: authRequiredFn }, async (request: AdminRequest, reply) => {
     const body = (request.body || {}) as Record<string, unknown>;
     const releaseId = String(body.releaseId || "");
-    if (releaseId) await publishRelease(releaseId, String(body.stage || "active"), request.adminUser || "admin");
-    return apiOk({ promoted: Boolean(releaseId), releaseId });
+    if (!releaseId) return reply.code(400).send(apiError(400, "旧版按脚本名发布已停用，请提供 releaseId"));
+    const stage = String(body.stage || body.pushMode || "active");
+    const rolloutPercent = stage === "active" ? 100 : Number(body.rolloutPercent ?? 10);
+    try {
+      const result = await publishScriptReleaseFn(releaseId, stage, rolloutPercent, request.adminUser || "admin");
+      await recordPublishedIssue(result, request.adminUser || "admin");
+      return apiOk({ ...result, promoted: true });
+    } catch (error) {
+      return sendScriptReleaseError(reply, error);
+    }
   });
 
-  app.post("/api/v1/admin/scripts/releases/:id/rollback", { preHandler: authRequiredFn }, async (request: AdminRequest) => {
+  app.post("/api/v1/admin/scripts/releases/:id/rollback", { preHandler: authRequiredFn }, async (request: AdminRequest, reply) => {
     const releaseId = (request.params as { id: string }).id;
-    await rollbackRelease(releaseId, request.adminUser || "admin");
-    return apiOk({ rolledBack: true });
+    try {
+      const result = await rollbackScriptReleaseFn(releaseId, request.adminUser || "admin");
+      await recordRolledBackIssue(result, request.adminUser || "admin");
+      pushAdminLog("warning", "script release rolled back", { source: "script-release", actor: request.adminUser || "admin", releaseId, parentReleaseId: result.parentReleaseId });
+      return apiOk({ ...result, rolledBack: true });
+    } catch (error) {
+      return sendScriptReleaseError(reply, error);
+    }
   });
 
-  app.post("/api/v1/admin/rollback_script", { preHandler: authRequiredFn }, async (request: AdminRequest) => {
+  app.post("/api/v1/admin/rollback_script", { preHandler: authRequiredFn }, async (request: AdminRequest, reply) => {
     const body = (request.body || {}) as Record<string, string>;
-    const row = await query("SELECT release_id FROM script_releases WHERE name = $1 AND release_stage = 'active' ORDER BY version DESC LIMIT 1", [body.scriptName || ""]);
-    if (row.rows[0]?.release_id) await rollbackRelease(String(row.rows[0].release_id), request.adminUser || "admin");
-    return apiOk({ rolledBack: Boolean(row.rows[0]) });
+    const releaseId = String(body.releaseId || "");
+    if (!releaseId) return reply.code(400).send(apiError(400, "旧版按脚本名回滚已停用，请提供 releaseId"));
+    try {
+      const result = await rollbackScriptReleaseFn(releaseId, request.adminUser || "admin");
+      await recordRolledBackIssue(result, request.adminUser || "admin");
+      return apiOk({ ...result, rolledBack: true });
+    } catch (error) {
+      return sendScriptReleaseError(reply, error);
+    }
+  });
+
+  app.post("/api/v1/admin/scripts/releases/:id/disable", { preHandler: authRequiredFn }, async (request: AdminRequest, reply) => {
+    const releaseId = (request.params as { id: string }).id;
+    const body = (request.body || {}) as Record<string, unknown>;
+    try {
+      const result = await disableScriptReleaseFn(releaseId, String(body.reason || ""), request.adminUser || "admin");
+      if (result.issueId) {
+        await setIssueStage(result.issueId, "DISABLED", "release disabled");
+        await addIssueEvent({ issueId: result.issueId, stage: "DISABLED", actor: request.adminUser || "admin", message: `disabled ${releaseId}` });
+      }
+      return apiOk({ ...result, disabled: true });
+    } catch (error) {
+      return sendScriptReleaseError(reply, error);
+    }
   });
 
   app.get("/api/v1/admin/script_history", { preHandler: authRequiredFn }, async (request) => {
@@ -472,7 +674,7 @@ export async function registerAdminRoutes(app: FastifyInstance, deps: AdminRoute
          i.school_name
        FROM script_releases r
        LEFT JOIN script_releases pr ON pr.release_id = r.parent_release_id
-       LEFT JOIN script_artifacts a ON a.script_id = r.script_id AND a.version = r.version
+       LEFT JOIN script_artifacts a ON a.release_id = r.release_id
        LEFT JOIN repair_issues i ON i.issue_id = r.issue_id
        WHERE r.name = $1
        ORDER BY r.created_at DESC
@@ -830,80 +1032,29 @@ async function loadModelConfig(): Promise<Record<string, unknown>> {
   return getAdminConfigPayload();
 }
 
-async function publishRelease(releaseId: string, stage: string, actor: string): Promise<void> {
-  const normalizedStage = stage === "active" ? "active" : "canary";
-  const release = await query<{ script_id: string; issue_id: string | null }>("SELECT script_id, issue_id FROM script_releases WHERE release_id = $1", [releaseId]);
-  const row = release.rows[0];
-  if (!row) throw new Error("release_not_found");
-  await withTx(async (client) => {
-    if (normalizedStage === "active") {
-      await client.query(
-        `UPDATE script_releases
-         SET release_stage = 'rolled_back', channel = 'rolled_back', rollout_percent = 0
-         WHERE script_id = $1 AND release_stage = 'active' AND release_id <> $2`,
-        [row.script_id, releaseId]
-      );
-    }
-    await client.query(
-      `UPDATE script_releases
-       SET release_stage = $2,
-           channel = CASE WHEN $2 = 'active' THEN 'stable' ELSE 'canary' END,
-           rollout_percent = CASE WHEN $2 = 'active' THEN 100 ELSE GREATEST(rollout_percent, 1) END,
-           approved_by = $3,
-           approved_at = now(),
-           published_at = now()
-       WHERE release_id = $1`,
-      [releaseId, normalizedStage, actor]
-    );
-    await client.query("INSERT INTO audit_logs(actor, action, target_type, target_id, detail_json) VALUES ($1,'publish_release','script_release',$2,$3::jsonb)", [
-      actor,
-      releaseId,
-      JSON.stringify({ stage: normalizedStage })
-    ]);
-  });
-  pushAdminLog("info", "script release published", { source: "script-release", actor, releaseId, stage: normalizedStage });
-  if (row.issue_id) {
-    await setIssueStage(row.issue_id, normalizedStage === "active" ? "ACTIVE" : "CANARY", `published ${normalizedStage}`);
-    await addIssueEvent({ issueId: row.issue_id, stage: normalizedStage === "active" ? "ACTIVE" : "CANARY", actor, message: `published ${releaseId} to ${normalizedStage}` });
-  }
+/** 同步自动修复问题的发布阶段。 */
+async function recordPublishedIssue(result: ScriptReleaseAdminResult, actor: string): Promise<void> {
+  if (!result.issueId) return;
+  const stage = result.releaseStage === "active" ? "ACTIVE" : "CANARY";
+  await setIssueStage(result.issueId, stage, `published ${result.releaseStage}`);
+  await addIssueEvent({ issueId: result.issueId, stage, actor, message: `published ${result.releaseId} to ${result.releaseStage}` });
 }
 
-async function rollbackRelease(releaseId: string, actor: string): Promise<void> {
-  const release = await query<{ script_id: string; parent_release_id: string | null; issue_id: string | null }>(
-    "SELECT script_id, parent_release_id, issue_id FROM script_releases WHERE release_id = $1",
-    [releaseId]
-  );
-  const row = release.rows[0];
-  if (!row) throw new Error("release_not_found");
-  await withTx(async (client) => {
-    await client.query("UPDATE script_releases SET release_stage = 'rolled_back', channel = 'rolled_back', rollout_percent = 0 WHERE release_id = $1", [releaseId]);
-    if (row.parent_release_id) {
-      await client.query(
-        `UPDATE script_releases
-         SET release_stage = 'rolled_back', channel = 'rolled_back', rollout_percent = 0
-         WHERE script_id = $1 AND release_stage = 'active' AND release_id <> $2`,
-        [row.script_id, row.parent_release_id]
-      );
-      await client.query("UPDATE script_releases SET release_stage = 'active', channel = 'stable', rollout_percent = 100, status = 'enabled' WHERE release_id = $1", [
-        row.parent_release_id
-      ]);
-    }
-    await client.query("INSERT INTO audit_logs(actor, action, target_type, target_id, detail_json) VALUES ($1,'rollback_release','script_release',$2,$3::jsonb)", [
-      actor,
-      releaseId,
-      JSON.stringify({ parentReleaseId: row.parent_release_id })
-    ]);
-  });
-  pushAdminLog("warning", "script release rolled back", {
-    source: "script-release",
-    actor,
-    releaseId,
-    parentReleaseId: row.parent_release_id || ""
-  });
-  if (row.issue_id) {
-    await setIssueStage(row.issue_id, "ROLLED_BACK", "rolled back");
-    await addIssueEvent({ issueId: row.issue_id, stage: "ROLLED_BACK", actor, message: `rolled back ${releaseId}` });
+/** 同步自动修复问题的回滚阶段。 */
+async function recordRolledBackIssue(result: ScriptReleaseAdminResult, actor: string): Promise<void> {
+  if (!result.issueId) return;
+  await setIssueStage(result.issueId, "ROLLED_BACK", "rolled back");
+  await addIssueEvent({ issueId: result.issueId, stage: "ROLLED_BACK", actor, message: `rolled back ${result.releaseId}` });
+}
+
+/** 将发布服务错误映射为稳定的管理 API HTTP 状态。 */
+function sendScriptReleaseError(reply: FastifyReply, error: unknown): FastifyReply {
+  const code = error instanceof Error ? error.message : String(error);
+  if (code === "release_not_found") return reply.code(404).send(apiError(404, "脚本版本不存在"));
+  if (code === "release_not_validated" || code === "rollback_parent_scope_mismatch") {
+    return reply.code(409).send(apiError(409, code));
   }
+  return reply.code(400).send(apiError(400, code));
 }
 
 function formatIssue(row: Record<string, unknown>): Record<string, unknown> {
@@ -971,25 +1122,62 @@ function formatRelease(row: Record<string, unknown>): Record<string, unknown> {
     targetType: String(row.target_type || ""),
     category: String(row.category || "")
   });
+  const releaseStage = String(row.release_stage || "");
+  const parentVersion = Number(row.parent_version || 0);
+  const updatedAt = row.published_at || row.created_at;
+  const activation = {
+    verified: Number(row.verified_count || 0),
+    trialPassed: Number(row.trial_passed_count || 0),
+    activated: Number(row.activated_count || 0),
+    failed: Number(row.failed_count || 0),
+    quarantined: Number(row.quarantined_count || 0),
+    rolledBack: Number(row.rolled_back_count || 0)
+  };
   return {
     releaseId: row.release_id,
     scriptId: row.script_id,
+    scriptKey: row.script_key,
     targetType: row.target_type,
     category: row.category,
     scriptRepairWorkflow: repairWorkflow,
     scriptRepairWorkflowLabel: formatScriptRepairWorkflowLabel(repairWorkflow),
     scriptRepairWorkflowDescription: describeScriptRepairWorkflow(repairWorkflow),
     name: row.name,
+    scriptName: row.name,
     version: row.version,
-    releaseStage: row.release_stage,
+    parentReleaseId: row.parent_release_id || "",
+    parentVersion,
+    releaseStage,
     channel: row.channel,
     status: row.status,
     rolloutPercent: row.rollout_percent,
     killSwitch: row.kill_switch,
+    scopeKind: row.scope_kind,
+    scopeId: row.scope_id,
+    schoolSystemType: row.school_system_type,
+    validationStatus: row.validation_status,
+    validationReport: row.validation_report_json || {},
+    parserApiVersion: row.parser_api_version,
+    runnerContractVersion: row.runner_contract_version,
     sha256: row.content_sha256,
     signatureReady: Boolean(row.signature),
     issueId: row.issue_id,
-    updatedAt: row.published_at || row.created_at
+    updatedAt,
+    appliedBy: row.approved_by || row.created_by || "",
+    pendingAvailable: releaseStage === "pending" && String(row.validation_status || "") === "passed",
+    rollbackAvailable: Boolean(row.parent_release_id && parentVersion > 0),
+    rollbackTargetVersion: parentVersion,
+    activation,
+    meta: {
+      scriptName: row.name,
+      targetType: row.target_type,
+      category: row.category,
+      version: Number(row.version || 0),
+      parentVersion,
+      releaseStage,
+      updatedAt: updatedAt ? new Date(String(updatedAt)).getTime() : 0,
+      appliedBy: row.approved_by || row.created_by || ""
+    }
   };
 }
 

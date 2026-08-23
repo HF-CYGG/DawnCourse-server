@@ -4,8 +4,16 @@
  */
 
 import { normalizeStoredAdminToken, resolveAdminApiError } from "./admin-auth-utils.js";
+import {
+  describeNonJsonAdminResponse,
+  filterReleaseTracks,
+  validateUploadFileDescriptor
+} from "./script-release-utils.js";
 
 const overlay = document.getElementById("loginOverlay");
+const adminSidebar = document.getElementById("adminSidebar");
+const mobileNavToggle = document.getElementById("mobileNavToggle");
+const sidebarBackdrop = document.getElementById("sidebarBackdrop");
 const loginBtn = document.getElementById("loginBtn");
 const loginHint = document.getElementById("loginHint");
 const loginUserInput = document.getElementById("loginUser");
@@ -88,6 +96,30 @@ const failureTableMeta = document.getElementById("failureTableMeta");
 const pullScriptTableMeta = document.getElementById("pullScriptTableMeta");
 const scriptReleaseGuide = document.getElementById("scriptReleaseGuide");
 const scriptReleaseMeta = document.getElementById("scriptReleaseMeta");
+const scriptOpsTabs = document.getElementById("scriptOpsTabs");
+const releaseFilterSystem = document.getElementById("releaseFilterSystem");
+const releaseFilterScope = document.getElementById("releaseFilterScope");
+const releaseFilterCategory = document.getElementById("releaseFilterCategory");
+const releaseFilterStage = document.getElementById("releaseFilterStage");
+const releaseFilterValidation = document.getElementById("releaseFilterValidation");
+const scriptUploadForm = document.getElementById("scriptUploadForm");
+const scriptUploadFile = document.getElementById("scriptUploadFile");
+const scriptUploadName = document.getElementById("scriptUploadName");
+const scriptUploadCategory = document.getElementById("scriptUploadCategory");
+const scriptUploadTarget = document.getElementById("scriptUploadTarget");
+const scriptUploadScopeKind = document.getElementById("scriptUploadScopeKind");
+const scriptUploadScopeId = document.getElementById("scriptUploadScopeId");
+const scriptUploadSystem = document.getElementById("scriptUploadSystem");
+const scriptUploadChangelog = document.getElementById("scriptUploadChangelog");
+const scriptUploadTestSchool = document.getElementById("scriptUploadTestSchool");
+const scriptUploadPageStage = document.getElementById("scriptUploadPageStage");
+const scriptUploadManualResult = document.getElementById("scriptUploadManualResult");
+const scriptUploadManualPassed = document.getElementById("scriptUploadManualPassed");
+const scriptUploadStatus = document.getElementById("scriptUploadStatus");
+const unmatchedSchoolMeta = document.getElementById("unmatchedSchoolMeta");
+const unmatchedSchoolTableBody = document.querySelector("#unmatchedSchoolTable tbody");
+const activationMetricMeta = document.getElementById("activationMetricMeta");
+const activationMetricTableBody = document.querySelector("#activationMetricTable tbody");
 const runtimeLogSummaryCards = document.getElementById("runtimeLogSummaryCards");
 const runtimeLogCallout = document.getElementById("runtimeLogCallout");
 const pageRefreshStatus = document.getElementById("pageRefreshStatus");
@@ -107,6 +139,9 @@ const confirmSubmitBtn = document.getElementById("confirmSubmitBtn");
 let currentData = null;
 let eventSource = null;
 let scriptsCache = null;
+let unmatchedSchoolsCache = [];
+let activationMetricsCache = [];
+let selectedUploadContent = "";
 const eventToastSeenMap = new Map();
 let lastEventStreamWarnAt = 0;
 let runtimeLogSnapshot = {
@@ -115,6 +150,8 @@ let runtimeLogSnapshot = {
   loadedAt: 0
 };
 let scriptModalState = {
+  releaseId: "",
+  detail: null,
   scriptName: "",
   rollbackTargetVersion: 0,
   selectedVersion: 0,
@@ -267,6 +304,28 @@ function openFloatingMenu(anchorEl, { mode, issueId }) {
 const navItems = document.querySelectorAll(".nav-item");
 const pageSections = document.querySelectorAll(".page-section");
 const pageTitle = document.getElementById("pageTitle");
+
+function setMobileNavigationOpen(open) {
+  const shouldOpen = Boolean(open) && window.matchMedia("(max-width: 820px)").matches;
+  adminSidebar?.classList.toggle("mobile-open", shouldOpen);
+  sidebarBackdrop?.classList.toggle("visible", shouldOpen);
+  mobileNavToggle?.setAttribute("aria-expanded", shouldOpen ? "true" : "false");
+  mobileNavToggle?.setAttribute("aria-label", shouldOpen ? "关闭导航" : "打开导航");
+}
+
+mobileNavToggle?.addEventListener("click", () => {
+  setMobileNavigationOpen(!adminSidebar?.classList.contains("mobile-open"));
+});
+sidebarBackdrop?.addEventListener("click", () => setMobileNavigationOpen(false));
+window.addEventListener("resize", () => {
+  if (!window.matchMedia("(max-width: 820px)").matches) setMobileNavigationOpen(false);
+});
+window.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && adminSidebar?.classList.contains("mobile-open")) {
+    setMobileNavigationOpen(false);
+    mobileNavToggle?.focus();
+  }
+});
 // 页面元信息统一收口在这里，避免导航、页签标题与页面标题出现语义不一致。
 const PAGE_METADATA = {
   "page-dashboard": { title: "总览监控", browserTitle: "Dawn Course 运维后台 - 总览监控" },
@@ -1248,6 +1307,7 @@ window.addEventListener("unhandledrejection", (event) => {
 
 navItems.forEach((item) => {
   item.addEventListener("click", () => {
+    setMobileNavigationOpen(false);
     const target = item.getAttribute("data-target");
     const prev = getActivePageId();
     if (prev === "page-repair-issues" && target !== "page-repair-issues") {
@@ -1293,6 +1353,8 @@ function stageBadge(stage) {
 
 function showScriptModal(scriptName, rollbackTargetVersion) {
   scriptModalState = {
+    releaseId: "",
+    detail: null,
     scriptName: (scriptName || "").toString(),
     rollbackTargetVersion: Number(rollbackTargetVersion || 0),
     selectedVersion: 0,
@@ -1310,6 +1372,94 @@ function showScriptModal(scriptName, rollbackTargetVersion) {
   loadScriptModalContent();
 }
 
+async function showReleaseDetail(releaseId) {
+  scriptModalState = {
+    releaseId: String(releaseId || ""),
+    detail: null,
+    scriptName: "",
+    rollbackTargetVersion: 0,
+    selectedVersion: 0,
+    selectedHistoryKey: "",
+    currentMeta: null
+  };
+  scriptModalTitle.textContent = releaseId || "Release 详情";
+  scriptModalMeta.textContent = "加载中...";
+  if (scriptModalHistoryMeta) scriptModalHistoryMeta.textContent = "依赖、验证与时间线";
+  if (scriptModalHistory) scriptModalHistory.innerHTML = "";
+  scriptModalCode.textContent = "加载中...";
+  scriptModalSource.value = "current";
+  scriptModal.style.display = "flex";
+  try {
+    const result = await fetchWithAuth(`/api/v1/admin/scripts/releases/${encodeURIComponent(releaseId)}`);
+    scriptModalState.detail = result.data || {};
+    renderReleaseDetail();
+  } catch (error) {
+    scriptModalMeta.textContent = error?.detailMessage || error?.message || "加载失败";
+    scriptModalCode.textContent = "加载失败";
+  }
+}
+
+function renderReleaseDetail() {
+  const detail = scriptModalState.detail || {};
+  const release = detail.release || {};
+  scriptModalTitle.textContent = `${release.name || release.scriptName || "脚本"} v${Number(release.version || 0)}`;
+  scriptModalMeta.textContent = [
+    release.releaseId,
+    release.scriptKey,
+    `${release.scopeKind || "-"}:${release.scopeId || "-"}`,
+    `阶段 ${formatReleaseStageText(release.releaseStage || "-")}`,
+    `验证 ${release.validationStatus || "-"}`,
+    `灰度 ${Number(release.rolloutPercent || 0)}%`
+  ].filter(Boolean).join(" | ");
+  const source = scriptModalSource.value || "current";
+  if (source === "backup") {
+    scriptModalCode.textContent = detail.parentContent || "无父版本内容";
+  } else if (source === "pending") {
+    scriptModalCode.textContent = JSON.stringify(detail.validationReport || {}, null, 2);
+  } else {
+    const diff = buildLineDiff(detail.parentContent || "", detail.content || "");
+    scriptModalCode.textContent = `${detail.content || ""}\n\n/* 父版本差异\n${diff}\n*/`;
+  }
+  const dependencies = Array.isArray(detail.dependencies) ? detail.dependencies : [];
+  const validations = Array.isArray(detail.manualValidations) ? detail.manualValidations : [];
+  const timeline = Array.isArray(detail.timeline) ? detail.timeline : [];
+  const metrics = Array.isArray(detail.activationMetrics) ? detail.activationMetrics : [];
+  if (scriptModalHistory) {
+    scriptModalHistory.innerHTML = [
+      `<div class="history-item"><div class="history-item-title">依赖快照</div><div class="history-item-meta">${escapeHtml(
+        dependencies.map((item) => `${item.name} v${item.version} (${item.release_id})`).join("\n") || "无依赖"
+      )}</div></div>`,
+      `<div class="history-item"><div class="history-item-title">验证报告</div><div class="history-item-meta">${escapeHtml(
+        JSON.stringify(detail.validationReport || {}, null, 2)
+      )}</div></div>`,
+      `<div class="history-item"><div class="history-item-title">人工验证</div><div class="history-item-meta">${escapeHtml(
+        validations.map((item) => `${item.school_id} / ${item.page_stage} / ${item.result_note}`).join("\n") || "无人工验证"
+      )}</div></div>`,
+      `<div class="history-item"><div class="history-item-title">客户端激活</div><div class="history-item-meta">${escapeHtml(
+        metrics.map((item) => `${item.metric_date} ${item.event_type} ${item.event_count}`).join("\n") || "尚无激活上报"
+      )}</div></div>`,
+      ...timeline.map((item) => `<div class="history-item"><div class="history-item-title">${escapeHtml(item.action || "事件")}<span class="muted">${escapeHtml(formatTime(item.created_at))}</span></div><div class="history-item-meta">${escapeHtml(item.actor || "-")} | ${escapeHtml(JSON.stringify(item.detail_json || {}))}</div></div>`)
+    ].join("");
+  }
+}
+
+function buildLineDiff(parentContent, currentContent) {
+  const before = String(parentContent || "").split("\n");
+  const after = String(currentContent || "").split("\n");
+  const lines = [];
+  const max = Math.max(before.length, after.length);
+  for (let index = 0; index < max; index += 1) {
+    if (before[index] === after[index]) continue;
+    if (before[index] !== undefined) lines.push(`- ${before[index]}`);
+    if (after[index] !== undefined) lines.push(`+ ${after[index]}`);
+    if (lines.length >= 200) {
+      lines.push("... 差异过长，已截断");
+      break;
+    }
+  }
+  return lines.join("\n") || "无内容差异";
+}
+
 function closeScriptModal() {
   scriptModal.style.display = "none";
   scriptModalCode.textContent = "";
@@ -1317,6 +1467,8 @@ function closeScriptModal() {
   if (scriptModalHistoryMeta) scriptModalHistoryMeta.textContent = "";
   if (scriptModalHistory) scriptModalHistory.innerHTML = "";
   scriptModalState = {
+    releaseId: "",
+    detail: null,
     scriptName: "",
     rollbackTargetVersion: 0,
     selectedVersion: 0,
@@ -1326,6 +1478,10 @@ function closeScriptModal() {
 }
 
 async function loadScriptModalContent() {
+  if (scriptModalState.releaseId) {
+    renderReleaseDetail();
+    return;
+  }
   const scriptName = scriptModalState.scriptName;
   if (!scriptName) return;
   const source = scriptModalSource.value || "current";
@@ -1797,7 +1953,10 @@ async function parseAdminApiResponse(res) {
   try {
     parsed = text ? JSON.parse(text) : {};
   } catch {
-    throw buildAdminRequestError("error", text || `unexpected_response_${res.status}`);
+    throw buildAdminRequestError(
+      "error",
+      describeNonJsonAdminResponse(res.status, text, res.headers?.get?.("content-type") || "")
+    );
   }
   const apiError = resolveAdminApiError(res.status, parsed);
   if (apiError) {
@@ -2964,54 +3123,52 @@ function renderScriptCards(list) {
 
 function renderScriptsTable(list) {
   if (!scriptTableBody) return;
-  const items = (Array.isArray(list) ? list : []).map((item) => normalizeScriptListItem(item));
+  const normalized = (Array.isArray(list) ? list : []).map((item) => normalizeScriptListItem(item));
+  const items = filterReleaseTracks(normalized, {
+    system: releaseFilterSystem?.value,
+    scope: releaseFilterScope?.value,
+    category: releaseFilterCategory?.value,
+    stage: releaseFilterStage?.value,
+    validation: releaseFilterValidation?.value
+  });
   scriptTableBody.innerHTML = items
     .map((item) => {
       const meta = item.meta || {};
       const stage = meta.releaseStage || "unknown";
-      const workflowLabel = item.scriptRepairWorkflowLabel || formatScriptRepairWorkflowLabel(item.scriptRepairWorkflow);
-      const workflowDesc = item.scriptRepairWorkflowDescription || describeScriptRepairWorkflow(item.scriptRepairWorkflow);
       const v = Number(meta.version || 0);
-      const pv = Number(meta.parentVersion || 0);
-      const failCount = Number(item.recentFailureCount || 0);
-      const failBadge =
-        failCount > 0 ? `<span class="badge danger" style="margin-left:8px">失败 ${failCount}</span>` : "";
-      const pendingStatus = getScriptPendingStatus(item, stage);
-      const rollbackStatus = getScriptRollbackStatus(item, pv);
-      const pendingBadge = `<span class="badge ${pendingStatus.tone || ""}">${escapeHtml(pendingStatus.label)}</span>`;
-      const rollbackBadge = `<span class="badge ${rollbackStatus.tone || ""}">${escapeHtml(rollbackStatus.label)}</span>`;
-      const promoteDisabled = item.pendingAvailable ? "" : "disabled";
-      const rollbackDisabled = item.rollbackAvailable ? "" : "disabled";
+      const releaseId = String(item.releaseId || "");
+      const validationStatus = String(item.validationStatus || "pending");
+      const validationTone = validationStatus === "passed" ? "success" : validationStatus === "failed" ? "danger" : "warning";
+      const activation = item.activation || {};
+      const canPublish = stage === "pending" && validationStatus === "passed";
+      const canRollback = Boolean(item.rollbackAvailable) && ["active", "canary"].includes(stage);
+      const canDisable = ["active", "canary"].includes(stage);
+      const scopeText = item.scopeKind === "school"
+        ? `学校 ${item.scopeId || "-"}`
+        : item.scopeKind === "system"
+          ? `系统 ${formatSystemType(item.scopeId || item.schoolSystemType || "unknown")}`
+          : "全局";
       return `
         <tr>
           <td>
-            <div class="cell-inline-head">
-              <span class="cell-main">${escapeHtml(item.scriptName || "-")}</span>
-              ${failBadge}
-            </div>
-            <div class="cell-sub">当前阶段：${escapeHtml(formatReleaseStageText(stage))} | ${escapeHtml(workflowLabel)}</div>
+            <div class="cell-main">${escapeHtml(item.scriptKey || item.scriptName || "-")}</div>
+            <div class="cell-sub">${escapeHtml(releaseId)}</div>
           </td>
-          <td>${stageBadge(stage)}<div class="cell-sub">线上状态标签</div></td>
-          <td>${buildInfoLine(`v${v}`, "当前脚本版本")}</td>
-          <td>${buildInfoLine(pv > 0 ? `v${pv}` : "-", pv > 0 ? "回滚目标父版本" : "尚未形成父版本")}</td>
-          <td>${pendingBadge}<div class="cell-sub">${escapeHtml(workflowDesc)}</div></td>
-          <td>${rollbackBadge}<div class="cell-sub">${escapeHtml(rollbackStatus.sub)}</div></td>
-          <td>${buildInfoLine(formatTime(meta.updatedAt), "最近更新时间")}</td>
-          <td>${buildInfoLine(meta.appliedBy || "-", "最近操作人")}</td>
+          <td>${escapeHtml(scopeText)}<div class="cell-sub">${escapeHtml(item.category || "-")} / ${escapeHtml(item.targetType || "-")}</div></td>
+          <td>v${escapeHtml(v)}<div class="cell-sub">父版本 ${item.parentVersion ? `v${escapeHtml(item.parentVersion)}` : "-"}</div></td>
+          <td>${stageBadge(stage)}<div class="cell-sub">${escapeHtml(item.status || "-")}</div></td>
+          <td><span class="badge ${validationTone}">${escapeHtml(validationStatus)}</span></td>
+          <td>${Number(item.rolloutPercent || 0)}%${stage === "pending" ? `<div><input class="rollout-input" type="number" min="1" max="99" value="10" aria-label="灰度比例"></div>` : ""}</td>
+          <td><div class="cell-main">激活 ${formatCount(activation.activated || 0)}</div><div class="cell-sub">试跑 ${formatCount(activation.trialPassed || 0)} / 隔离 ${formatCount(activation.quarantined || 0)} / 回滚 ${formatCount(activation.rolledBack || 0)}</div></td>
+          <td>${buildInfoLine(formatTime(meta.updatedAt), meta.appliedBy || "-")}</td>
           <td>
             <div class="actions">
-              <button class="btn secondary" type="button" data-action="view" data-script="${encodeURIComponent(
-                item.scriptName || ""
-              )}" data-pv="${pv}">查看详情</button>
-              <button class="btn" type="button" data-action="promote-active" data-script="${encodeURIComponent(
-                item.scriptName || ""
-              )}" ${promoteDisabled}>发布全量</button>
-              <button class="btn secondary" type="button" data-action="promote-gradual" data-script="${encodeURIComponent(
-                item.scriptName || ""
-              )}" ${promoteDisabled}>灰度发布</button>
-              <button class="btn secondary" type="button" data-action="rollback" data-script="${encodeURIComponent(
-                item.scriptName || ""
-              )}" ${rollbackDisabled}>回滚到上一版</button>
+              <button class="btn secondary compact" type="button" data-action="view" data-release="${escapeHtml(releaseId)}">详情</button>
+              <button class="btn secondary compact" type="button" data-action="revalidate" data-release="${escapeHtml(releaseId)}" ${stage === "pending" ? "" : "disabled"}>重新验证</button>
+              <button class="btn secondary compact" type="button" data-action="promote-gradual" data-release="${escapeHtml(releaseId)}" ${canPublish ? "" : "disabled"}>灰度</button>
+              <button class="btn compact" type="button" data-action="promote-active" data-release="${escapeHtml(releaseId)}" ${canPublish ? "" : "disabled"}>全量</button>
+              <button class="btn secondary compact" type="button" data-action="rollback" data-release="${escapeHtml(releaseId)}" ${canRollback ? "" : "disabled"}>回滚</button>
+              <button class="btn secondary compact" type="button" data-action="disable" data-release="${escapeHtml(releaseId)}" ${canDisable ? "" : "disabled"}>停用</button>
             </div>
           </td>
         </tr>
@@ -3019,15 +3176,71 @@ function renderScriptsTable(list) {
     })
     .join("");
   if (!items.length) {
-    scriptTableBody.innerHTML = `<tr><td colspan="9" class="muted">暂无脚本数据</td></tr>`;
+    scriptTableBody.innerHTML = `<tr><td colspan="9" class="muted">暂无符合筛选条件的发布轨道</td></tr>`;
   }
+  if (scriptReleaseMeta) scriptReleaseMeta.textContent = `显示 ${items.length} / ${normalized.length} 条 release；一行对应一个 ScriptKey 版本。`;
+}
+
+function updateReleaseFilterOptions(list) {
+  if (!releaseFilterSystem) return;
+  const current = releaseFilterSystem.value;
+  const systems = Array.from(new Set((list || []).map((item) => item.schoolSystemType).filter(Boolean))).sort();
+  releaseFilterSystem.innerHTML = `<option value="">全部</option>${systems.map((system) => `<option value="${escapeHtml(system)}">${escapeHtml(formatSystemType(system))}</option>`).join("")}`;
+  if (systems.includes(current)) releaseFilterSystem.value = current;
+}
+
+function renderUnmatchedSchools(list) {
+  unmatchedSchoolsCache = Array.isArray(list) ? list : [];
+  if (!unmatchedSchoolTableBody) return;
+  unmatchedSchoolTableBody.innerHTML = unmatchedSchoolsCache.map((item) => {
+    const schoolId = String(item.school_id || item.schoolId || "");
+    const schoolName = String(item.school_name || item.schoolName || schoolId || "-");
+    const system = String(item.school_system_type || item.schoolSystemType || "UNKNOWN");
+    const candidate = String(item.school_release_id || "");
+    return `<tr>
+      <td><div class="cell-main">${escapeHtml(schoolName)}</div><div class="cell-sub">${escapeHtml(schoolId)}</div></td>
+      <td>${formatCount(item.sample_count || 0)}</td>
+      <td>${escapeHtml(formatSystemType(system))}</td>
+      <td>${item.generic_release_id ? `<span class="badge success">${escapeHtml(item.generic_script_name || item.generic_release_id)}</span>` : `<span class="badge warning">未覆盖</span>`}</td>
+      <td>${candidate ? `${stageBadge(item.school_release_stage)}<div class="cell-sub">${escapeHtml(item.school_validation_status || "-")}</div>` : `<span class="badge">无候选</span>`}</td>
+      <td><div class="actions"><button class="btn secondary compact" type="button" data-unmatched-action="upload" data-school="${escapeHtml(schoolId)}" data-system="${escapeHtml(system)}">上传学校脚本</button>${item.created_from_issue_id ? `<button class="btn secondary compact" type="button" data-unmatched-action="issue" data-issue="${escapeHtml(item.created_from_issue_id)}">修复问题</button>` : ""}</div></td>
+    </tr>`;
+  }).join("");
+  if (!unmatchedSchoolsCache.length) unmatchedSchoolTableBody.innerHTML = `<tr><td colspan="6" class="muted">暂无未匹配学校</td></tr>`;
+  if (unmatchedSchoolMeta) unmatchedSchoolMeta.textContent = `共 ${unmatchedSchoolsCache.length} 所学校；样本仅统计已授权脱敏数据。`;
+}
+
+function renderActivationMetrics(list) {
+  activationMetricsCache = Array.isArray(list) ? list : [];
+  if (!activationMetricTableBody) return;
+  const eventLabels = {
+    verified: "验签通过",
+    trial_passed: "试跑通过",
+    activated: "客户端激活",
+    failed: "执行失败",
+    quarantined: "已隔离",
+    rolled_back: "已回滚"
+  };
+  activationMetricTableBody.innerHTML = activationMetricsCache.map((item) => `<tr>
+    <td>${escapeHtml(item.metric_date || "-")}</td>
+    <td><div class="cell-main">${escapeHtml(item.name || "-")}</div><div class="cell-sub">${escapeHtml(item.release_id || "")}</div></td>
+    <td>${escapeHtml(item.school_id || "通用")}<div class="cell-sub">${escapeHtml(formatSystemType(item.school_system_type || "UNKNOWN"))}</div></td>
+    <td>${escapeHtml(eventLabels[item.event_type] || item.event_type || "-")}</td>
+    <td>${escapeHtml(item.error_code || "-")}</td>
+    <td>${formatCount(item.event_count || 0)}</td>
+    <td>${escapeHtml(formatTime(item.last_event_at))}</td>
+  </tr>`).join("");
+  if (!activationMetricsCache.length) activationMetricTableBody.innerHTML = `<tr><td colspan="7" class="muted">尚无客户端激活事件</td></tr>`;
+  if (activationMetricMeta) activationMetricMeta.textContent = `共 ${activationMetricsCache.length} 个日期 / release / 学校 / 结果聚合项，不含设备标识。`;
 }
 
 async function loadScriptsPage() {
   try {
-    const [dataResult, scriptResult] = await Promise.all([
+    const [dataResult, scriptResult, unmatchedResult, activationResult] = await Promise.all([
       fetchWithAuth("/api/v1/admin/data"),
-      fetchWithAuth("/api/v1/admin/scripts")
+      fetchWithAuth("/api/v1/admin/scripts"),
+      fetchWithAuth("/api/v1/admin/unmatched-schools"),
+      fetchWithAuth("/api/v1/admin/scripts/activation-metrics")
     ]);
     const data = dataResult.data || {};
     currentData = data;
@@ -3042,9 +3255,12 @@ async function loadScriptsPage() {
     renderScriptAnalyticsTable(analytics);
     const list = (scriptResult.data?.list || []).map((item) => normalizeScriptListItem(item));
     scriptsCache = list;
+    updateReleaseFilterOptions(list);
     renderScriptCards(list);
     renderScriptReleaseGuide(list);
     renderScriptsTable(list);
+    renderUnmatchedSchools(unmatchedResult.data?.list || []);
+    renderActivationMetrics(activationResult.data?.list || []);
     return true;
   } catch (e) {
     if (isUnauthorizedError(e)) {
@@ -3056,34 +3272,17 @@ async function loadScriptsPage() {
   }
 }
 
-async function promoteWithDoubleConfirm(scriptName, pushMode) {
-  const modeLabel = pushMode === "canary" ? "灰度发布" : "全量发布";
+async function confirmReleaseOperation(releaseId, title, detail, confirmLabel) {
   const confirmed = await askOperationConfirm({
-    title: `确认${modeLabel}`,
-    detail: `${modeLabel}将更新脚本 ${scriptName} 的线上流量指向，请确认发布窗口、候选验证结果与回滚路径均已检查。`,
-    emphasizeText: "脚本发布属于高风险操作，确认后会立即触发生效流程。",
-    confirmText: scriptName,
-    confirmLabel: `确认${modeLabel}`,
+    title,
+    detail,
+    emphasizeText: `该操作会立即影响 release ${releaseId} 所属 ScriptKey。`,
+    confirmText: releaseId,
+    confirmLabel,
     danger: true,
-    kicker: "发布确认"
+    kicker: "Release 操作确认"
   });
-  if (!confirmed) {
-    showToast("warning", "已取消", `${modeLabel}已取消`);
-    return { aborted: true };
-  }
-  const precheck = await postWithAuth("/api/v1/admin/promote_script", {
-    scriptName,
-    pushMode
-  });
-  if (precheck.code !== 409 || !precheck.data?.confirmToken) {
-    return precheck;
-  }
-  return await postWithAuth("/api/v1/admin/promote_script", {
-    scriptName,
-    pushMode,
-    confirmPublish: true,
-    confirmToken: precheck.data.confirmToken
-  });
+  return Boolean(confirmed);
 }
 
 if (scriptTableBody) {
@@ -3091,22 +3290,57 @@ if (scriptTableBody) {
     const btn = e.target?.closest?.("button[data-action]");
     if (!btn) return;
     const action = btn.getAttribute("data-action");
-    const encoded = btn.getAttribute("data-script") || "";
-    const scriptName = decodeURIComponent(encoded);
-    const pv = Number(btn.getAttribute("data-pv") || 0);
+    const releaseId = btn.getAttribute("data-release") || "";
+    const release = (scriptsCache || []).find((item) => String(item.releaseId || "") === releaseId) || {};
     if (action === "view") {
-      showScriptModal(scriptName, pv);
+      showReleaseDetail(releaseId);
+      return;
+    }
+    if (action === "revalidate") {
+      const payload = release.category === "js" ? {
+        testSchoolId: scriptUploadTestSchool?.value || "",
+        pageStage: scriptUploadPageStage?.value || "",
+        manualValidationResult: scriptUploadManualResult?.value || "",
+        manualValidationPassed: scriptUploadManualPassed?.checked === true
+      } : {};
+      if (release.category === "js" && (!payload.testSchoolId || !payload.pageStage || !payload.manualValidationResult || !payload.manualValidationPassed)) {
+        switchScriptOpsView("upload");
+        showToast("warning", "需要人工验证信息", "请先填写测试学校、页面阶段、结果并勾选确认通过，再返回发布轨道重新验证。");
+        return;
+      }
+      try {
+        await withButtonLoading(btn, "验证中...", async () => {
+          await postWithAuth(`/api/v1/admin/scripts/releases/${encodeURIComponent(releaseId)}/revalidate`, payload);
+          showToast("info", "重新验证通过", releaseId);
+          await loadScriptsPage();
+        });
+      } catch (error) {
+        showToast("error", "重新验证失败", error?.detailMessage || error?.message || "Runner 门禁未通过");
+      }
       return;
     }
     if (action === "promote-active" || action === "promote-gradual") {
-      const pushMode = action === "promote-gradual" ? "canary" : "active";
-      const modeLabel = pushMode === "canary" ? "灰度发布" : "全量发布";
+      const releaseStage = action === "promote-gradual" ? "canary" : "active";
+      const modeLabel = releaseStage === "canary" ? "灰度发布" : "全量发布";
+      const rolloutPercent = releaseStage === "active"
+        ? 100
+        : Number(btn.closest("tr")?.querySelector(".rollout-input")?.value || 10);
+      if (releaseStage === "canary" && (!Number.isInteger(rolloutPercent) || rolloutPercent < 1 || rolloutPercent > 99)) {
+        showToast("error", "灰度比例无效", "请输入 1–99 的整数");
+        return;
+      }
       try {
         await withButtonLoading(btn, "发布中...", async () => {
-          const json = await promoteWithDoubleConfirm(scriptName, pushMode);
-          if (json?.aborted) return;
+          const confirmed = await confirmReleaseOperation(
+            releaseId,
+            `确认${modeLabel}`,
+            `${release.scriptKey || releaseId} 将切换到 ${rolloutPercent}% 流量。`,
+            `确认${modeLabel}`
+          );
+          if (!confirmed) return;
+          const json = await postWithAuth("/api/v1/admin/scripts/releases", { releaseId, releaseStage, rolloutPercent });
           if (json.code === 200) {
-            showToast("info", "发布成功", `${scriptName} -> ${modeLabel}`);
+            showToast("info", "发布成功", `${releaseId} -> ${modeLabel}`);
             await loadScriptsPage();
             return;
           }
@@ -3120,22 +3354,11 @@ if (scriptTableBody) {
     if (action === "rollback") {
       try {
         await withButtonLoading(btn, "回滚中...", async () => {
-          const confirmed = await askOperationConfirm({
-            title: "确认回滚脚本",
-            detail: `将把脚本 ${scriptName} 回滚到上一版本，并立即影响后续脚本下发。`,
-            emphasizeText: "请确认父版本备份可用，并已评估当前线上脚本的回退影响。",
-            confirmText: scriptName,
-            confirmLabel: "确认回滚",
-            danger: true,
-            kicker: "回滚确认"
-          });
-          if (!confirmed) {
-            showToast("warning", "已取消", "未执行回滚操作");
-            return;
-          }
-          const json = await postWithAuth("/api/v1/admin/rollback_script", { scriptName });
+          const confirmed = await confirmReleaseOperation(releaseId, "确认同作用域回滚", `将恢复父版本 ${release.parentReleaseId || "-"}。`, "确认回滚");
+          if (!confirmed) return;
+          const json = await postWithAuth(`/api/v1/admin/scripts/releases/${encodeURIComponent(releaseId)}/rollback`, {});
           if (json.code === 200) {
-            showToast("warning", "已回滚", `${scriptName} 已回滚到上个版本`);
+            showToast("warning", "已回滚", `${releaseId} 已回滚到父版本`);
             await loadScriptsPage();
             return;
           }
@@ -3144,9 +3367,122 @@ if (scriptTableBody) {
       } catch (err) {
         showToast("error", "回滚失败", err?.message || "网络错误");
       }
+      return;
+    }
+    if (action === "disable") {
+      try {
+        await withButtonLoading(btn, "停用中...", async () => {
+          const confirmed = await confirmReleaseOperation(releaseId, "确认停用 release", "停用后该 release 不再进入 manifest。", "确认停用");
+          if (!confirmed) return;
+          await postWithAuth(`/api/v1/admin/scripts/releases/${encodeURIComponent(releaseId)}/disable`, { reason: "管理员从发布轨道停用" });
+          showToast("warning", "已停用", releaseId);
+          await loadScriptsPage();
+        });
+      } catch (err) {
+        showToast("error", "停用失败", err?.detailMessage || err?.message || "网络错误");
+      }
     }
   });
 }
+
+[releaseFilterSystem, releaseFilterScope, releaseFilterCategory, releaseFilterStage, releaseFilterValidation]
+  .filter(Boolean)
+  .forEach((control) => control.addEventListener("change", () => renderScriptsTable(scriptsCache || [])));
+
+function switchScriptOpsView(view) {
+  document.querySelectorAll("[data-script-view]").forEach((button) => button.classList.toggle("active", button.dataset.scriptView === view));
+  document.querySelectorAll("[data-script-panel]").forEach((panel) => panel.classList.toggle("active", panel.dataset.scriptPanel === view));
+}
+
+scriptOpsTabs?.addEventListener("click", (event) => {
+  const button = event.target?.closest?.("[data-script-view]");
+  if (button) switchScriptOpsView(button.dataset.scriptView || "release");
+});
+
+function syncUploadFormMode() {
+  const isWebView = scriptUploadCategory?.value === "js";
+  document.querySelectorAll(".web-validation-field").forEach((field) => field.classList.toggle("hidden", !isWebView));
+  if (scriptUploadTarget) scriptUploadTarget.value = isWebView ? "navigation" : "parser";
+  if (scriptUploadScopeKind?.value === "system" && scriptUploadScopeId && scriptUploadSystem) {
+    scriptUploadScopeId.value = scriptUploadSystem.value;
+  }
+}
+
+scriptUploadCategory?.addEventListener("change", syncUploadFormMode);
+scriptUploadScopeKind?.addEventListener("change", syncUploadFormMode);
+scriptUploadSystem?.addEventListener("change", syncUploadFormMode);
+syncUploadFormMode();
+
+scriptUploadFile?.addEventListener("change", async () => {
+  const file = scriptUploadFile.files?.[0];
+  const descriptor = validateUploadFileDescriptor(file);
+  if (!descriptor.ok) {
+    selectedUploadContent = "";
+    if (scriptUploadStatus) scriptUploadStatus.textContent = descriptor.error;
+    return;
+  }
+  const content = await file.text();
+  if (content.includes("\uFFFD") || content.includes("\u0000")) {
+    selectedUploadContent = "";
+    if (scriptUploadStatus) scriptUploadStatus.textContent = "文件不是有效的 UTF-8 JavaScript";
+    return;
+  }
+  selectedUploadContent = content;
+  if (scriptUploadName) scriptUploadName.value = file.name;
+  if (scriptUploadStatus) scriptUploadStatus.textContent = `${file.name} · ${formatCount(file.size)} bytes`;
+});
+
+scriptUploadForm?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!selectedUploadContent) {
+    showToast("error", "无法上传", "请选择有效的 UTF-8 .js 文件");
+    return;
+  }
+  const payload = {
+    name: scriptUploadName?.value || "",
+    category: scriptUploadCategory?.value || "parsers",
+    targetType: scriptUploadTarget?.value || "parser",
+    scopeKind: scriptUploadScopeKind?.value || "system",
+    scopeId: scriptUploadScopeId?.value || "",
+    schoolSystemType: scriptUploadSystem?.value || "UNKNOWN",
+    content: selectedUploadContent,
+    changelog: scriptUploadChangelog?.value || "",
+    testSchoolId: scriptUploadTestSchool?.value || "",
+    pageStage: scriptUploadPageStage?.value || "",
+    manualValidationResult: scriptUploadManualResult?.value || "",
+    manualValidationPassed: scriptUploadManualPassed?.checked === true
+  };
+  try {
+    const submit = document.getElementById("scriptUploadSubmit");
+    await withButtonLoading(submit, "验证中...", async () => {
+      const result = await postWithAuth("/api/v1/admin/scripts/uploads", payload);
+      showToast("info", "候选已创建", `${result.data?.releaseId || ""} 已通过验证并进入待发布轨道`);
+      scriptUploadForm.reset();
+      selectedUploadContent = "";
+      syncUploadFormMode();
+      await loadScriptsPage();
+      switchScriptOpsView("release");
+    });
+  } catch (error) {
+    showToast("error", "候选创建失败", error?.detailMessage || error?.message || "验证未通过");
+  }
+});
+
+unmatchedSchoolTableBody?.addEventListener("click", (event) => {
+  const button = event.target?.closest?.("button[data-unmatched-action]");
+  if (!button) return;
+  if (button.dataset.unmatchedAction === "issue") {
+    document.querySelector('.nav-item[data-target="page-repair-issues"]')?.click();
+    return;
+  }
+  switchScriptOpsView("upload");
+  if (scriptUploadScopeKind) scriptUploadScopeKind.value = "school";
+  if (scriptUploadScopeId) scriptUploadScopeId.value = button.dataset.school || "";
+  if (scriptUploadTestSchool) scriptUploadTestSchool.value = button.dataset.school || "";
+  if (scriptUploadSystem) scriptUploadSystem.value = button.dataset.system || "UNKNOWN";
+  syncUploadFormMode();
+  scriptUploadFile?.focus();
+});
 
 function updateFilterOptions(data) {
   const schoolIds = new Set([

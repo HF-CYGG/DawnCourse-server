@@ -10,7 +10,7 @@
   </head>
   <body>
     <div class="app-wrapper">
-      <aside class="sidebar">
+      <aside class="sidebar" id="adminSidebar">
         <div class="sidebar-header">
           <h1>Dawn Course 运维后台</h1>
         </div>
@@ -38,9 +38,19 @@
           <button class="btn secondary full-width" id="logoutBtn" type="button">退出登录</button>
         </div>
       </aside>
+      <button class="sidebar-backdrop" id="sidebarBackdrop" type="button" aria-label="关闭导航"></button>
 
       <div class="main-content">
         <header>
+          <button
+            class="mobile-nav-toggle"
+            id="mobileNavToggle"
+            type="button"
+            aria-label="打开导航"
+            aria-controls="adminSidebar"
+            aria-expanded="false"
+            title="导航"
+          >&#9776;</button>
           <div>
             <h2 id="pageTitle">总览监控</h2>
             <div class="meta" id="headerMeta">等待数据…</div>
@@ -311,85 +321,87 @@
           </div>
 
           <div id="page-scripts" class="page-section">
-            <section class="mb-24">
-              <div class="grid cards" id="scriptAnalyticsCards"></div>
-            </section>
-            <section class="filter-bar mb-24">
-              <div class="filters">
-                <div class="filter">
-                  <label>统计口径</label>
-                  <select id="scriptViewMode">
-                    <option value="session">会话级</option>
-                    <option value="raw">原始逐脚本</option>
-                  </select>
+            <div class="segmented-control mb-24" id="scriptOpsTabs" role="tablist" aria-label="脚本管理视图">
+              <button class="segment active" type="button" data-script-view="release">发布轨道</button>
+              <button class="segment" type="button" data-script-view="upload">候选上传</button>
+              <button class="segment" type="button" data-script-view="activation">设备激活</button>
+            </div>
+
+            <div class="script-ops-view active" data-script-panel="release">
+              <section class="mb-24"><div class="grid cards" id="scriptSummaryCards"></div></section>
+              <section class="mb-24"><div class="overview-banner" id="scriptReleaseGuide">等待脚本发布数据…</div></section>
+              <section class="filter-bar mb-24">
+                <div class="filters">
+                  <div class="filter"><label>教务系统</label><select id="releaseFilterSystem"><option value="">全部</option></select></div>
+                  <div class="filter"><label>作用域</label><select id="releaseFilterScope"><option value="">全部</option><option value="system">系统通用</option><option value="school">学校专属</option></select></div>
+                  <div class="filter"><label>类别</label><select id="releaseFilterCategory"><option value="">全部</option><option value="parsers">解析器</option><option value="js">WebView</option></select></div>
+                  <div class="filter"><label>阶段</label><select id="releaseFilterStage"><option value="">全部</option><option value="pending">待发布</option><option value="canary">灰度</option><option value="active">全量</option><option value="disabled">已停用</option><option value="rolled_back">已回滚</option></select></div>
+                  <div class="filter"><label>验证</label><select id="releaseFilterValidation"><option value="">全部</option><option value="passed">已通过</option><option value="failed">未通过</option><option value="pending">待验证</option></select></div>
                 </div>
-                <div class="filter">
-                  <label>教务系统</label>
-                  <select id="scriptFilterSystemType"></select>
+              </section>
+              <section class="mb-24">
+                <h3 class="section-title">脚本发布轨道</h3>
+                <div class="section-meta" id="scriptReleaseMeta">等待数据…</div>
+                <div class="table-shell">
+                  <table class="table table-wide table-script-release" id="scriptTable">
+                    <thead><tr><th>ScriptKey</th><th>作用域</th><th>版本</th><th>阶段</th><th>验证</th><th>灰度</th><th>客户端激活</th><th>更新时间</th><th>操作</th></tr></thead>
+                    <tbody></tbody>
+                  </table>
                 </div>
-                <div class="filter">
-                  <label>结果</label>
-                  <select id="scriptFilterFinalResult">
-                    <option value="">全部</option>
-                    <option value="success">含成功</option>
-                    <option value="failed">含失败</option>
-                  </select>
+              </section>
+            </div>
+
+            <div class="script-ops-view" data-script-panel="upload">
+              <section class="script-upload-layout mb-24">
+                <form id="scriptUploadForm" class="config-group script-upload-form">
+                  <h3>上传候选脚本</h3>
+                  <div class="config-row"><label>JavaScript 文件</label><input id="scriptUploadFile" type="file" accept=".js,text/javascript" required></div>
+                  <div class="config-row"><label>脚本名称</label><input id="scriptUploadName" type="text" readonly required></div>
+                  <div class="config-row"><label>类别</label><select id="scriptUploadCategory"><option value="parsers">解析器</option><option value="js">WebView 脚本</option></select></div>
+                  <div class="config-row"><label>目标类型</label><select id="scriptUploadTarget"><option value="parser">parser</option><option value="navigation">navigation</option><option value="term_extractor">term_extractor</option></select></div>
+                  <div class="config-row"><label>作用域</label><select id="scriptUploadScopeKind"><option value="system">系统通用</option><option value="school">学校专属</option></select></div>
+                  <div class="config-row"><label>作用域 ID</label><input id="scriptUploadScopeId" type="text" placeholder="如 ZF 或学校 ID" required></div>
+                  <div class="config-row"><label>教务系统</label><select id="scriptUploadSystem"><option value="ZF">正方</option><option value="QIANGZHI">强智</option><option value="KINGOSOFT">青果</option><option value="QIDI">起迪</option><option value="UNKNOWN">未知</option></select></div>
+                  <div class="config-row"><label>变更说明</label><textarea id="scriptUploadChangelog" maxlength="2000" required></textarea></div>
+                  <div class="config-row web-validation-field"><label>测试学校</label><input id="scriptUploadTestSchool" type="text"></div>
+                  <div class="config-row web-validation-field"><label>页面阶段</label><input id="scriptUploadPageStage" type="text" placeholder="如 login / timetable"></div>
+                  <div class="config-row web-validation-field"><label>人工验证结果</label><textarea id="scriptUploadManualResult"></textarea></div>
+                  <div class="config-row web-validation-field"><label>确认通过</label><label class="check-line"><input id="scriptUploadManualPassed" type="checkbox"> 已在测试学校验证</label></div>
+                  <div class="config-actions"><span class="muted" id="scriptUploadStatus">仅接受 UTF-8 .js，最大 256 KiB</span><button class="btn" id="scriptUploadSubmit" type="submit">验证并创建候选</button></div>
+                </form>
+                <div>
+                  <h3 class="section-title">未匹配学校</h3>
+                  <div class="section-meta" id="unmatchedSchoolMeta">等待数据…</div>
+                  <div class="table-shell">
+                    <table class="table table-wide" id="unmatchedSchoolTable">
+                      <thead><tr><th>学校</th><th>样本</th><th>系统识别</th><th>通用覆盖</th><th>学校候选</th><th>操作</th></tr></thead>
+                      <tbody></tbody>
+                    </table>
+                  </div>
                 </div>
-                <div class="filter">
-                  <label>失败类型</label>
-                  <select id="scriptFilterFailureType"></select>
+              </section>
+            </div>
+
+            <div class="script-ops-view" data-script-panel="activation">
+              <section class="mb-24"><div class="grid cards" id="scriptAnalyticsCards"></div></section>
+              <section class="filter-bar mb-24">
+                <div class="filters">
+                  <div class="filter"><label>统计口径</label><select id="scriptViewMode"><option value="session">会话级</option><option value="raw">原始逐脚本</option></select></div>
+                  <div class="filter"><label>教务系统</label><select id="scriptFilterSystemType"></select></div>
+                  <div class="filter"><label>结果</label><select id="scriptFilterFinalResult"><option value="">全部</option><option value="success">含成功</option><option value="failed">含失败</option></select></div>
+                  <div class="filter"><label>失败类型</label><select id="scriptFilterFailureType"></select></div>
                 </div>
-              </div>
-            </section>
-            <section class="mb-24">
-              <h3 class="section-title">脚本解析统计</h3>
-              <div class="meta" id="scriptAnalyticsMeta">等待数据...</div>
-              <div class="table-shell">
-                <table class="table table-wide table-script-analytics" id="scriptAnalyticsTable">
-                  <thead>
-                    <tr>
-                      <th>脚本</th>
-                      <th>成功</th>
-                      <th>失败</th>
-                      <th>成功率</th>
-                      <th>系统分布</th>
-                      <th>失败原因</th>
-                      <th>未知占比</th>
-                      <th>最近更新</th>
-                    </tr>
-                  </thead>
-                  <tbody></tbody>
-                </table>
-              </div>
-            </section>
-            <section class="mb-24">
-              <div class="grid cards" id="scriptSummaryCards"></div>
-            </section>
-            <section class="mb-24">
-              <div class="overview-banner" id="scriptReleaseGuide">等待脚本发布数据…</div>
-            </section>
-            <section class="mb-24">
-              <h3 class="section-title">脚本发布列表</h3>
-              <div class="section-meta" id="scriptReleaseMeta">等待数据…</div>
-              <div class="table-shell">
-                <table class="table table-wide table-script-release" id="scriptTable">
-                  <thead>
-                    <tr>
-                      <th>脚本</th>
-                      <th>阶段</th>
-                      <th>版本</th>
-                      <th>父版本</th>
-                      <th>待发布</th>
-                      <th>回滚状态</th>
-                      <th>更新时间</th>
-                      <th>操作人</th>
-                      <th>操作</th>
-                    </tr>
-                  </thead>
-                  <tbody></tbody>
-                </table>
-              </div>
-            </section>
+              </section>
+              <section class="mb-24">
+                <h3 class="section-title">客户端实际激活</h3>
+                <div class="section-meta" id="activationMetricMeta">等待数据…</div>
+                <div class="table-shell"><table class="table table-wide" id="activationMetricTable"><thead><tr><th>日期</th><th>Release</th><th>学校 / 系统</th><th>事件</th><th>错误码</th><th>次数</th><th>最近上报</th></tr></thead><tbody></tbody></table></div>
+              </section>
+              <section class="mb-24">
+                <h3 class="section-title">脚本解析统计</h3><div class="meta" id="scriptAnalyticsMeta">等待数据...</div>
+                <div class="table-shell"><table class="table table-wide table-script-analytics" id="scriptAnalyticsTable"><thead><tr><th>脚本</th><th>成功</th><th>失败</th><th>成功率</th><th>系统分布</th><th>失败原因</th><th>未知占比</th><th>最近更新</th></tr></thead><tbody></tbody></table></div>
+              </section>
+            </div>
           </div>
 
           <div id="page-repair-issues" class="page-section">

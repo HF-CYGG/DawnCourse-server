@@ -5,6 +5,7 @@ import { query } from "./db.js";
 import { addIssueEvent, setIssueStage } from "./events.js";
 import { log } from "./log.js";
 import { getManifestPublicBaseUrl } from "./runtimeConfig.js";
+import { buildImmutableBundlePayload, buildScriptKey, deriveReleaseScope, releaseScopeMatchesRequest } from "./scriptRelease.js";
 import { id, normalizeSystemType, parserForSystem, safeSegment, scriptId, sha256, signContent, stableJson } from "./utils.js";
 export async function seedBundledScripts() {
     const candidates = [];
@@ -19,24 +20,34 @@ export async function seedBundledScripts() {
     for (const candidate of candidates) {
         const name = path.basename(candidate.file);
         const sid = scriptId(candidate.category, name);
-        const exists = await query("SELECT 1 FROM script_releases WHERE script_id = $1 AND release_stage = 'active' LIMIT 1", [sid]);
+        const scope = deriveReleaseScope({
+            targetType: candidate.targetType,
+            category: candidate.category,
+            name,
+            schoolSystemTypes: systemTypesForScript(name),
+            schoolIds: []
+        });
+        const key = buildScriptKey(scope);
+        const exists = await query("SELECT 1 FROM script_releases WHERE script_key = $1 AND release_stage = 'active' LIMIT 1", [key]);
         if (exists.rowCount)
             continue;
         const content = fs.readFileSync(candidate.file, "utf8");
         const hash = sha256(content);
         const signature = signContent(content);
         const releaseId = id("rel");
-        await query(`INSERT INTO script_artifacts(script_id,target_type,category,name,version,release_id,content,content_sha256,signature,provenance,created_by)
-       VALUES ($1,$2,$3,$4,1,$5,$6,$7,$8,$9::jsonb,'seed')`, [sid, candidate.targetType, candidate.category, name, releaseId, content, hash, signature, JSON.stringify({ source: "bundled" })]);
-        await query(`INSERT INTO script_releases(release_id,script_id,target_type,category,name,version,release_stage,channel,status,rollout_percent,school_system_types_json,school_ids_json,changelog,published_at,approved_by,approved_at)
-       VALUES ($1,$2,$3,$4,$5,1,'active','stable','enabled',100,$6::jsonb,'[]'::jsonb,'bundled baseline',now(),'system',now())`, [releaseId, sid, candidate.targetType, candidate.category, name, JSON.stringify(systemTypesForScript(name))]);
+        await query(`INSERT INTO script_artifacts(script_id,script_key,target_type,category,name,version,release_id,content,content_sha256,signature,provenance,created_by)
+       VALUES ($1,$2,$3,$4,$5,1,$6,$7,$8,$9,$10::jsonb,'seed')`, [sid, key, candidate.targetType, candidate.category, name, releaseId, content, hash, signature, JSON.stringify({ source: "bundled" })]);
+        await query(`INSERT INTO script_releases(release_id,script_id,script_key,target_type,category,name,version,release_stage,channel,status,rollout_percent,
+         school_system_types_json,school_ids_json,scope_kind,scope_id,school_system_type,validation_status,changelog,published_at,approved_by,approved_at)
+       VALUES ($1,$2,$3,$4,$5,$6,1,'active','stable','enabled',100,$7::jsonb,'[]'::jsonb,$8,$9,$10,'passed','bundled baseline',now(),'system',now())`, [releaseId, sid, key, candidate.targetType, candidate.category, name, JSON.stringify(systemTypesForScript(name)), scope.scopeKind, scope.scopeId, scope.schoolSystemType]);
+        await snapshotDefaultParserDependency(releaseId, candidate.category, name);
         log.info("seeded bundled script", { sid, name, releaseId });
     }
 }
 export async function getActiveScriptContent(category, name) {
     const row = await query(`SELECT a.content, r.release_id, r.version
      FROM script_releases r
-     JOIN script_artifacts a ON a.script_id = r.script_id AND a.version = r.version
+     JOIN script_artifacts a ON a.release_id = r.release_id
      WHERE r.category = $1 AND r.name = $2 AND r.release_stage IN ('active','canary')
        AND r.status = 'enabled' AND r.kill_switch = false
      ORDER BY CASE WHEN r.release_stage = 'active' THEN 2 ELSE 1 END DESC, r.version DESC
@@ -45,21 +56,28 @@ export async function getActiveScriptContent(category, name) {
     return found ? { content: found.content, releaseId: found.release_id, version: found.version } : null;
 }
 export async function createPendingRelease(input) {
-    const latest = await query("SELECT COALESCE(MAX(version),0) AS version FROM script_artifacts WHERE script_id = $1", [
-        input.scriptId
-    ]);
-    const nextVersion = Number(latest.rows[0]?.version || 0) + 1;
-    const releaseId = id("rel");
-    const hash = sha256(input.content);
-    const signature = signContent(input.content);
-    const scope = buildScriptReleaseScope({
+    const legacyScope = buildScriptReleaseScope({
         name: input.name,
         schoolId: input.schoolId || "",
         schoolSystemType: input.schoolSystemType || ""
     });
-    await query(`INSERT INTO script_artifacts(script_id,target_type,category,name,version,release_id,content,content_sha256,signature,parent_release_id,test_report_id,provenance,created_by)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13)`, [
+    const scope = deriveReleaseScope({
+        targetType: input.targetType,
+        category: input.category,
+        name: input.name,
+        schoolSystemTypes: legacyScope.schoolSystemTypes,
+        schoolIds: legacyScope.schoolIds
+    });
+    const key = buildScriptKey(scope);
+    const latest = await query("SELECT COALESCE(MAX(version),0) AS version FROM script_artifacts WHERE script_key = $1", [key]);
+    const nextVersion = Number(latest.rows[0]?.version || 0) + 1;
+    const releaseId = id("rel");
+    const hash = sha256(input.content);
+    const signature = signContent(input.content);
+    await query(`INSERT INTO script_artifacts(script_id,script_key,target_type,category,name,version,release_id,content,content_sha256,signature,parent_release_id,test_report_id,provenance,created_by)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14)`, [
         input.scriptId,
+        key,
         input.targetType,
         input.category,
         input.name,
@@ -73,23 +91,42 @@ export async function createPendingRelease(input) {
         JSON.stringify({ issueId: input.issueId, generatedBy: "repair-orchestrator" }),
         input.actor || "system"
     ]);
-    await query(`INSERT INTO script_releases(release_id,script_id,target_type,category,name,version,release_stage,channel,status,rollout_percent,school_system_types_json,school_ids_json,changelog,parent_release_id,issue_id)
-     VALUES ($1,$2,$3,$4,$5,$6,'pending','pending','enabled',0,$7::jsonb,$8::jsonb,$9,$10,$11)`, [
+    await query(`INSERT INTO script_releases(release_id,script_id,script_key,target_type,category,name,version,release_stage,channel,status,rollout_percent,
+       school_system_types_json,school_ids_json,scope_kind,scope_id,school_system_type,validation_status,changelog,parent_release_id,issue_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,'pending','pending','enabled',0,$8::jsonb,$9::jsonb,$10,$11,$12,'passed',$13,$14,$15)`, [
         releaseId,
         input.scriptId,
+        key,
         input.targetType,
         input.category,
         input.name,
         nextVersion,
-        JSON.stringify(scope.schoolSystemTypes),
-        JSON.stringify(scope.schoolIds),
+        JSON.stringify(legacyScope.schoolSystemTypes),
+        JSON.stringify(legacyScope.schoolIds),
+        scope.scopeKind,
+        scope.scopeId,
+        scope.schoolSystemType,
         input.changelog,
         input.parentReleaseId || null,
         input.issueId
     ]);
+    await snapshotDefaultParserDependency(releaseId, input.category, input.name);
     await addIssueEvent({ issueId: input.issueId, stage: "PENDING_REVIEW", message: `candidate pending: ${input.name} v${nextVersion}`, meta: { releaseId } });
     await setIssueStage(input.issueId, "PENDING_REVIEW", "pending release created");
     return releaseId;
+}
+/** 为解析器 release 固定当前通用工具依赖，避免后续依赖热更改变历史 bundle。 */
+async function snapshotDefaultParserDependency(releaseId, category, name) {
+    if (category !== "parsers" || name === "common_parser_utils.js")
+        return;
+    await query(`INSERT INTO script_release_dependencies(release_id, dependency_release_id, load_order)
+     SELECT $1, release_id, 0
+     FROM script_releases
+     WHERE category = 'parsers' AND name = 'common_parser_utils.js'
+       AND release_stage IN ('active','canary') AND status = 'enabled' AND kill_switch = false
+     ORDER BY CASE WHEN release_stage = 'active' THEN 2 ELSE 1 END DESC, version DESC
+     LIMIT 1
+     ON CONFLICT DO NOTHING`, [releaseId]);
 }
 export function buildScriptReleaseScopeForTest(input) {
     return buildScriptReleaseScope(input);
@@ -105,7 +142,9 @@ function buildScriptReleaseScope(input) {
         schoolIds: schoolId ? [schoolId] : []
     };
 }
-export async function registerRegistryRoutes(app) {
+export async function registerRegistryRoutes(app, deps = {}) {
+    const queryFn = (deps.query || query);
+    const signContentFn = deps.signContent || signContent;
     app.get("/scripts/:category/:name", async (request, reply) => {
         const params = request.params;
         const category = safeSegment(params.category);
@@ -131,6 +170,73 @@ export async function registerRegistryRoutes(app) {
             return reply.code(404).send("not found");
         reply.type("application/javascript; charset=utf-8").send(active.content);
     });
+    app.get("/api/v1/scripts/releases/:releaseId/bundle", async (request, reply) => {
+        const releaseId = safeSegment(request.params.releaseId);
+        if (!releaseId)
+            return reply.code(400).send({ code: 400, msg: "invalid releaseId" });
+        const bundle = await loadImmutableBundle(queryFn, releaseId);
+        if (!bundle)
+            return reply.code(404).send({ code: 404, msg: "release not found" });
+        const bundleSignature = signContentFn(stableJson(bundle));
+        return reply.send({ ...bundle, bundleAlg: "rsa-sha256", bundleSignature });
+    });
+    app.get("/api/v1/scripts/releases/:releaseId/content", async (request, reply) => {
+        const releaseId = safeSegment(request.params.releaseId);
+        if (!releaseId)
+            return reply.code(400).send("invalid releaseId");
+        const bundle = await loadImmutableBundle(queryFn, releaseId);
+        if (!bundle)
+            return reply.code(404).send("not found");
+        return reply.type("application/javascript; charset=utf-8").send(bundle.script.content);
+    });
+    app.get("/api/v1/scripts/releases/:releaseId/meta", async (request, reply) => {
+        const releaseId = safeSegment(request.params.releaseId);
+        if (!releaseId)
+            return reply.code(400).send({ code: 400, msg: "invalid releaseId" });
+        const bundle = await loadImmutableBundle(queryFn, releaseId);
+        if (!bundle)
+            return reply.code(404).send({ code: 404, msg: "release not found" });
+        return reply.send({
+            releaseId: bundle.releaseId,
+            scriptKey: bundle.scriptKey,
+            sha256: bundle.script.sha256,
+            signature: bundle.script.signature,
+            alg: bundle.script.alg,
+            version: bundle.version
+        });
+    });
+    app.post("/api/v1/scripts/activation-events", async (request, reply) => {
+        const body = (request.body || {});
+        const releaseId = safeSegment(String(body.releaseId || ""));
+        const eventType = String(body.eventType || "");
+        const allowedEvents = new Set(["verified", "trial_passed", "activated", "failed", "quarantined", "rolled_back"]);
+        if (!releaseId || !allowedEvents.has(eventType)) {
+            return reply.code(400).send({ code: 400, msg: "invalid activation event" });
+        }
+        const releaseResult = await queryFn(`SELECT release_id, target_type, category, name, school_system_types_json, school_ids_json
+       FROM script_releases /* activation_release */ WHERE release_id = $1 LIMIT 1`, [releaseId]);
+        const release = releaseResult.rows[0];
+        if (!release)
+            return reply.code(404).send({ code: 404, msg: "release not found" });
+        const schoolId = String(body.schoolId || "").trim().slice(0, 160);
+        const schoolSystemType = normalizeSystemType(String(body.schoolSystemType || ""));
+        const scope = deriveReleaseScope({
+            targetType: String(release.target_type || ""),
+            category: String(release.category || ""),
+            name: String(release.name || ""),
+            schoolSystemTypes: release.school_system_types_json,
+            schoolIds: release.school_ids_json
+        });
+        if (!releaseScopeMatchesRequest(scope, schoolSystemType, schoolId)) {
+            return reply.code(400).send({ code: 400, msg: "activation scope mismatch" });
+        }
+        const errorCode = String(body.errorCode || "").trim().slice(0, 80);
+        await queryFn(`INSERT INTO script_activation_metrics(release_id, school_id, school_system_type, event_type, error_code, event_count, last_event_at)
+       VALUES ($1,$2,$3,$4,$5,1,now())
+       ON CONFLICT (metric_date, release_id, school_id, event_type, error_code)
+       DO UPDATE SET event_count = script_activation_metrics.event_count + 1, last_event_at = now()`, [releaseId, schoolId, schoolSystemType, eventType, errorCode]);
+        return reply.code(202).send({ code: 202, msg: "accepted" });
+    });
     app.get("/api/v1/scripts/manifest", async (request) => {
         const queryParams = request.query;
         const systemType = String(queryParams.schoolSystemType || "");
@@ -144,10 +250,33 @@ export async function registerRegistryRoutes(app) {
             name: row.name,
             version: Number(row.version || 0),
             releaseId: row.release_id,
+            scriptKey: releaseScriptKey(row),
             releaseStage: row.release_stage,
             channel: row.channel,
-            url: `${base}/scripts/${row.category}/${row.name}`,
-            metaUrl: `${base}/scripts/${row.category}/${row.name.replace(/\.js$/i, ".meta.json")}`,
+            url: `${base}/api/v1/scripts/releases/${row.release_id}/content`,
+            metaUrl: `${base}/api/v1/scripts/releases/${row.release_id}/meta`,
+            bundleUrl: `${base}/api/v1/scripts/releases/${row.release_id}/bundle`,
+            scopeKind: deriveReleaseScope({
+                targetType: row.target_type,
+                category: row.category,
+                name: row.name,
+                schoolSystemTypes: row.school_system_types_json,
+                schoolIds: row.school_ids_json
+            }).scopeKind,
+            scopeId: deriveReleaseScope({
+                targetType: row.target_type,
+                category: row.category,
+                name: row.name,
+                schoolSystemTypes: row.school_system_types_json,
+                schoolIds: row.school_ids_json
+            }).scopeId,
+            schoolSystemType: deriveReleaseScope({
+                targetType: row.target_type,
+                category: row.category,
+                name: row.name,
+                schoolSystemTypes: row.school_system_types_json,
+                schoolIds: row.school_ids_json
+            }).schoolSystemType,
             sha256: row.content_sha256,
             signature: row.signature,
             alg: row.alg || "rsa-sha256",
@@ -191,10 +320,69 @@ export async function registerRegistryRoutes(app) {
         return apiOk({ saved: true });
     });
 }
+/** 按 releaseId 装配不可变脚本与依赖快照。 */
+async function loadImmutableBundle(queryFn, releaseId) {
+    const releaseResult = await queryFn(`SELECT r.release_id, r.script_key, r.target_type, r.category, r.name, r.version,
+            r.scope_kind, r.scope_id, r.school_system_type, r.parser_api_version, r.runner_contract_version,
+            a.content, a.content_sha256, a.signature, a.alg
+     FROM script_releases r /* bundle_release */
+     JOIN script_artifacts a ON a.release_id = r.release_id
+     WHERE r.release_id = $1 AND r.release_stage IN ('active','canary')
+       AND r.status = 'enabled' AND r.kill_switch = false
+     LIMIT 1`, [releaseId]);
+    const row = releaseResult.rows[0];
+    if (!row)
+        return null;
+    const derivedScope = deriveReleaseScope({
+        targetType: String(row.target_type || ""),
+        category: String(row.category || ""),
+        name: String(row.name || ""),
+        schoolSystemTypes: row.school_system_type && row.school_system_type !== "UNKNOWN" ? [row.school_system_type] : [],
+        schoolIds: row.scope_kind === "school" ? [row.scope_id] : []
+    });
+    const dependencyResult = await queryFn(`SELECT d.dependency_release_id, dr.category, dr.name, dr.version,
+            da.content, da.content_sha256, da.signature, da.alg
+     FROM script_release_dependencies d
+     JOIN script_releases dr ON dr.release_id = d.dependency_release_id
+     JOIN script_artifacts da ON da.release_id = d.dependency_release_id
+     WHERE d.release_id = $1
+     ORDER BY d.load_order ASC, d.id ASC`, [releaseId]);
+    return buildImmutableBundlePayload({
+        release: {
+            releaseId: String(row.release_id),
+            scriptKey: String(row.script_key || buildScriptKey(derivedScope)),
+            targetType: String(row.target_type),
+            category: String(row.category),
+            name: String(row.name),
+            version: Number(row.version || 0),
+            scopeKind: row.scope_kind || derivedScope.scopeKind,
+            scopeId: String(row.scope_id ?? derivedScope.scopeId),
+            schoolSystemType: String(row.school_system_type || derivedScope.schoolSystemType),
+            parserApiVersion: Number(row.parser_api_version || 1),
+            runnerContractVersion: Number(row.runner_contract_version || 1)
+        },
+        artifact: {
+            content: String(row.content || ""),
+            sha256: String(row.content_sha256 || ""),
+            signature: String(row.signature || ""),
+            alg: String(row.alg || "rsa-sha256")
+        },
+        dependencies: dependencyResult.rows.map((dependency) => ({
+            releaseId: String(dependency.dependency_release_id),
+            category: String(dependency.category),
+            name: String(dependency.name),
+            version: Number(dependency.version || 0),
+            content: String(dependency.content || ""),
+            sha256: String(dependency.content_sha256 || ""),
+            signature: String(dependency.signature || ""),
+            alg: String(dependency.alg || "rsa-sha256")
+        }))
+    });
+}
 async function getReleaseForServing(category, name) {
     const result = await query(`SELECT r.*, a.content, a.content_sha256, a.signature, a.alg
      FROM script_releases r
-     JOIN script_artifacts a ON a.script_id = r.script_id AND a.version = r.version
+     JOIN script_artifacts a ON a.release_id = r.release_id
      WHERE r.category = $1 AND r.name = $2 AND r.release_stage IN ('active','canary')
        AND r.status = 'enabled' AND r.kill_switch = false
      ORDER BY CASE WHEN r.release_stage = 'active' THEN 2 ELSE 1 END DESC, r.version DESC
@@ -204,7 +392,7 @@ async function getReleaseForServing(category, name) {
 async function selectManifestReleases(systemType, schoolId, appVersionCode, bucket, requestedPolicy = "") {
     const rows = await query(`SELECT r.*, a.content_sha256, a.signature, a.alg
      FROM script_releases r
-     JOIN script_artifacts a ON a.script_id = r.script_id AND a.version = r.version
+     JOIN script_artifacts a ON a.release_id = r.release_id
      WHERE r.release_stage IN ('active','canary') AND r.status = 'enabled' AND r.kill_switch = false
        AND r.min_app_version_code <= $1
        AND (r.max_app_version_code IS NULL OR r.max_app_version_code >= $1)
@@ -224,26 +412,62 @@ export function selectManifestRowsForTest(rows, context) {
     const policy = context.selection?.selection_policy || "auto";
     if (policy === "assets_only")
         return [];
+    const eligibleRows = rows.filter((row) => isReleaseEligible(row, context.appVersionCode) && releaseTargetsMatch(row, context.systemType, context.schoolId));
+    if (policy === "fixed_release" && context.selection?.preferred_release_id) {
+        const fixed = eligibleRows.find((row) => row.release_id === context.selection?.preferred_release_id);
+        return fixed ? [markSelection(fixed, "fixed_release")] : [];
+    }
     const grouped = new Map();
-    for (const row of rows) {
-        if (!isReleaseEligible(row, context.appVersionCode))
-            continue;
-        if (!releaseTargetsMatch(row, context.systemType, context.schoolId))
-            continue;
-        const key = `${row.category}/${row.name}`;
+    for (const row of eligibleRows) {
+        const key = releaseScriptKey(row);
         grouped.set(key, [...(grouped.get(key) || []), row]);
     }
     const selected = [];
     for (const group of grouped.values()) {
-        const picked = selectUserFixedRelease(group, context.selection) ||
-            selectUserSchoolSpecificRelease(group, context.selection) ||
+        const picked = selectUserSchoolSpecificRelease(group, context.selection) ||
             selectSchoolBindingRelease(group, context.bindings) ||
             selectCanaryRelease(group, context.bucket || "anonymous") ||
             selectActiveRelease(group);
-        if (picked)
-            selected.push(picked);
+        if (!picked)
+            continue;
+        selected.push(picked);
+        if (picked.release_stage === "canary") {
+            const stable = selectActiveRelease(group);
+            if (stable && stable.release_id !== picked.release_id)
+                selected.push(stable);
+        }
     }
-    return selected.sort((a, b) => priorityFor(b, context.systemType) - priorityFor(a, context.systemType));
+    return selected.sort((a, b) => {
+        const scopeOrder = scopePriority(b) - scopePriority(a);
+        return scopeOrder !== 0 ? scopeOrder : priorityFor(b, context.systemType) - priorityFor(a, context.systemType);
+    });
+}
+/** 使用数据库中的脚本键，旧记录则即时推导，保证升级期间选择行为一致。 */
+function releaseScriptKey(row) {
+    if (row.script_key)
+        return row.script_key;
+    return buildScriptKey(deriveReleaseScope({
+        targetType: row.target_type,
+        category: row.category,
+        name: row.name,
+        schoolSystemTypes: row.school_system_types_json,
+        schoolIds: row.school_ids_json
+    }));
+}
+/** 学校覆盖优先于系统通用，系统通用优先于全局运行时。 */
+function scopePriority(row) {
+    const scope = deriveReleaseScope({
+        targetType: row.target_type,
+        category: row.category,
+        name: row.name,
+        schoolSystemTypes: row.school_system_types_json,
+        schoolIds: row.school_ids_json
+    });
+    if (scope.scopeKind === "school")
+        return 300;
+    if (scope.scopeKind === "system")
+        return 200;
+    return 100;
 }
 async function loadAppSelection(bucket, schoolId, systemType, requestedPolicy) {
     const result = await query(`SELECT selection_policy, preferred_release_id, preferred_script_id
@@ -331,9 +555,14 @@ function markSelection(row, selectionPolicy, schoolBindingId = null) {
     return { ...row, selection_policy: selectionPolicy, school_binding_id: schoolBindingId };
 }
 function releaseTargetsMatch(row, systemType, schoolId) {
-    const systems = Array.isArray(row.school_system_types_json) ? row.school_system_types_json.map(String) : [];
-    const schools = Array.isArray(row.school_ids_json) ? row.school_ids_json.map(String) : [];
-    return (!systems.length || systems.includes(systemType) || systemType === "") && (!schools.length || schools.includes(schoolId) || schoolId === "");
+    const scope = deriveReleaseScope({
+        targetType: row.target_type,
+        category: row.category,
+        name: row.name,
+        schoolSystemTypes: row.school_system_types_json,
+        schoolIds: row.school_ids_json
+    });
+    return releaseScopeMatchesRequest(scope, systemType, schoolId);
 }
 function rolloutHit(row, bucket) {
     const percent = Number(row.rollout_percent || 0);

@@ -15,7 +15,7 @@ function createSummaryConfig() {
   };
 }
 
-test("parse_task uses durable task store without depending on route memory Map", async () => {
+test("durable task store keeps canonical importSessionId after route restart", async () => {
   const app = Fastify();
   const savedTasks = new Map();
   const cloudTaskStore = {
@@ -47,7 +47,7 @@ test("parse_task uses durable task store without depending on route memory Map",
     method: "POST",
     url: "/api/v1/parse_task",
     payload: {
-      parseSessionId: "sess-persisted",
+      importSessionId: "import-persisted",
       userConsent: true,
       sanitizedContent: "星期一 大学英语 1-2节"
     }
@@ -55,8 +55,14 @@ test("parse_task uses durable task store without depending on route memory Map",
   const created = createResponse.json();
   assert.equal(created.code, 200);
   assert.equal(savedTasks.size, 1);
+  assert.equal(savedTasks.get(created.data.taskId).importSessionId, "import-persisted");
 
-  const statusResponse = await app.inject({
+  await app.close();
+
+  const restartedApp = Fastify();
+  await registerCollectorRoutes(restartedApp, { cloudTaskStore });
+
+  const statusResponse = await restartedApp.inject({
     method: "GET",
     url: `/api/v1/task_status?taskId=${created.data.taskId}`
   });
@@ -65,6 +71,7 @@ test("parse_task uses durable task store without depending on route memory Map",
   assert.equal(status.data.status, "success");
   assert.equal(status.data.result, '[{"name":"大学英语"}]');
   assert.equal(status.data.issueId, "issue-persisted");
+  assert.equal(status.data.importSessionId, "import-persisted");
 
-  await app.close();
+  await restartedApp.close();
 });

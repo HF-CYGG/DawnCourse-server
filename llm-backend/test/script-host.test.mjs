@@ -285,8 +285,8 @@ test("设备端内置副本与服务端权威源保持一致", () => {
   // 与 app/src/main/assets/runtime（断网兜底）。两者漂移会让「服务端跑通 == 设备跑通」
   // 的前提失效，因此在此锁定一致性。
   //
-  // server/ 目录会被 sync-server-repo 工作流同步到独立仓库，那里不存在 app 副本，
-  // 因此副本缺失时跳过而非失败。
+  // server/ 是独立仓库，直接在该仓库发布；独立检出中不存在 app 副本，
+  // 因此副本缺失时跳过而非失败。不要恢复已删除的常驻 Token 同步工作流。
   const appCopyUrl = new URL("../../../app/src/main/assets/runtime/script_host.js", import.meta.url);
   if (!fs.existsSync(appCopyUrl)) return;
 

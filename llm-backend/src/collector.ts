@@ -9,18 +9,19 @@ import { addIssueEvent, setIssueStage } from "./events.js";
 import { log } from "./log.js";
 import { startRepairJob } from "./repair.js";
 import { getRuntimeModelConfig, getRuntimePlatformConfig, ModelRuntimeConfig } from "./runtimeConfig.js";
-import { PageFingerprintInput, ParseReportInput, ParserAttemptInput } from "./types.js";
+import { PageFingerprintInput, ParseReportInput, ParseSessionInput, ParserAttemptInput } from "./types.js";
 import { hostFromUrl, id, limitString, normalizeSystemType, safeJsonParse, sha256 } from "./utils.js";
 
 /**
  * 内存态任务仓库：
- * - 当前 PG 版服务尚未把兜底解析任务持久化到数据库；
- * - 这里至少要把提交与轮询接口真正接起来，避免出现“任务已创建但永远不会完成”的接口断层。
+ * - 为同进程轮询提供低延迟缓存；
+ * - 重启后的任务状态与 importSessionId 仍以 CloudParseTaskStore 的持久记录为准。
  */
 const taskStore = new Map<
   string,
   {
     status: string;
+    importSessionId: string;
     result?: string;
     error?: string;
     issueId?: string;
@@ -35,6 +36,7 @@ const taskStore = new Map<
 
 type CloudParseTaskRecord = {
   taskId: string;
+  importSessionId: string;
   status: string;
   result?: string;
   error?: string;
@@ -81,7 +83,15 @@ export interface CollectorRouteDeps {
   }) => Promise<void>;
   taskStore?: typeof taskStore;
   cloudTaskStore?: CloudParseTaskStore;
+  writeFeedbackStats?: (input: FeedbackStatsInput) => Promise<void>;
 }
+
+type FeedbackStatsInput = {
+  scriptName: string;
+  success: boolean;
+  failureType: string;
+  importSessionId: string;
+};
 
 /**
  * 自动修复触发依赖：
@@ -101,20 +111,22 @@ export async function registerCollectorRoutes(app: FastifyInstance, deps: Collec
   const getRuntimeModelConfigFn = deps.getRuntimeModelConfig || getRuntimeModelConfig;
   const scheduleCloudParseTaskFn = deps.scheduleCloudParseTask || scheduleCloudParseTask;
   const routeTaskStore = deps.taskStore || taskStore;
+  const writeFeedbackStatsFn = deps.writeFeedbackStats || writeFeedbackStats;
   const cloudTaskStore =
     deps.cloudTaskStore || (deps.taskStore ? createMapCloudTaskStore(routeTaskStore) : pgCloudParseTaskStore);
   app.post("/api/v1/parse/report", async (request) => {
-    const body = (request.body || {}) as ParseReportInput;
+    const body = normalizeParseReportInput((request.body || {}) as ParseReportInput);
     const result = await ingestParseReportFn(body, "parse_report");
     return apiOk(result);
   });
 
   app.post("/api/v1/script_feedback", async (request) => {
     const body = (request.body || {}) as Record<string, unknown>;
+    const importSessionId = resolveImportSessionId(body);
     if (body.isSessionFinal === true && body.finalResult !== "success") {
       const report: ParseReportInput = {
         session: {
-          parseSessionId: String(body.parseSessionId || id("sess")),
+          importSessionId,
           schoolSystemType: body.schoolSystemType || "UNKNOWN",
           sourceUrl: body.sourceUrl || ""
         },
@@ -134,23 +146,40 @@ export async function registerCollectorRoutes(app: FastifyInstance, deps: Collec
       };
       await ingestParseReportFn(report, "script_feedback");
     }
-    await writeFeedbackStats(body);
+    await writeFeedbackStatsFn(buildFeedbackStatsInput(body, importSessionId));
     return apiOk({ accepted: true });
   });
 
   app.post("/api/v1/parse_task", async (request) => {
     const body = (request.body || {}) as Record<string, unknown>;
-    const content = String(body.sanitizedContent || body.content || body.html || "");
-    const parseSessionId = String(body.parseSessionId || id("sess"));
+    const hasLegacyRawContent = Object.hasOwn(body, "content") || Object.hasOwn(body, "html");
+    if (hasLegacyRawContent) {
+      return {
+        code: 400,
+        msg: "请求包含未脱敏的 legacy content/html 字段",
+        data: null
+      };
+    }
+    // 服务端只接收客户端脱敏器明确产出的字段，绝不把 content/html 这类原始别名当作样本。
+    const content = String(body.sanitizedContent || "");
+    const importSessionId = resolveImportSessionId(body);
     const explicitConsent = body.userConsent === true || body.hasUserConsent === true;
-    const sanitizerVersion = Number(body.sanitizerVersion || 1);
+    const sanitizerVersion = Object.hasOwn(body, "sanitizerVersion") ? Number(body.sanitizerVersion) : 1;
+    const sanitizerVersionValid = Number.isFinite(sanitizerVersion) && sanitizerVersion > 0;
+    if (!sanitizerVersionValid) {
+      return {
+        code: 400,
+        msg: "sanitizerVersion 必须是有限正数",
+        data: null
+      };
+    }
     const computedHash = content ? sha256(content) : "";
     const providedHash = String(body.contentSha256 || "").trim();
     const contentHashValid = !providedHash || providedHash.toLowerCase() === computedHash.toLowerCase();
-    const hasConsent = explicitConsent && sanitizerVersion > 0 && contentHashValid && Boolean(content.trim());
+    const hasConsent = explicitConsent && sanitizerVersionValid && contentHashValid && Boolean(content.trim());
     const report: ParseReportInput = {
       session: {
-        parseSessionId,
+        importSessionId,
         schoolId: body.schoolId || "",
         schoolName: body.schoolName || "",
         schoolSystemType: body.schoolSystemType || "",
@@ -213,6 +242,7 @@ export async function registerCollectorRoutes(app: FastifyInstance, deps: Collec
     const now = Date.now();
     const taskRecord = {
       taskId,
+      importSessionId,
       status: "processing",
       issueId: issue.issueId,
       schoolId: String(body.schoolId || ""),
@@ -234,6 +264,7 @@ export async function registerCollectorRoutes(app: FastifyInstance, deps: Collec
       const existing = routeTaskStore.get(taskId);
       const failedTask = {
         status: "failed",
+        importSessionId: existing?.importSessionId || importSessionId,
         issueId: existing?.issueId || issue.issueId,
         schoolId: existing?.schoolId || "",
         schoolName: existing?.schoolName || "",
@@ -247,7 +278,7 @@ export async function registerCollectorRoutes(app: FastifyInstance, deps: Collec
       void cloudTaskStore.update(taskId, failedTask);
       log.error("cloud parse task failed", { taskId, issueId: issue.issueId, error: String(error) });
     });
-    return apiOk({ taskId, status: "processing", issueId: issue.issueId });
+    return apiOk({ taskId, status: "processing", issueId: issue.issueId, importSessionId });
   });
 
   app.get("/api/v1/task_status", async (request) => {
@@ -265,6 +296,7 @@ export async function registerCollectorRoutes(app: FastifyInstance, deps: Collec
       result: task.result || null,
       error: task.error || "",
       issueId: task.issueId || "",
+      importSessionId: task.importSessionId || "",
       schoolId: task.schoolId || "",
       schoolName: task.schoolName || "",
       schoolSystemType: task.schoolSystemType || "",
@@ -274,9 +306,161 @@ export async function registerCollectorRoutes(app: FastifyInstance, deps: Collec
   });
 }
 
+const IMPORT_SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+
+/** 新协议优先 importSessionId，parseSessionId 只作为旧客户端的入站兼容字段。 */
+function resolveImportSessionId(source: Record<string, unknown> | ParseSessionInput): string {
+  const candidate = source.importSessionId ?? source.parseSessionId;
+  return typeof candidate === "string" && IMPORT_SESSION_ID_PATTERN.test(candidate) ? candidate : id("sess");
+}
+
+/**
+ * 把所有进入 collector 的报告归一化为新协议写法。
+ *
+ * 本地 Profile 身份不能离开设备，故所有嵌套对象都逐字段重建后才会进入持久化与下游分类；
+ * legacy parseSessionId 同样不会再被写入新的对象、事件或审计记录。客户端自由提供的
+ * classificationHint 没有服务端消费者，故不属于规范协议，也不会持久化。
+ */
+function normalizeParseReportInput(body: ParseReportInput): ParseReportInput {
+  const rawBody = isPlainRecord(body) ? body : {};
+  const rawSession = isPlainRecord(rawBody.session) ? rawBody.session : {};
+  const canonicalSession: ParseSessionInput = {
+    importSessionId: resolveImportSessionId(rawSession)
+  };
+  copyScalar(rawSession, "appVersionCode", canonicalSession);
+  copyScalar(rawSession, "appVersionName", canonicalSession);
+  copyScalar(rawSession, "installBucketIdHash", canonicalSession);
+  copyScalar(rawSession, "importSource", canonicalSession);
+  copyScalar(rawSession, "schoolId", canonicalSession);
+  copyScalar(rawSession, "schoolName", canonicalSession);
+  copyScalar(rawSession, "schoolSystemType", canonicalSession);
+  copyScalar(rawSession, "sourceUrl", canonicalSession);
+
+  const normalized: ParseReportInput = { session: canonicalSession };
+  const pageFingerprint = normalizePageFingerprint(rawBody.pageFingerprint);
+  if (pageFingerprint) normalized.pageFingerprint = pageFingerprint;
+  const attempts = normalizeParserAttempts(rawBody.attempts);
+  if (attempts) normalized.attempts = attempts;
+  if (typeof rawBody.finalSuccess === "boolean") normalized.finalSuccess = rawBody.finalSuccess;
+  copyString(rawBody, "finalFailureType", normalized);
+  copyString(rawBody, "failureStage", normalized);
+  copyRepairDomain(rawBody, normalized);
+  copyTargetType(rawBody, normalized);
+  copyString(rawBody, "sourceUrl", normalized);
+  if (typeof rawBody.consentAt === "number" || typeof rawBody.consentAt === "string") {
+    normalized.consentAt = rawBody.consentAt;
+  }
+  const sanitizedSample = normalizeSanitizedSample(rawBody.sanitizedSample);
+  if (sanitizedSample) normalized.sanitizedSample = sanitizedSample;
+  return normalized;
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function copyScalar(source: object, key: string, target: object): void {
+  const sourceRecord = source as Record<string, unknown>;
+  const targetRecord = target as Record<string, unknown>;
+  const value = sourceRecord[key];
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") targetRecord[key] = value;
+}
+
+function copyString(source: object, key: string, target: object): void {
+  const sourceRecord = source as Record<string, unknown>;
+  if (typeof sourceRecord[key] === "string") (target as Record<string, unknown>)[key] = sourceRecord[key];
+}
+
+function copyBoolean(source: object, key: string, target: object): void {
+  const sourceRecord = source as Record<string, unknown>;
+  if (typeof sourceRecord[key] === "boolean") (target as Record<string, unknown>)[key] = sourceRecord[key];
+}
+
+function copyNumber(source: object, key: string, target: object): void {
+  const sourceRecord = source as Record<string, unknown>;
+  if (typeof sourceRecord[key] === "number" && Number.isFinite(sourceRecord[key])) {
+    (target as Record<string, unknown>)[key] = sourceRecord[key];
+  }
+}
+
+function normalizePageFingerprint(value: unknown): PageFingerprintInput | undefined {
+  if (!isPlainRecord(value)) return undefined;
+  const normalized: PageFingerprintInput = {};
+  copyString(value, "host", normalized);
+  copyString(value, "pathPattern", normalized);
+  copyString(value, "titleHash", normalized);
+  copyString(value, "bodyTextHash", normalized);
+  copyString(value, "htmlStructureHash", normalized);
+  copyString(value, "tableShape", normalized);
+  copyString(value, "formActionHash", normalized);
+  copyBoolean(value, "hasCaptcha", normalized);
+  copyBoolean(value, "hasLoginKeyword", normalized);
+  copyBoolean(value, "hasCourseKeyword", normalized);
+  return Object.keys(normalized).length ? normalized : undefined;
+}
+
+function normalizeParserAttempts(value: unknown): ParserAttemptInput[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const normalized = value.flatMap((attempt) => {
+    if (!isPlainRecord(attempt)) return [];
+    const safeAttempt: ParserAttemptInput = {};
+    copyString(attempt, "parserName", safeAttempt);
+    copyString(attempt, "category", safeAttempt);
+    copyNumber(attempt, "parserVersion", safeAttempt);
+    copyString(attempt, "releaseId", safeAttempt);
+    copyString(attempt, "scriptSource", safeAttempt);
+    copyString(attempt, "scriptSha256", safeAttempt);
+    copyNumber(attempt, "durationMs", safeAttempt);
+    copyBoolean(attempt, "success", safeAttempt);
+    copyNumber(attempt, "resultCount", safeAttempt);
+    copyString(attempt, "failureType", safeAttempt);
+    copyString(attempt, "safeErrorCode", safeAttempt);
+    copyBoolean(attempt, "schemaValid", safeAttempt);
+    copyNumber(attempt, "confidence", safeAttempt);
+    return [safeAttempt];
+  });
+  return normalized;
+}
+
+function normalizeSanitizedSample(value: unknown): NonNullable<ParseReportInput["sanitizedSample"]> | undefined {
+  if (!isPlainRecord(value)) return undefined;
+  const normalized: NonNullable<ParseReportInput["sanitizedSample"]> = {};
+  copyBoolean(value, "hasUserConsent", normalized);
+  copyNumber(value, "sanitizerVersion", normalized);
+  copyString(value, "contentSha256", normalized);
+  copyString(value, "content", normalized);
+  return Object.keys(normalized).length ? normalized : undefined;
+}
+
+function copyRepairDomain(source: Record<string, unknown>, target: ParseReportInput): void {
+  if (
+    source.repairDomain === "PARSER_FAILURE" ||
+    source.repairDomain === "NAVIGATION_FAILURE" ||
+    source.repairDomain === "TERM_EXTRACT_FAILURE" ||
+    source.repairDomain === "LOGIN_OR_CAPTCHA" ||
+    source.repairDomain === "NON_TIMETABLE_PAGE" ||
+    source.repairDomain === "CLOUD_PARSE_FAILURE"
+  ) {
+    target.repairDomain = source.repairDomain;
+  }
+}
+
+function copyTargetType(source: Record<string, unknown>, target: ParseReportInput): void {
+  if (
+    source.targetType === "parser" ||
+    source.targetType === "navigation" ||
+    source.targetType === "term_extractor" ||
+    source.targetType === "cloud_parse" ||
+    source.targetType === "none"
+  ) {
+    target.targetType = source.targetType;
+  }
+}
+
 export async function ingestParseReport(body: ParseReportInput, source: string): Promise<{ issueId: string; repairDomain: string; targetType: string; queued: boolean }> {
+  body = normalizeParseReportInput(body);
   const session = body.session || {};
-  const parseSessionId = String(session.parseSessionId || id("sess"));
+  const importSessionId = resolveImportSessionId(session);
   const sourceUrl = body.sourceUrl || String(session.sourceUrl || "");
   const host = (body.pageFingerprint?.host || hostFromUrl(sourceUrl)).toLowerCase();
   const content = body.sanitizedSample?.hasUserConsent ? String(body.sanitizedSample.content || "") : "";
@@ -326,7 +510,7 @@ export async function ingestParseReport(body: ParseReportInput, source: string):
         END,
         updated_at = now()`,
       [
-        parseSessionId,
+        importSessionId,
         Number(session.appVersionCode || 0),
         String(session.appVersionName || ""),
         String(session.installBucketIdHash || ""),
@@ -342,7 +526,8 @@ export async function ingestParseReport(body: ParseReportInput, source: string):
         body.failureStage || "",
         resolution.targetType,
         sourceUrl,
-        JSON.stringify(body.classificationHint || {}),
+        // classificationHint 曾是客户端自由对象；没有服务端消费者，规范化入口已明确不接收它。
+        JSON.stringify({}),
         consentAt
       ]
     );
@@ -352,7 +537,7 @@ export async function ingestParseReport(body: ParseReportInput, source: string):
           duration_ms, success, result_count, failure_type, safe_error_code, schema_valid, confidence, raw_json)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb)`,
         [
-          parseSessionId,
+          importSessionId,
           attempt.parserName || resolution.scriptName,
           attempt.category || resolution.category,
           Number(attempt.parserVersion || 0),
@@ -373,7 +558,7 @@ export async function ingestParseReport(body: ParseReportInput, source: string):
 
     const sessionIssue = await client.query<{ issue_id: string | null }>(
       "SELECT issue_id FROM parse_sessions WHERE parse_session_id = $1 FOR UPDATE",
-      [parseSessionId]
+      [importSessionId]
     );
     const existing = await client.query<{ issue_id: string; sample_count: number; user_count: number }>(
       "SELECT issue_id, sample_count, user_count FROM repair_issues WHERE issue_key = $1 FOR UPDATE",
@@ -450,7 +635,7 @@ export async function ingestParseReport(body: ParseReportInput, source: string):
         ]
       );
     }
-    await client.query("UPDATE parse_sessions SET issue_id = $2, updated_at = now() WHERE parse_session_id = $1", [parseSessionId, issueId]);
+    await client.query("UPDATE parse_sessions SET issue_id = $2, updated_at = now() WHERE parse_session_id = $1", [importSessionId, issueId]);
 
     if (body.sanitizedSample?.hasUserConsent && content) {
       const candidateSampleId = id("sample");
@@ -477,7 +662,7 @@ export async function ingestParseReport(body: ParseReportInput, source: string):
          RETURNING sample_id`,
         [
           candidateSampleId,
-          parseSessionId,
+          importSessionId,
           issueId,
           Number(body.sanitizedSample.sanitizerVersion || 1),
           body.sanitizedSample.contentSha256 || sha256(content),
@@ -513,7 +698,7 @@ export async function ingestParseReport(body: ParseReportInput, source: string):
     );
   });
 
-  await addIssueEvent({ issueId, stage: "REPORTED", source, message: "收到失败上报", meta: { parseSessionId, repairDomain: resolution.repairDomain, targetType: resolution.targetType } });
+  await addIssueEvent({ issueId, stage: "REPORTED", source, message: "收到失败上报", meta: { importSessionId, repairDomain: resolution.repairDomain, targetType: resolution.targetType } });
   await addIssueEvent({ issueId, stage: "CLASSIFIED", source: "classifier", message: `失败分类：${resolution.repairDomain}`, meta: resolution as unknown as Record<string, unknown> });
   await addIssueEvent({ issueId, stage: "ISSUE_MERGED", source, message: "已归并到 Repair Issue", meta: { issueKey: resolution.issueKey, sampleId } });
 
@@ -642,14 +827,27 @@ function normalizeAttemptList(value: unknown): string[] {
   return ["zhengfang.js"];
 }
 
-async function writeFeedbackStats(body: Record<string, unknown>): Promise<void> {
-  const scriptName = String(body.scriptName || "unknown.js");
-  const success = body.success === true || body.finalResult === "success";
-  const failureType = String(body.failureType || "unknown");
+function buildFeedbackStatsInput(body: Record<string, unknown>, importSessionId: string): FeedbackStatsInput {
+  return {
+    scriptName: String(body.scriptName || "unknown.js"),
+    success: body.success === true || body.finalResult === "success",
+    failureType: String(body.failureType || "unknown"),
+    importSessionId
+  };
+}
+
+async function writeFeedbackStats(input: FeedbackStatsInput): Promise<void> {
   await query(
     `INSERT INTO audit_logs(actor, action, target_type, target_id, detail_json)
      VALUES ('client','script_feedback','script',$1,$2::jsonb)`,
-    [scriptName, JSON.stringify({ success, failureType, parseSessionId: body.parseSessionId || "" })]
+    [
+      input.scriptName,
+      JSON.stringify({
+        success: input.success,
+        failureType: input.failureType,
+        importSessionId: input.importSessionId
+      })
+    ]
   );
 }
 
@@ -746,12 +944,13 @@ function createMapCloudTaskStore(store: typeof taskStore): CloudParseTaskStore {
 const pgCloudParseTaskStore: CloudParseTaskStore = {
   async create(task) {
     await query(
-      `INSERT INTO cloud_parse_tasks(task_id, status, issue_id, school_id, school_name, school_system_type, created_at, started_at, updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,to_timestamp($7 / 1000.0),to_timestamp($8 / 1000.0),now())
+      `INSERT INTO cloud_parse_tasks(task_id, import_session_id, status, issue_id, school_id, school_name, school_system_type, created_at, started_at, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,to_timestamp($8 / 1000.0),to_timestamp($9 / 1000.0),now())
        ON CONFLICT (task_id)
-       DO UPDATE SET status = EXCLUDED.status, issue_id = EXCLUDED.issue_id, updated_at = now()`,
+       DO UPDATE SET import_session_id = EXCLUDED.import_session_id, status = EXCLUDED.status, issue_id = EXCLUDED.issue_id, updated_at = now()`,
       [
         task.taskId,
+        task.importSessionId,
         task.status,
         task.issueId || "",
         task.schoolId || "",
@@ -781,6 +980,7 @@ const pgCloudParseTaskStore: CloudParseTaskStore = {
       result_text: string | null;
       error_text: string | null;
       issue_id: string | null;
+      import_session_id: string | null;
       school_id: string | null;
       school_name: string | null;
       school_system_type: string | null;
@@ -788,7 +988,7 @@ const pgCloudParseTaskStore: CloudParseTaskStore = {
       started_at_ms: string | null;
       completed_at_ms: string | null;
     }>(
-      `SELECT task_id, status, result_text, error_text, issue_id, school_id, school_name, school_system_type,
+      `SELECT task_id, import_session_id, status, result_text, error_text, issue_id, school_id, school_name, school_system_type,
          floor(extract(epoch from created_at) * 1000)::bigint::text AS created_at_ms,
          floor(extract(epoch from started_at) * 1000)::bigint::text AS started_at_ms,
          floor(extract(epoch from completed_at) * 1000)::bigint::text AS completed_at_ms
@@ -799,6 +999,7 @@ const pgCloudParseTaskStore: CloudParseTaskStore = {
     if (!row) return null;
     return {
       taskId: row.task_id,
+      importSessionId: row.import_session_id || "",
       status: row.status,
       result: row.result_text || undefined,
       error: row.error_text || undefined,

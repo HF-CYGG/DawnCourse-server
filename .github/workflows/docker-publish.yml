@@ -169,6 +169,7 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
+          provenance: false
           tags: ${{ steps.tags.outputs.aliyun }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

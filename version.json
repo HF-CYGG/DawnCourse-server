@@ -1,11 +1,11 @@
 {
-  "versionCode": 138,
-  "versionName": "v1.0.5.1",
-  "title": "全新数据同步、备份与日历导出体验",
-  "type": "feature",
-  "updateContent": "Dawn Course v1.0.5.1 核心更新：\n\n1. 新增：WebDAV 云端备份与恢复功能，支持后台自动同步。\n2. 新增：本地安全备份与还原功能，并提供还原前的数据预览与二次确认。\n3. 新增：导出日历 (ICS) 功能，完美支持将课程导入系统日历或 Outlook。\n4. 优化：全新设计的桌面组件 (Widget)，增加地点图标、统一主题配色与边缘渐变遮罩。\n5. 优化：提升凭据存储安全性并修复部分场景下的提醒通知问题。",
-  "downloadUrl": "https://gitee.com/YeMiao_cats/Dawn-Course/releases/download/v1.0.5.1/Dawn%20Course.apk",
-  "date": "2026-03-28",
-  "sha256": "E5D0B38BB931A9805614CF180B2C65EBBB6C12522256D9AA7936347C14311A47",
+  "versionCode": 139,
+  "versionName": "v1.0.6.0",
+  "title": "云端脚本引擎与多课表全面升级",
+  "type": "major",
+  "updateContent": "Dawn Course v1.0.6.0 核心更新：\n\n1. 重大更新：云端脚本引擎可单独更新导入规则，无需等待整个应用升级；某条导入规则出错时，只影响这条规则，不影响其他规则。遇到新学校或页面变化时，经用户同意后只上传已去除个人信息的内容协助适配。\n2. 新增：多套课表可创建、复制、切换、重命名，分别设置学期和导入位置。\n3. 安全：启用本地数据加密与恢复引导；升级出错时保留旧数据，不静默清空。\n4. 优化：改进不同来源课程的导入成功率。\n5. 修复：周次、单双周和节次识别问题。\n6. 修复：升级后同一课程可能显示成多张窄卡的问题。\n7. 优化：提醒、自动静音、桌面课表小组件和启动更可靠。",
+  "downloadUrl": "https://gitee.com/YeMiao_cats/Dawn-Course/releases/download/v1.0.6.0/Dawn%20Course.apk",
+  "date": "2026-09-02",
+  "sha256": "8AF04F10094472FE76AD0D701E5BF2E29EE74FF8D1B922B5E69A244F5DA355F5",
   "forceUpdate": false
 }

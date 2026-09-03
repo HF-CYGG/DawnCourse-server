@@ -16,7 +16,9 @@ if defined PORT_USED (
   if %TRY_INDEX% LSS %MAX_PORT_TRY% goto find_port
 )
 if not exist "node_modules\redis" (
-  npm install
+  call npm install
+  if errorlevel 1 exit /b 1
 )
-start "" "http://localhost:%PORT%/admin/"
-node server.js
+call npm run build
+if errorlevel 1 exit /b 1
+node dist\main.js

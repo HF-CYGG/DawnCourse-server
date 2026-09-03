@@ -223,7 +223,9 @@ async function runRepairJob(issueId, jobId, options) {
             parentReleaseId: active.releaseId,
             changelog: `Auto repair from ${issueId}: ${candidate.summary || diagnosis.summary}`,
             testReportId: candidateRuns[candidateRuns.length - 1]?.reportId,
-            actor
+            actor,
+            schoolId: issue.school_id || "",
+            schoolSystemType: issue.school_system_type || ""
         });
         await query("UPDATE repair_jobs SET status = 'completed', finished_at = now(), meta_json = $2::jsonb WHERE job_id = $1", [
             jobId,
@@ -373,11 +375,42 @@ async function loadRegressionSamples(issue, issueId, limit) {
      LIMIT $5`, [issueId, issue.affected_script_id, issue.school_system_type || "", issue.school_id || "", Math.max(1, limit)]);
     return result.rows;
 }
+/** 共享执行契约的脚本标识 */
+const SCRIPT_HOST_CATEGORY = "runtime";
+const SCRIPT_HOST_NAME = "script_host.js";
+/** 所有解析器共用的工具库，必须与脚本一同注入沙箱 */
+const COMMON_PARSER_UTILS = "common_parser_utils.js";
+/**
+ * 读取当前对外服务的共享执行契约源码。
+ *
+ * 沙箱使用与客户端同一版本的 harness，才能保证「沙箱跑通 == 设备跑通」。
+ */
+async function loadHarnessSource() {
+    const harness = await getActiveScriptContent(SCRIPT_HOST_CATEGORY, SCRIPT_HOST_NAME);
+    return harness?.content || "";
+}
+/**
+ * 解析脚本依赖。
+ *
+ * 规则与客户端保持一致：parsers 分类的脚本统一前置 common_parser_utils.js。
+ * 此前沙箱从不注入依赖，导致 zhengfang/qiangzhi/kingosoft 在缺少工具函数的
+ * 残缺环境里执行，baseline 与候选脚本都在错误前提下被判定。
+ */
+async function loadScriptDependencies(category, name) {
+    if (category !== "parsers" || name === COMMON_PARSER_UTILS)
+        return [];
+    const common = await getActiveScriptContent("parsers", COMMON_PARSER_UTILS);
+    return common?.content ? [{ name: COMMON_PARSER_UTILS, content: common.content }] : [];
+}
 async function runScriptForSamples(input) {
     const runs = [];
+    const harnessSource = await loadHarnessSource();
+    const dependencies = await loadScriptDependencies(input.issue.affected_category, input.issue.affected_script_name);
     for (const sample of input.samples) {
         const report = await runScript({
             scriptContent: input.scriptContent,
+            dependencies,
+            harnessSource,
             sampleContent: sample.sanitized_content,
             targetType: input.issue.target_type,
             timeoutMs: input.timeoutMs

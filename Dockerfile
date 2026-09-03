@@ -33,6 +33,8 @@ COPY --from=backend-build /app/llm-backend/dist /app/llm-backend/dist
 COPY ./script-runner/package.json /app/script-runner/package.json
 COPY ./script-runner/runner.js /app/script-runner/runner.js
 
+COPY ./scripts /app/scripts
+
 COPY ./start.sh /app/start.sh
 RUN chmod +x /app/start.sh && mkdir -p /shared/parsers /data /run/redis /run/postgresql
 VOLUME ["/shared/parsers", "/data"]

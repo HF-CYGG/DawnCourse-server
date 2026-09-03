@@ -55,8 +55,30 @@ export interface PageFingerprintInput {
   hasCourseKeyword?: boolean;
 }
 
+/**
+ * 解析诊断会话的跨端身份。
+ *
+ * `importSessionId` 是新协议唯一写出的字段；`parseSessionId` 仅用于读取旧客户端请求。
+ * `profileId` 不属于服务端诊断协议，入口归一化时会丢弃。
+ */
+export interface ParseSessionInput {
+  importSessionId?: unknown;
+  /** @deprecated 仅兼容旧客户端入站请求，服务端不再写出。 */
+  parseSessionId?: unknown;
+  schoolId?: unknown;
+  schoolName?: unknown;
+  schoolSystemType?: unknown;
+  sourceUrl?: unknown;
+  appVersionCode?: unknown;
+  appVersionName?: unknown;
+  installBucketIdHash?: unknown;
+  importSource?: unknown;
+  /** 运行时入口仍会按 allowlist 丢弃未知字段；索引签名仅兼容分类器的通用诊断输入类型。 */
+  [key: string]: unknown;
+}
+
 export interface ParseReportInput {
-  session?: Record<string, unknown>;
+  session?: ParseSessionInput;
   pageFingerprint?: PageFingerprintInput;
   attempts?: ParserAttemptInput[];
   finalSuccess?: boolean;
@@ -65,7 +87,6 @@ export interface ParseReportInput {
   repairDomain?: RepairDomain;
   targetType?: TargetType;
   sourceUrl?: string;
-  classificationHint?: Record<string, unknown>;
   consentAt?: number | string;
   sanitizedSample?: {
     hasUserConsent?: boolean;
@@ -99,6 +120,13 @@ export interface RunnerRequest {
   entry?: string;
   timeoutMs?: number;
   memoryLimitMb?: number;
+  /**
+   * 共享执行契约（script_host.js）源码。
+   *
+   * 由后端读取「当前对外服务的那一版 harness」并随请求下发，使沙箱校验环境
+   * 与设备端实际执行环境保持同版本，避免契约漂移导致的误判。
+   */
+  harnessSource?: string;
 }
 
 export interface RunnerResponse {

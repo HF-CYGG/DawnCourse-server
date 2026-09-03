@@ -1,0 +1,39 @@
+name: Verify script meta sidecars
+
+# 无 TLS 部署下，客户端只能走静态 /scripts/<category>/<name>.js 下载并按同名
+# .meta.json 验签。此工作流确保每次改动脚本后，签名边车都同步重新生成、字节一致，
+# 否则客户端会验签失败并弹「云端脚本拉取失败」。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "html/scripts/**"
+      - "scripts/gen-script-meta.mjs"
+      - "scripts/gen-script-meta.test.mjs"
+      - ".gitattributes"
+  pull_request:
+    paths:
+      - "html/scripts/**"
+      - "scripts/gen-script-meta.mjs"
+      - "scripts/gen-script-meta.test.mjs"
+      - ".gitattributes"
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Unit tests
+        run: node --test scripts/gen-script-meta.test.mjs
+
+      - name: Sidecars match scripts (sha256 + RSA signature, LF, no BOM)
+        run: node scripts/gen-script-meta.mjs --check

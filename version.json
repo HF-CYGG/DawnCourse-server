@@ -1,11 +1,11 @@
 {
-  "versionCode": 139,
-  "versionName": "v1.0.6.0",
-  "title": "云端脚本引擎与多课表全面升级",
-  "type": "major",
-  "updateContent": "Dawn Course v1.0.6.0 核心更新：\n\n1. 重大更新：云端脚本引擎可单独更新导入规则，无需等待整个应用升级；某条导入规则出错时，只影响这条规则，不影响其他规则。遇到新学校或页面变化时，经用户同意后只上传已去除个人信息的内容协助适配。\n2. 新增：多套课表可创建、复制、切换、重命名，分别设置学期和导入位置。\n3. 安全：启用本地数据加密与恢复引导；升级出错时保留旧数据，不静默清空。\n4. 优化：改进不同来源课程的导入成功率。\n5. 修复：周次、单双周和节次识别问题。\n6. 修复：升级后同一课程可能显示成多张窄卡的问题。\n7. 优化：提醒、自动静音、桌面课表小组件和启动更可靠。\n8. 更新体验：支持在应用内下载 APK 并打开系统安装页，避免文件被保存为 .apk.zip；检查更新优先使用 Dawn 服务器，失败时自动切换备用节点。",
-  "downloadUrl": "https://gitee.com/YeMiao_cats/Dawn-Course/releases/download/v1.0.6.0/Dawn%20Course.apk",
-  "date": "2026-09-02",
-  "sha256": "4C1BC33959A4ABA8523A29F98074CAFE30E637E8B36962E32C37946D1857F65F",
+  "versionCode": 140,
+  "versionName": "v1.0.6.1",
+  "title": "更新检查 HTTPS 迁移稳定性修复",
+  "type": "patch",
+  "updateContent": "Dawn Course v1.0.6.1 更新：\n\n1. 修复：自建更新服务迁移到 HTTPS 后，部分网络环境可能无法正常检查更新的问题。\n2. 安全：所有更新元数据节点统一使用 HTTPS，并限制重定向停留在可信的同源地址。\n3. 稳定性：自建节点暂时不可用时，继续自动切换 GitHub Raw、GitHub API 和 jsDelivr 备用节点。\n4. 测试：补充真实 TLS 握手、同源 HTTPS 重定向和异常回退验证。",
+  "downloadUrl": "https://gitee.com/YeMiao_cats/Dawn-Course/releases/download/v1.0.6.1/Dawn%20Course.apk",
+  "date": "2026-09-04",
+  "sha256": "2D1379409D2ACF4286ADA9C3376288433D8712FA2CB498434434C71466A00A52",
   "forceUpdate": false
 }

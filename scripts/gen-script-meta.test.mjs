@@ -10,7 +10,6 @@ import { parseVersion, computeMeta, serializeMeta, verifySidecar, run } from "./
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, "..");
-const REPO_PUBLIC_KEY = fs.readFileSync(path.join(HERE, "script_sign_public.pem"), "utf8");
 
 const kp = crypto.generateKeyPairSync("rsa", {
   modulusLength: 2048,
@@ -89,6 +88,14 @@ test("verifySidecar 用错误的公钥判定失败", () => {
 test("--fill-stale 会重写签名验不过的遗留边车（持久卷里旧密钥签的）", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gen-meta-fillstale-"));
   try {
+    // CI 没有仓库私钥，用一对临时密钥当「部署签名密钥」经 env 传入
+    const deploy = crypto.generateKeyPairSync("rsa", {
+      modulusLength: 2048,
+      publicKeyEncoding: { type: "spki", format: "pem" },
+      privateKeyEncoding: { type: "pkcs8", format: "pem" }
+    });
+    const env = { SCRIPT_SIGN_PRIVATE_KEY: deploy.privateKey, SCRIPT_VERIFY_PUBLIC_KEY: deploy.publicKey };
+
     const jsSrc = fs.readFileSync(path.join(REPO_ROOT, "html/scripts/js/generic_provider.js"));
     fs.writeFileSync(path.join(dir, "generic_provider.js"), jsSrc);
     // 旧版服务端遗留：sha256 字段正确，但签名是另一把密钥签的、字段也多
@@ -112,21 +119,19 @@ test("--fill-stale 会重写签名验不过的遗留边车（持久卷里旧密�
       })
     );
 
-    const code = run(["--fill-stale", "--quiet", "--root", dir], { env: {}, cwd: dir });
+    const code = run(["--fill-stale", "--quiet", "--root", dir], { env, cwd: dir });
     assert.equal(code, 0);
 
     const rewritten = fs.readFileSync(path.join(dir, "generic_provider.meta.json"), "utf8");
-    assert.deepEqual(verifySidecar(jsSrc, rewritten, REPO_PUBLIC_KEY), [], "重写后应能被 App 公钥验过");
+    assert.deepEqual(verifySidecar(jsSrc, rewritten, deploy.publicKey), [], "重写后应能被部署公钥验过");
     assert.deepEqual(Object.keys(JSON.parse(rewritten)), ["sha256", "signature", "alg", "version"]);
 
-    // 幂等：再跑一次不应再改动
-    const before = fs.statSync(path.join(dir, "generic_provider.meta.json")).mtimeMs;
-    run(["--fill-stale", "--quiet", "--root", dir], { env: {}, cwd: dir });
+    // 幂等：再跑一次不应破坏
+    run(["--fill-stale", "--quiet", "--root", dir], { env, cwd: dir });
     assert.deepEqual(
-      verifySidecar(jsSrc, fs.readFileSync(path.join(dir, "generic_provider.meta.json"), "utf8"), REPO_PUBLIC_KEY),
+      verifySidecar(jsSrc, fs.readFileSync(path.join(dir, "generic_provider.meta.json"), "utf8"), deploy.publicKey),
       []
     );
-    void before;
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

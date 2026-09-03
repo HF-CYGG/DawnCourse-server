@@ -1,0 +1,6 @@
+# 客户端按「nginx 实际下发的原始字节」做 sha256 + RSA 验签，
+# 因此被签名的脚本及其 .meta.json 边车必须在所有平台上字节一致（统一 LF、无 BOM）。
+html/scripts/**/*.js   text eol=lf
+html/scripts/**/*.json  text eol=lf
+scripts/*.mjs          text eol=lf
+start.sh               text eol=lf

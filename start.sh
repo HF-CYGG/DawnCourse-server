@@ -94,6 +94,22 @@ fi
 
 trap stop_all TERM INT
 
+# 无 TLS 部署下，客户端只能走 nginx 的静态 /scripts/<category>/<name>.js 下载路径，
+# 并按「实际下发的原始字节」验签同名 .meta.json。这里对 nginx try_files 真正会命中的
+# 目录重新生成边车，保证持久卷里被 LLM 修复 / 管理端上传覆盖过的脚本也有匹配的签名。
+# 私钥缺失时只告警不阻塞启动（此时客户端继续用 assets 兜底）。
+if [ -f /app/scripts/gen-script-meta.mjs ]; then
+  if node /app/scripts/gen-script-meta.mjs --fill-stale --quiet \
+       --root /usr/share/nginx/html/scripts/js \
+       --root /usr/share/nginx/html/scripts/parsers \
+       --root /usr/share/nginx/html/scripts/runtime \
+       --root "${SCRIPT_OUTPUT_DIR}"; then
+    echo "[bootstrap] script meta sidecars refreshed"
+  else
+    echo "[bootstrap] WARN: script meta generation skipped (signing key unavailable?)" >&2
+  fi
+fi
+
 sed \
   -e "s#__LLM_BACKEND_UPSTREAM__#${LLM_BACKEND_UPSTREAM}#g" \
   -e "s#__NGINX_DNS_RESOLVER__#${NGINX_DNS_RESOLVER}#g" \

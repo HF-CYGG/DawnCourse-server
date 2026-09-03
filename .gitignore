@@ -4,6 +4,8 @@
 
 secrets/
 *.pem
+# 脚本验签公钥不是机密，需随仓库提交作为边车校验锚点（= App 内置 SCRIPT_VERIFY_PUBLIC_KEY）
+!/scripts/script_sign_public.pem
 script_sign_private_env.txt
 script_verify_public_env.txt
 

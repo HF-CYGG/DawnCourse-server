@@ -4,6 +4,7 @@
 .env.*
 secrets
 *.pem
+!scripts/script_sign_public.pem
 script_sign_private_env.txt
 script_verify_public_env.txt
 **/node_modules

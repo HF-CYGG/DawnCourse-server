@@ -21,9 +21,9 @@
  *     --check       只校验，不需要私钥：对每个 .js 校验同名边车的 sha256、
  *                   RSA-SHA256 签名（用公钥验）、alg、version，以及 .js 无 CRLF/BOM。
  *                   任一不满足 → 退出码 1。CI 用。
- *     --fill-stale  容器启动用：仅当边车缺失、或其 sha256 与当前 .js 不符时才用私钥重写；
- *                   sha256 已对上的边车保持原签名不动，避免用运行期密钥覆盖镜像里
- *                   已用正确密钥签好的静态边车。
+ *     --fill-stale  容器启动用：仅当边车缺失、或其签名【验不过当前验签公钥】时才用私钥重写
+ *                   （能验过的保持不动，避免用运行期密钥覆盖镜像里已签好的静态边车）。
+ *                   这会覆盖持久卷 /shared/parsers 里旧版服务端用旧密钥写的 *.meta.json。
  *     --quiet       只打印告警与错误
  *
  * 私钥解析顺序（重签 / --fill-stale 时需要，与 llm-backend/src/runtimeConfig.ts 一致）：
@@ -154,14 +154,6 @@ function short(value) {
   return typeof value === "string" ? `${value.slice(0, 12)}…` : String(value);
 }
 
-function sidecarSha(text) {
-  try {
-    return JSON.parse(text).sha256 || "";
-  } catch {
-    return "";
-  }
-}
-
 function hasBom(bytes) {
   return bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf;
 }
@@ -266,8 +258,13 @@ export function run(argv = process.argv.slice(2), { env = process.env, cwd = pro
 
       const meta = computeMeta(bytes, signing.privateKey);
       const metaText = serializeMeta(meta);
-      if (fillStale && existing !== null && sidecarSha(existing) === meta.sha256) {
-        continue; // 边车已覆盖当前脚本字节：保留原签名，不用运行期密钥覆盖
+      if (fillStale && existing !== null) {
+        // 只有当现有边车能被验签公钥【真正验过】时才保留（避免用运行期密钥覆盖镜像里
+        // 已用正确密钥签好的边车）；sha256 对得上但签名验不过的旧边车必须重写——
+        // 例如持久卷里旧版服务端写的、用旧密钥签名的 *.meta.json。
+        const stale = verifySidecar(bytes, existing, verify.publicKey);
+        if (stale.length === 0) continue;
+        log(`[gen-script-meta] 重写失效边车 ${metaRel}：${stale.join("；")}`);
       }
       if (existing !== metaText) {
         fs.writeFileSync(metaPath, metaText);

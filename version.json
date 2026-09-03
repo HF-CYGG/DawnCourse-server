@@ -2,7 +2,7 @@
   "versionCode": 140,
   "versionName": "v1.0.6.1",
   "title": "更新检查 HTTPS 迁移稳定性修复",
-  "type": "patch",
+  "type": "standard",
   "updateContent": "Dawn Course v1.0.6.1 更新：\n\n1. 修复：自建更新服务迁移到 HTTPS 后，部分网络环境可能无法正常检查更新的问题。\n2. 安全：所有更新元数据节点统一使用 HTTPS，并限制重定向停留在可信的同源地址。\n3. 稳定性：自建节点暂时不可用时，继续自动切换 GitHub Raw、GitHub API 和 jsDelivr 备用节点。\n4. 测试：补充真实 TLS 握手、同源 HTTPS 重定向和异常回退验证。",
   "downloadUrl": "https://gitee.com/YeMiao_cats/Dawn-Course/releases/download/v1.0.6.1/Dawn%20Course.apk",
   "date": "2026-09-04",

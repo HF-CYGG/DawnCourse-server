@@ -2,10 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { parseVersion, computeMeta, serializeMeta, verifySidecar } from "./gen-script-meta.mjs";
+import { parseVersion, computeMeta, serializeMeta, verifySidecar, run } from "./gen-script-meta.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, "..");
@@ -82,6 +83,58 @@ test("verifySidecar 用错误的公钥判定失败", () => {
     privateKeyEncoding: { type: "pkcs8", format: "pem" }
   });
   assert.ok(verifySidecar(bytes, text, other.publicKey).some((e) => e.includes("签名验证不通过")));
+});
+
+test("--fill-stale 会重写签名验不过的遗留边车（持久卷里旧密钥签的）", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gen-meta-fillstale-"));
+  try {
+    // CI 没有仓库私钥，用一对临时密钥当「部署签名密钥」经 env 传入
+    const deploy = crypto.generateKeyPairSync("rsa", {
+      modulusLength: 2048,
+      publicKeyEncoding: { type: "spki", format: "pem" },
+      privateKeyEncoding: { type: "pkcs8", format: "pem" }
+    });
+    const env = { SCRIPT_SIGN_PRIVATE_KEY: deploy.privateKey, SCRIPT_VERIFY_PUBLIC_KEY: deploy.publicKey };
+
+    const jsSrc = fs.readFileSync(path.join(REPO_ROOT, "html/scripts/js/generic_provider.js"));
+    fs.writeFileSync(path.join(dir, "generic_provider.js"), jsSrc);
+    // 旧版服务端遗留：sha256 字段正确，但签名是另一把密钥签的、字段也多
+    const wrong = crypto.generateKeyPairSync("rsa", {
+      modulusLength: 2048,
+      publicKeyEncoding: { type: "spki", format: "pem" },
+      privateKeyEncoding: { type: "pkcs8", format: "pem" }
+    });
+    const s = crypto.createSign("RSA-SHA256");
+    s.update(jsSrc);
+    fs.writeFileSync(
+      path.join(dir, "generic_provider.meta.json"),
+      JSON.stringify({
+        scriptName: "generic_provider.js",
+        version: 1,
+        parentVersion: 0,
+        parentSha256: "",
+        sha256: crypto.createHash("sha256").update(jsSrc).digest("hex"),
+        signature: s.sign(wrong.privateKey, "base64"),
+        alg: "rsa-sha256"
+      })
+    );
+
+    const code = run(["--fill-stale", "--quiet", "--root", dir], { env, cwd: dir });
+    assert.equal(code, 0);
+
+    const rewritten = fs.readFileSync(path.join(dir, "generic_provider.meta.json"), "utf8");
+    assert.deepEqual(verifySidecar(jsSrc, rewritten, deploy.publicKey), [], "重写后应能被部署公钥验过");
+    assert.deepEqual(Object.keys(JSON.parse(rewritten)), ["sha256", "signature", "alg", "version"]);
+
+    // 幂等：再跑一次不应破坏
+    run(["--fill-stale", "--quiet", "--root", dir], { env, cwd: dir });
+    assert.deepEqual(
+      verifySidecar(jsSrc, fs.readFileSync(path.join(dir, "generic_provider.meta.json"), "utf8"), deploy.publicKey),
+      []
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("仓库内已提交的静态边车能被提交的公钥验证（= App 内置公钥）", () => {

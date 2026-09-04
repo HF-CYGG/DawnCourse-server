@@ -13,8 +13,8 @@
 
 ```text
 旧版 Android HTTP :10000  -> 1Panel/OpenResty Stream -> 127.0.0.1:15000
-新版 Android HTTPS :10000 -> 1Panel/OpenResty Stream -> 127.0.0.1:443
-                                                     -> 127.0.0.1:15000
+新版 Android HTTPS :10000 -> 1Panel/OpenResty Stream -> 127.0.0.1:10443
+                                                       -> 127.0.0.1:15000
 ```
 
 `docker-compose.yml` 不得映射宿主机 `10000`，否则 OpenResty 无法监听该端口。容器的
@@ -22,9 +22,18 @@
 
 ## 1Panel 配置
 
-1. 先创建普通 HTTPS 反向代理网站：主域名填写 `yyh163.xyz`（不带 `:10000`），代理
-   地址填写 `http://127.0.0.1:15000`，选择有效证书，只启用 TLS 1.2 与 TLS 1.3。
-2. 确认 `https://yyh163.xyz/version.json` 返回 HTTP 200 和兼容元数据。
+1. 保持已有的 `yyh163.xyz:443` 网站不变，创建一个仅供更新入口内部转发使用的 HTTPS
+   反向代理网站：主域名填写 `yyh163.xyz:10443`，代理地址填写
+   `http://127.0.0.1:15000`，选择现有 `yyh163.xyz` 证书，只启用 TLS 1.2 与 TLS 1.3。
+   HTTP 选项选择“禁止 HTTP 访问”，不要选择自动跳转；HSTS 暂时关闭。
+2. 在新网站的配置文件中确认存在 `listen 10443 ssl;`，并且没有把请求重定向到 443。
+   在服务器上执行以下命令，确认独立 TLS 上游返回 HTTP 200 和兼容元数据：
+
+   ```bash
+   curl --resolve yyh163.xyz:10443:127.0.0.1 \
+     https://yyh163.xyz:10443/version.json
+   ```
+
 3. 停止或删除当前监听 `yyh163.xyz:10000` 的 HTTP 网站，释放 OpenResty 的 `10000`。
    不要保留该网站的“HTTP 自动跳转 HTTPS”，因为它会截获老客户端请求。
 4. 在 OpenResty 容器终端确认编译参数包含 `--with-stream_ssl_preread_module`：
@@ -37,11 +46,11 @@
    `deploy/1panel/dawn-update-stream.conf` 的内容。若直接编辑 OpenResty 全局配置，应把
    该文件内容放进已有的 `stream {}` 中，不要再嵌套一层 `stream`。
 6. 先执行 OpenResty 配置检查，再保存并重载。TCP 代理只识别和转发协议，不持有证书；
-   TLS 会原样透传到步骤 1 的 `443` 站点。
+   TLS 会原样透传到步骤 1 的 `10443` 站点。
 
 如果 OpenResty 运行在隔离的桥接网络中，配置里的 `127.0.0.1` 必须换成 OpenResty
-容器能够访问的宿主机网关地址；不得把 `127.0.0.1:443` 指回公网 `10000`，否则会形成
-代理环路。
+容器能够访问的宿主机网关地址。`10443` 与 Stream 都在同一 OpenResty 实例时可以继续
+使用 `127.0.0.1:10443`；不得把它指回公网 `10000`，否则会形成代理环路。
 
 ## 更新元数据兼容契约
 
@@ -62,6 +71,9 @@
 curl --fail --show-error --silent \
   https://yyh163.xyz:10000/version.json
 
+curl --resolve yyh163.xyz:10443:127.0.0.1 \
+  https://yyh163.xyz:10443/version.json
+
 curl --head --max-redirs 0 \
   http://yyh163.xyz:10000/version.json
 ```
@@ -76,4 +88,5 @@ curl --head --max-redirs 0 \
 ## 回滚
 
 若 Stream 配置导致 OpenResty 无法重载，删除新增的 `10000` Stream 片段并恢复配置检查。
-容器上游始终保留在 `15000`，回滚协议入口不需要修改数据库或重建后端数据卷。
+恢复原 `yyh163.xyz:10000` 网站即可；独立的 `10443` 站点可以保留供排查，也可以在确认
+回滚后停用。容器上游始终保留在 `15000`，回滚不需要修改数据库或重建后端数据卷。

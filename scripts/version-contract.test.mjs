@@ -51,7 +51,7 @@ test("Compose 为宿主机 TLS 反向代理保留公网 10000 端口", () => {
   );
 });
 
-test("1Panel Stream 在同一公网端口分别转发 HTTP 与 TLS", () => {
+test("1Panel Stream 将 TLS 转发到独立内部端口且不占用现有 443", () => {
   /** 交给 1Panel/OpenResty Stream 上下文加载的配置模板。 */
   const streamConfigPath = path.join(
     serverRoot,
@@ -66,7 +66,7 @@ test("1Panel Stream 在同一公网端口分别转发 HTTP 与 TLS", () => {
   const streamConfig = fs.readFileSync(streamConfigPath, "utf8");
   assert.match(streamConfig, /\$ssl_preread_protocol/u);
   assert.match(streamConfig, /""\s+127\.0\.0\.1:15000;/u);
-  assert.match(streamConfig, /default\s+127\.0\.0\.1:443;/u);
+  assert.match(streamConfig, /default\s+127\.0\.0\.1:10443;/u);
   assert.match(streamConfig, /listen\s+10000;/u);
   assert.match(streamConfig, /ssl_preread\s+on;/u);
 });

@@ -4,18 +4,17 @@
 
 ### 背景
 
-线上服务端**没有 TLS**（nginx 只 `listen 80` / `15000`，compose 映射 `10000:80`）。
-Android 客户端把 `https://…:10000` 当主端点、manifest 查询又是 HTTPS 专用，于是所有
-HTTPS 请求 TLS 握手失败，只能回落到
+生产环境由宿主机 1Panel/OpenResty 的 Stream 入口独占 `yyh163.xyz:10000`，通过
+`ssl_preread` 区分协议：老客户端的 HTTP 直接转发到 `127.0.0.1:15000`，新客户端的
+TLS 则透传到现有 `127.0.0.1:443` HTTPS 站点终止证书，再反向代理到同一 `15000`
+上游。因此 Compose 只暴露容器的 `15000`，不再直接映射宿主机 `10000`。
+`version.json.type` 必须始终使用老客户端可识别的 `standard`、`bugfix`、`security`、
+`feature` 或 `major`，不能依赖国内网络访问 GitHub 才能完成正常更新。
 
-```
-http://…:10000/scripts/<category>/<name>.js
-```
-
-这条**纯静态**下载路径（nginx `try_files`，从不反代到 `llm-backend`，所以数据库里的
-签名与 manifest 对这个客户端不可达）。客户端下载脚本正文后，会再取同目录的
-`<name>.meta.json`，用其中的 `sha256` + `RSA-SHA256` 签名验签；**取不到 meta 就把
-云端脚本整个丢弃**，回落到 App 内置的 assets 旧版本，并弹「云端脚本拉取失败」。
+脚本正文仍由 nginx 的**纯静态**下载路径提供（`try_files`，从不反代到
+`llm-backend`）。客户端下载脚本正文后，会再取同目录的 `<name>.meta.json`，用其中的
+`sha256` + `RSA-SHA256` 签名验签；**取不到 meta 就把云端脚本整个丢弃**，回落到 App
+内置的 assets 旧版本，并弹「云端脚本拉取失败」。
 
 因此 `html/scripts/{js,parsers,runtime}/` 下每个 `*.js` 都必须有一个同名、可验签的
 `*.meta.json` 边车。本脚本负责生成 / 校验它们。
@@ -60,6 +59,9 @@ node scripts/gen-script-meta.mjs --check
 
 # 单元测试
 node --test scripts/gen-script-meta.test.mjs
+
+# 更新元数据与生产端口兼容契约
+node --test scripts/version-contract.test.mjs
 ```
 
 - `--fill-stale`：容器 `start.sh` 启动时调用。只补齐**缺失或 sha256 对不上**的边车，

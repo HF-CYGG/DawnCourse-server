@@ -4,7 +4,8 @@ services:
     # nginx 静态资源 + API 反代入口
     build: .
     ports:
-      - "10000:80"
+      # 公网 10000 由宿主机 1Panel/OpenResty 终止 TLS，再反代到本服务的 15000。
+      # 不要在容器侧重复占用 10000，否则 https://yyh163.xyz:10000 无法监听。
       - "8080:80"
       - "15000:15000"
     restart: ${RESTART_POLICY:-no}

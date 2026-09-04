@@ -1,0 +1,30 @@
+name: Update compatibility contract
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "version.json"
+      - "docker-compose.yml"
+      - "deploy/1panel/**"
+      - "scripts/version-contract.test.mjs"
+      - ".github/workflows/update-contract.yml"
+  pull_request:
+    paths:
+      - "version.json"
+      - "docker-compose.yml"
+      - "deploy/1panel/**"
+      - "scripts/version-contract.test.mjs"
+      - ".github/workflows/update-contract.yml"
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 防止未知更新类型再次导致已发布的老客户端崩溃，并锁定公网端口边界。
+      - name: Verify update compatibility contract
+        run: node --test scripts/version-contract.test.mjs
